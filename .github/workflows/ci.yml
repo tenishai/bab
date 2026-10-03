@@ -1,0 +1,19 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}  # spark (arm64, self-hosted) when set
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: rm -rf .venv && python -m venv .venv && .venv/bin/pip install -q -e ".[dev]"
+      - run: .venv/bin/ruff check bab tests
+      - run: make fga
+      - name: model is generated from the catalogue, not hand-edited
+        run: make model PY=.venv/bin/python && git diff --exit-code model/example.fga
+      - run: make test-model PY=.venv/bin/python
+      - run: .venv/bin/pytest -q

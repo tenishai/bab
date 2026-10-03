@@ -1,0 +1,22 @@
+# example fleet catalogue — every action Atlas and Beacon expose today.
+# Reads are catalogue entries too: a read the policy never mentions is a deny.
+resources: [project, cluster, namespace]
+
+actions:
+  # ---- reads ----
+  - {name: kubectl_read,  tier: read, global: true, description: Read-only kubectl (get/describe/logs/top)}
+  - {name: gcloud_read,   tier: read, global: true, description: Read-only gcloud (describe/list)}
+  - {name: log_read,      tier: read, global: true, description: Read pod / workload logs}
+
+  # ---- Atlas (platform) ----
+  - {name: pod_delete,           tier: mutate,  description: Delete a pod}
+  - {name: configmap_update,     tier: mutate,  description: Update a ConfigMap}
+  - {name: secret_update,        tier: mutate,  description: Update a Secret}
+  - {name: lb_timeout_update,    tier: mutate,  description: Update backend service timeout}
+  - {name: psc_endpoint_create,  tier: mutate,  description: Create a PSC consumer endpoint}
+  - {name: iam_binding_resource, tier: destroy, description: Add a resource-level IAM binding}
+  - {name: node_pool_create,     tier: destroy, description: Create a GKE node pool}
+
+  # ---- Beacon (data) ----
+  - {name: kafka_topic_partitions_increase, tier: destroy, description: Increase partitions (irreversible)}
+  - {name: kafka_topic_config_update,       tier: mutate,  description: Alter topic config}

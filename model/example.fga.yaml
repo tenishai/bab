@@ -1,0 +1,104 @@
+name: fleet-guardrails
+model_file: ./example.fga
+tuples:
+  # ===== SOURCE 1: Okta sync (engineering_* groups -> team member) =====
+  - {user: user:alice,  relation: member, object: team:platform-infra}
+  - {user: user:bob,  relation: member, object: team:platform-infra}
+  - {user: user:carol,  relation: member, object: team:platform-infra}
+  - {user: user:alice,  relation: member, object: team:data-infra}
+  - {user: user:dave, relation: member, object: team:data-infra}
+
+  # ===== SOURCE 2: topology sync (Gojira/GKE -> resource tree + ownership) =====
+  - {user: team:platform-infra, relation: team, object: agent:atlas}
+  - {user: team:data-infra,    relation: team, object: agent:beacon}
+  - {user: team:platform-infra, relation: owner, object: project:acme-platform-prod}
+  - {user: team:platform-infra, relation: owner, object: project:acme-legacy-prod}
+  - {user: team:platform-infra, relation: owner, object: project:acme-platform-dev}
+  - {user: team:data-infra,    relation: owner, object: project:acme-data-prod}
+  - {user: project:acme-platform-prod, relation: project, object: cluster:platform-prod}
+  - {user: project:acme-legacy-prod,     relation: project, object: cluster:platform-prod-legacy}
+  - {user: project:acme-platform-dev,  relation: project, object: cluster:platform-dev}
+  - {user: project:acme-legacy-dev,      relation: project, object: cluster:platform-dev-legacy}
+  - {user: project:acme-data-prod,         relation: project, object: cluster:data-kafka}
+  - {user: cluster:platform-prod, relation: cluster, object: namespace:platform-prod/ingest}
+  - {user: cluster:platform-dev,  relation: cluster, object: namespace:platform-dev/ingest}
+  - {user: cluster:data-kafka,   relation: cluster, object: namespace:data-kafka/streams}
+
+  # ===== SOURCE 3a: console — ceilings (what each team may grant at most) =====
+  - {user: team:platform-infra, relation: ceiling_pod_delete,        object: project:acme-platform-dev}   # allow ceiling
+  - {user: team:platform-infra, relation: ceiling_pod_delete_gated,  object: project:acme-platform-prod}  # approve-only ceiling
+  - {user: team:data-infra,    relation: ceiling_kafka_topic_config_update_gated, object: project:acme-data-prod}
+
+  # ===== SOURCE 3b: console — grants (ceiling-checked at write time) =====
+  - {user: agent:atlas,   relation: pod_delete,             object: project:acme-platform-dev}
+  - {user: agent:atlas,   relation: pod_delete_gated,       object: project:acme-platform-prod}
+  - {user: agent:atlas,   relation: pod_delete_gated,       object: project:acme-legacy-prod}
+  - {user: agent:atlas,   relation: configmap_update,            object: project:acme-platform-dev}
+  - {user: agent:atlas,   relation: node_pool_create_gated, object: project:acme-platform-prod}
+  - {user: agent:beacon, relation: kafka_topic_config_update_gated, object: project:acme-data-prod}
+  - {user: "agent:*",    relation: log_read,               object: project:acme-legacy-dev}
+
+tests:
+  - name: atlas — allow on dev, approval on prod, inherited three levels down
+    check:
+      - user: agent:atlas
+        object: namespace:platform-dev/ingest
+        assertions: {pod_delete: true, pod_delete_gated: false, can_pod_delete: true, can_configmap_update: true}
+      - user: agent:atlas
+        object: namespace:platform-prod/ingest
+        assertions: {pod_delete: false, pod_delete_gated: true, can_pod_delete: true, can_configmap_update: false}
+    list_objects:
+      - user: agent:atlas
+        type: cluster
+        assertions:
+          pod_delete: [cluster:platform-dev]
+          pod_delete_gated: [cluster:platform-prod, cluster:platform-prod-legacy]
+          node_pool_create: []
+          node_pool_create_gated: [cluster:platform-prod]
+
+  - name: beacon — kafka only, no pod rights anywhere (set assertions, not point checks)
+    check:
+      - user: agent:beacon
+        object: project:acme-data-prod
+        assertions: {can_kafka_topic_config_update: true, kafka_topic_config_update: false}
+      - user: agent:atlas
+        object: project:acme-data-prod
+        assertions: {can_kafka_topic_config_update: false}
+    list_objects:
+      - user: agent:beacon
+        type: project
+        assertions: {pod_delete: [], pod_delete_gated: [], configmap_update: [], node_pool_create_gated: []}
+      - user: agent:beacon
+        type: cluster
+        assertions: {pod_delete: [], pod_delete_gated: []}
+
+  - name: global — any agent reads logs in acme-legacy-dev, nowhere else
+    check:
+      - {user: agent:beacon, object: cluster:platform-dev-legacy, assertions: {log_read: true}}
+      - {user: agent:beacon, object: cluster:platform-prod,       assertions: {log_read: false}}
+
+  - name: approvers — team members, inherited to the namespace, scoped to their own projects
+    check:
+      - {user: user:dave, object: namespace:data-kafka/streams,   assertions: {approver: true}}
+      - {user: user:dave, object: namespace:platform-prod/ingest,  assertions: {approver: false}}
+      - {user: user:carol,  object: namespace:data-kafka/streams,   assertions: {approver: false}}
+    list_users:
+      - object: namespace:platform-prod/ingest
+        user_filter: [{type: user}]
+        assertions: {approver: {users: [user:alice, user:bob, user:carol]}}
+      - object: namespace:data-kafka/streams
+        user_filter: [{type: user}]
+        assertions: {approver: {users: [user:alice, user:dave]}}
+
+  - name: ceilings — allow implies approve, approve-only forbids allow, inherited, other teams excluded
+    check:
+      - {user: team:platform-infra, object: cluster:platform-dev,  assertions: {ceiling_pod_delete: true,  ceiling_pod_delete_gated: true}}
+      - {user: team:platform-infra, object: cluster:platform-prod, assertions: {ceiling_pod_delete: false, ceiling_pod_delete_gated: true}}
+      - {user: team:data-infra,    object: cluster:platform-prod, assertions: {ceiling_pod_delete_gated: false}}
+      - {user: team:data-infra,    object: project:acme-data-prod,    assertions: {ceiling_kafka_topic_config_update_gated: true, ceiling_kafka_topic_config_update: false}}
+    list_objects:
+      - user: team:platform-infra
+        type: project
+        assertions:
+          ceiling_pod_delete: [project:acme-platform-dev]
+          ceiling_pod_delete_gated: [project:acme-platform-dev, project:acme-platform-prod]

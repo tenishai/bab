@@ -1,0 +1,25 @@
+import pytest
+
+from bab.catalogue import Catalogue, CatalogueError, load
+
+
+def test_loads_example_profile():
+    cat = load("catalogues/example.yaml")
+    assert cat.resources == ("project", "cluster", "namespace")
+    assert cat.action("pod_delete").tier == "mutate"
+    assert cat.action("log_read").global_ is True
+    assert cat.action("nope") is None
+
+
+@pytest.mark.parametrize("raw,msg", [
+    ({"resources": []}, "at least one level"),
+    ({"resources": ["project"], "actions": [{"name": "Pod-Delete", "tier": "mutate"}]}, "bad action name"),
+    ({"resources": ["project"], "actions": [{"name": "approver", "tier": "read"}]}, "bad action name"),
+    ({"resources": ["project"], "actions": [{"name": "x_gated", "tier": "read"}]}, "collides"),
+    ({"resources": ["project"], "actions": [{"name": "x", "tier": "yolo"}]}, "tier must be"),
+    ({"resources": ["project"], "actions": [{"name": "x", "tier": "read"}] * 2}, "duplicate action"),
+    ({"resources": ["project", "project"]}, "duplicate resource"),
+])
+def test_rejects_bad_catalogues(raw, msg):
+    with pytest.raises(CatalogueError, match=msg):
+        Catalogue.from_dict(raw)

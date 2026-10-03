@@ -1,0 +1,207 @@
+model
+  schema 1.1
+
+type user
+
+type team
+  relations
+    define member: [user]
+
+type agent
+  relations
+    define team: [team]
+
+type project
+  relations
+    define owner: [team]
+    define approver: member from owner
+    define kubectl_read: [agent, agent:*]
+    define kubectl_read_gated: [agent, agent:*]
+    define can_kubectl_read: kubectl_read or kubectl_read_gated
+    define ceiling_kubectl_read: [team]
+    define ceiling_kubectl_read_gated: [team] or ceiling_kubectl_read
+    define gcloud_read: [agent, agent:*]
+    define gcloud_read_gated: [agent, agent:*]
+    define can_gcloud_read: gcloud_read or gcloud_read_gated
+    define ceiling_gcloud_read: [team]
+    define ceiling_gcloud_read_gated: [team] or ceiling_gcloud_read
+    define log_read: [agent, agent:*]
+    define log_read_gated: [agent, agent:*]
+    define can_log_read: log_read or log_read_gated
+    define ceiling_log_read: [team]
+    define ceiling_log_read_gated: [team] or ceiling_log_read
+    define pod_delete: [agent]
+    define pod_delete_gated: [agent]
+    define can_pod_delete: pod_delete or pod_delete_gated
+    define ceiling_pod_delete: [team]
+    define ceiling_pod_delete_gated: [team] or ceiling_pod_delete
+    define configmap_update: [agent]
+    define configmap_update_gated: [agent]
+    define can_configmap_update: configmap_update or configmap_update_gated
+    define ceiling_configmap_update: [team]
+    define ceiling_configmap_update_gated: [team] or ceiling_configmap_update
+    define secret_update: [agent]
+    define secret_update_gated: [agent]
+    define can_secret_update: secret_update or secret_update_gated
+    define ceiling_secret_update: [team]
+    define ceiling_secret_update_gated: [team] or ceiling_secret_update
+    define lb_timeout_update: [agent]
+    define lb_timeout_update_gated: [agent]
+    define can_lb_timeout_update: lb_timeout_update or lb_timeout_update_gated
+    define ceiling_lb_timeout_update: [team]
+    define ceiling_lb_timeout_update_gated: [team] or ceiling_lb_timeout_update
+    define psc_endpoint_create: [agent]
+    define psc_endpoint_create_gated: [agent]
+    define can_psc_endpoint_create: psc_endpoint_create or psc_endpoint_create_gated
+    define ceiling_psc_endpoint_create: [team]
+    define ceiling_psc_endpoint_create_gated: [team] or ceiling_psc_endpoint_create
+    define iam_binding_resource: [agent]
+    define iam_binding_resource_gated: [agent]
+    define can_iam_binding_resource: iam_binding_resource or iam_binding_resource_gated
+    define ceiling_iam_binding_resource: [team]
+    define ceiling_iam_binding_resource_gated: [team] or ceiling_iam_binding_resource
+    define node_pool_create: [agent]
+    define node_pool_create_gated: [agent]
+    define can_node_pool_create: node_pool_create or node_pool_create_gated
+    define ceiling_node_pool_create: [team]
+    define ceiling_node_pool_create_gated: [team] or ceiling_node_pool_create
+    define kafka_topic_partitions_increase: [agent]
+    define kafka_topic_partitions_increase_gated: [agent]
+    define can_kafka_topic_partitions_increase: kafka_topic_partitions_increase or kafka_topic_partitions_increase_gated
+    define ceiling_kafka_topic_partitions_increase: [team]
+    define ceiling_kafka_topic_partitions_increase_gated: [team] or ceiling_kafka_topic_partitions_increase
+    define kafka_topic_config_update: [agent]
+    define kafka_topic_config_update_gated: [agent]
+    define can_kafka_topic_config_update: kafka_topic_config_update or kafka_topic_config_update_gated
+    define ceiling_kafka_topic_config_update: [team]
+    define ceiling_kafka_topic_config_update_gated: [team] or ceiling_kafka_topic_config_update
+
+type cluster
+  relations
+    define project: [project]
+    define approver: approver from project
+    define kubectl_read: [agent, agent:*] or kubectl_read from project
+    define kubectl_read_gated: [agent, agent:*] or kubectl_read_gated from project
+    define can_kubectl_read: kubectl_read or kubectl_read_gated
+    define ceiling_kubectl_read: [team] or ceiling_kubectl_read from project
+    define ceiling_kubectl_read_gated: [team] or ceiling_kubectl_read or ceiling_kubectl_read_gated from project
+    define gcloud_read: [agent, agent:*] or gcloud_read from project
+    define gcloud_read_gated: [agent, agent:*] or gcloud_read_gated from project
+    define can_gcloud_read: gcloud_read or gcloud_read_gated
+    define ceiling_gcloud_read: [team] or ceiling_gcloud_read from project
+    define ceiling_gcloud_read_gated: [team] or ceiling_gcloud_read or ceiling_gcloud_read_gated from project
+    define log_read: [agent, agent:*] or log_read from project
+    define log_read_gated: [agent, agent:*] or log_read_gated from project
+    define can_log_read: log_read or log_read_gated
+    define ceiling_log_read: [team] or ceiling_log_read from project
+    define ceiling_log_read_gated: [team] or ceiling_log_read or ceiling_log_read_gated from project
+    define pod_delete: [agent] or pod_delete from project
+    define pod_delete_gated: [agent] or pod_delete_gated from project
+    define can_pod_delete: pod_delete or pod_delete_gated
+    define ceiling_pod_delete: [team] or ceiling_pod_delete from project
+    define ceiling_pod_delete_gated: [team] or ceiling_pod_delete or ceiling_pod_delete_gated from project
+    define configmap_update: [agent] or configmap_update from project
+    define configmap_update_gated: [agent] or configmap_update_gated from project
+    define can_configmap_update: configmap_update or configmap_update_gated
+    define ceiling_configmap_update: [team] or ceiling_configmap_update from project
+    define ceiling_configmap_update_gated: [team] or ceiling_configmap_update or ceiling_configmap_update_gated from project
+    define secret_update: [agent] or secret_update from project
+    define secret_update_gated: [agent] or secret_update_gated from project
+    define can_secret_update: secret_update or secret_update_gated
+    define ceiling_secret_update: [team] or ceiling_secret_update from project
+    define ceiling_secret_update_gated: [team] or ceiling_secret_update or ceiling_secret_update_gated from project
+    define lb_timeout_update: [agent] or lb_timeout_update from project
+    define lb_timeout_update_gated: [agent] or lb_timeout_update_gated from project
+    define can_lb_timeout_update: lb_timeout_update or lb_timeout_update_gated
+    define ceiling_lb_timeout_update: [team] or ceiling_lb_timeout_update from project
+    define ceiling_lb_timeout_update_gated: [team] or ceiling_lb_timeout_update or ceiling_lb_timeout_update_gated from project
+    define psc_endpoint_create: [agent] or psc_endpoint_create from project
+    define psc_endpoint_create_gated: [agent] or psc_endpoint_create_gated from project
+    define can_psc_endpoint_create: psc_endpoint_create or psc_endpoint_create_gated
+    define ceiling_psc_endpoint_create: [team] or ceiling_psc_endpoint_create from project
+    define ceiling_psc_endpoint_create_gated: [team] or ceiling_psc_endpoint_create or ceiling_psc_endpoint_create_gated from project
+    define iam_binding_resource: [agent] or iam_binding_resource from project
+    define iam_binding_resource_gated: [agent] or iam_binding_resource_gated from project
+    define can_iam_binding_resource: iam_binding_resource or iam_binding_resource_gated
+    define ceiling_iam_binding_resource: [team] or ceiling_iam_binding_resource from project
+    define ceiling_iam_binding_resource_gated: [team] or ceiling_iam_binding_resource or ceiling_iam_binding_resource_gated from project
+    define node_pool_create: [agent] or node_pool_create from project
+    define node_pool_create_gated: [agent] or node_pool_create_gated from project
+    define can_node_pool_create: node_pool_create or node_pool_create_gated
+    define ceiling_node_pool_create: [team] or ceiling_node_pool_create from project
+    define ceiling_node_pool_create_gated: [team] or ceiling_node_pool_create or ceiling_node_pool_create_gated from project
+    define kafka_topic_partitions_increase: [agent] or kafka_topic_partitions_increase from project
+    define kafka_topic_partitions_increase_gated: [agent] or kafka_topic_partitions_increase_gated from project
+    define can_kafka_topic_partitions_increase: kafka_topic_partitions_increase or kafka_topic_partitions_increase_gated
+    define ceiling_kafka_topic_partitions_increase: [team] or ceiling_kafka_topic_partitions_increase from project
+    define ceiling_kafka_topic_partitions_increase_gated: [team] or ceiling_kafka_topic_partitions_increase or ceiling_kafka_topic_partitions_increase_gated from project
+    define kafka_topic_config_update: [agent] or kafka_topic_config_update from project
+    define kafka_topic_config_update_gated: [agent] or kafka_topic_config_update_gated from project
+    define can_kafka_topic_config_update: kafka_topic_config_update or kafka_topic_config_update_gated
+    define ceiling_kafka_topic_config_update: [team] or ceiling_kafka_topic_config_update from project
+    define ceiling_kafka_topic_config_update_gated: [team] or ceiling_kafka_topic_config_update or ceiling_kafka_topic_config_update_gated from project
+
+type namespace
+  relations
+    define cluster: [cluster]
+    define approver: approver from cluster
+    define kubectl_read: [agent, agent:*] or kubectl_read from cluster
+    define kubectl_read_gated: [agent, agent:*] or kubectl_read_gated from cluster
+    define can_kubectl_read: kubectl_read or kubectl_read_gated
+    define ceiling_kubectl_read: [team] or ceiling_kubectl_read from cluster
+    define ceiling_kubectl_read_gated: [team] or ceiling_kubectl_read or ceiling_kubectl_read_gated from cluster
+    define gcloud_read: [agent, agent:*] or gcloud_read from cluster
+    define gcloud_read_gated: [agent, agent:*] or gcloud_read_gated from cluster
+    define can_gcloud_read: gcloud_read or gcloud_read_gated
+    define ceiling_gcloud_read: [team] or ceiling_gcloud_read from cluster
+    define ceiling_gcloud_read_gated: [team] or ceiling_gcloud_read or ceiling_gcloud_read_gated from cluster
+    define log_read: [agent, agent:*] or log_read from cluster
+    define log_read_gated: [agent, agent:*] or log_read_gated from cluster
+    define can_log_read: log_read or log_read_gated
+    define ceiling_log_read: [team] or ceiling_log_read from cluster
+    define ceiling_log_read_gated: [team] or ceiling_log_read or ceiling_log_read_gated from cluster
+    define pod_delete: [agent] or pod_delete from cluster
+    define pod_delete_gated: [agent] or pod_delete_gated from cluster
+    define can_pod_delete: pod_delete or pod_delete_gated
+    define ceiling_pod_delete: [team] or ceiling_pod_delete from cluster
+    define ceiling_pod_delete_gated: [team] or ceiling_pod_delete or ceiling_pod_delete_gated from cluster
+    define configmap_update: [agent] or configmap_update from cluster
+    define configmap_update_gated: [agent] or configmap_update_gated from cluster
+    define can_configmap_update: configmap_update or configmap_update_gated
+    define ceiling_configmap_update: [team] or ceiling_configmap_update from cluster
+    define ceiling_configmap_update_gated: [team] or ceiling_configmap_update or ceiling_configmap_update_gated from cluster
+    define secret_update: [agent] or secret_update from cluster
+    define secret_update_gated: [agent] or secret_update_gated from cluster
+    define can_secret_update: secret_update or secret_update_gated
+    define ceiling_secret_update: [team] or ceiling_secret_update from cluster
+    define ceiling_secret_update_gated: [team] or ceiling_secret_update or ceiling_secret_update_gated from cluster
+    define lb_timeout_update: [agent] or lb_timeout_update from cluster
+    define lb_timeout_update_gated: [agent] or lb_timeout_update_gated from cluster
+    define can_lb_timeout_update: lb_timeout_update or lb_timeout_update_gated
+    define ceiling_lb_timeout_update: [team] or ceiling_lb_timeout_update from cluster
+    define ceiling_lb_timeout_update_gated: [team] or ceiling_lb_timeout_update or ceiling_lb_timeout_update_gated from cluster
+    define psc_endpoint_create: [agent] or psc_endpoint_create from cluster
+    define psc_endpoint_create_gated: [agent] or psc_endpoint_create_gated from cluster
+    define can_psc_endpoint_create: psc_endpoint_create or psc_endpoint_create_gated
+    define ceiling_psc_endpoint_create: [team] or ceiling_psc_endpoint_create from cluster
+    define ceiling_psc_endpoint_create_gated: [team] or ceiling_psc_endpoint_create or ceiling_psc_endpoint_create_gated from cluster
+    define iam_binding_resource: [agent] or iam_binding_resource from cluster
+    define iam_binding_resource_gated: [agent] or iam_binding_resource_gated from cluster
+    define can_iam_binding_resource: iam_binding_resource or iam_binding_resource_gated
+    define ceiling_iam_binding_resource: [team] or ceiling_iam_binding_resource from cluster
+    define ceiling_iam_binding_resource_gated: [team] or ceiling_iam_binding_resource or ceiling_iam_binding_resource_gated from cluster
+    define node_pool_create: [agent] or node_pool_create from cluster
+    define node_pool_create_gated: [agent] or node_pool_create_gated from cluster
+    define can_node_pool_create: node_pool_create or node_pool_create_gated
+    define ceiling_node_pool_create: [team] or ceiling_node_pool_create from cluster
+    define ceiling_node_pool_create_gated: [team] or ceiling_node_pool_create or ceiling_node_pool_create_gated from cluster
+    define kafka_topic_partitions_increase: [agent] or kafka_topic_partitions_increase from cluster
+    define kafka_topic_partitions_increase_gated: [agent] or kafka_topic_partitions_increase_gated from cluster
+    define can_kafka_topic_partitions_increase: kafka_topic_partitions_increase or kafka_topic_partitions_increase_gated
+    define ceiling_kafka_topic_partitions_increase: [team] or ceiling_kafka_topic_partitions_increase from cluster
+    define ceiling_kafka_topic_partitions_increase_gated: [team] or ceiling_kafka_topic_partitions_increase or ceiling_kafka_topic_partitions_increase_gated from cluster
+    define kafka_topic_config_update: [agent] or kafka_topic_config_update from cluster
+    define kafka_topic_config_update_gated: [agent] or kafka_topic_config_update_gated from cluster
+    define can_kafka_topic_config_update: kafka_topic_config_update or kafka_topic_config_update_gated
+    define ceiling_kafka_topic_config_update: [team] or ceiling_kafka_topic_config_update from cluster
+    define ceiling_kafka_topic_config_update_gated: [team] or ceiling_kafka_topic_config_update or ceiling_kafka_topic_config_update_gated from cluster
