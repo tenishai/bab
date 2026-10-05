@@ -34,48 +34,24 @@ testing.
 
 ## Supported versions
 
-techne is pre-1.0. Security fixes go into the **latest release** only; older
+bab is pre-1.0. Security fixes go into the **latest release** only; older
 releases are not patched. If you're running an older version, upgrade to get
 fixes.
 
 ## Scope
 
-techne is a local memory store and MCP server for AI agents. In scope:
+bab is a door: it decides whether an actor may take an action on an object,
+and it is meant to fail closed. In scope:
 
-- the stored memory: anything that lets one agent or project read or change
-  another's memory without being configured to;
-- credential and secret handling: a secret in a format techne's redaction is
-  meant to recognise that still reaches the memory store, an export, or an
-  injected prompt. Redaction is pattern-based and best-effort, not a
-  confidentiality guarantee; a token shape it doesn't recognise yet is a
-  hardening request, not a vulnerability.
-  The architect pattern store, the codex code-graph store, and short
-  structured fields (source, tags, target) are not redacted by design;
-- egress: configuration that is supposed to keep memory local but doesn't.
-  Only `/etc/techne/config.operator.yaml` is a lock, and only while the process
-  reading it cannot write it. `$TECHNE_OPERATOR_CONFIG` and
-  `<techne_home>/config.operator.yaml` are conveniences an agent can bypass
-  (`env -u`, or a different `TECHNE_HOME`), and with no operator layer
-  `config.yaml` keeps full authority. An agent redirecting its own egress in
-  those setups is documented behaviour, not a vulnerability (see "Operator-owned
-  config" in the README);
-- the hooks and the MCP server: anything a tool result, transcript, or
-  repository file can use to run code or change techne's configuration;
-- the shell guard (`techne.security.shell_guard`), a library for callers that
-  run agent-issued commands:
-  - `check_command`: a command string it accepts that a shell would still
-    read as chaining, redirection, or command substitution. Single-command
-    expansion (globs, `~`, `$VAR`, `(` subshells, `!` history, `#`) is
-    accepted by design, since `run_guarded` passes it to the program
-    literally; and a single program that starts others (`bash -c`, `xargs`,
-    `find -exec`) is the caller's allow-list's job, not this check's;
-  - `audit_install`: a `pip install` of a named package with a known
-    vulnerability that it allows while `pip-audit` runs successfully.
-    Install detection is shallow and fails open by design (other pip
-    spellings, `-r`/`-e`, other package managers, audit errors), so gaps
-    there are hardening requests.
+- the decision: `check` returning allow for a request the catalogue and stored
+  tuples do not grant, or returning allow when OpenFGA is unreachable or errors;
+- ceilings: a team granting, or being granted, more than its ceiling allows;
+- the generated model: a catalogue that produces a model granting more than the
+  catalogue says;
+- the syncs (Okta, topology, file): input that makes a sync write tuples for
+  principals or objects it was not given.
 
-**Out of scope:** vulnerabilities in third-party dependencies (please report
-those upstream, and tell us if we ship an affected version), and problems that
-require an attacker to already control the machine or the operator account
-techne runs under.
+**Out of scope:** vulnerabilities in third-party dependencies, OpenFGA included
+(please report those upstream, and tell us if we ship an affected version), and
+problems that require an attacker to already control the OpenFGA store, the
+identity provider, or the account bab runs under.
