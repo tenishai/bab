@@ -7,8 +7,9 @@ name = "tenish-bab"
 version = "0.1.0"
 description = "bab (باب, door): actor → action → object guardrails for agent fleets, on OpenFGA"
 readme = "README.md"
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.11"
+authors = [{ name = "tenish" }]
 dependencies = ["openfga-sdk>=0.9", "pyyaml>=6", "httpx>=0.27"]
 
 [project.optional-dependencies]
