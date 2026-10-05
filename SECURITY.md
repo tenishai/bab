@@ -40,15 +40,21 @@ fixes.
 
 ## Scope
 
-bab is a door: it decides whether an actor may take an action on an object,
-and it is meant to fail closed. In scope:
+bab is a door: it decides whether an actor may take an action on an object.
+It fails closed for anything above read: when OpenFGA is unreachable or errors,
+read-tier actions degrade to allow by design (`bab/door.py`), and every other
+action is denied or routed to fallback approvers. In scope:
 
 - the decision: `check` returning allow for a request the catalogue and stored
-  tuples do not grant, or returning allow when OpenFGA is unreachable or errors;
-- ceilings: a team granting, or being granted, more than its ceiling allows;
+  tuples do not grant, or returning allow for a non-read action when OpenFGA is
+  unreachable or errors;
+- ceilings: `bab.ceiling.permitted`, or the generated ceiling relations,
+  accepting a grant the team's ceiling does not cover. bab does not write
+  grants itself; a caller that writes tuples without consulting the ceiling is
+  that caller's issue;
 - the generated model: a catalogue that produces a model granting more than the
   catalogue says;
-- the syncs (Okta, topology, file): input that makes a sync write tuples for
+- the syncs (Okta, topology): input that makes a sync write tuples for
   principals or objects it was not given.
 
 **Out of scope:** vulnerabilities in third-party dependencies, OpenFGA included
