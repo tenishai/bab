@@ -1,7 +1,7 @@
 ---
 card: repo-card:bab
 updated: 2026-09-28
-anchor: pyproject.toml sha=2f534437e1458529a2138462443648d026ebb11c
+anchor: pyproject.toml sha=699f230f8c2784cd8fa6a7af337003e0bca8b124
 ---
 # bab — repo card
 
