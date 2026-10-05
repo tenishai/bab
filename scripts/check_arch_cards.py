@@ -61,7 +61,7 @@ CARD_GLOBS = ("ARCHITECTURE.md", "docs/arch/*.md")
 MANIFEST_FILE = "ARCHITECTURE.md"
 # Only non-nested paths: the card glob is `docs/arch/*.md`, so a nested path could
 # never be found as a card and would be reported as deleted forever. Matching the
-# glob's shape keeps the two halves consistent (Prudence, PR #451).
+# glob's shape keeps the two halves consistent (Prudence, tenishai/techne#451).
 MANIFEST_RE = re.compile(r"→\s*(docs/arch/[^/\s)]+\.md)")
 # Tolerate an optional BOM and CRLF line endings around the frontmatter fence.
 FRONTMATTER_RE = re.compile(r"\A﻿?---[ \t]*\r?\n(.*?)\r?\n---", re.S)
@@ -114,7 +114,7 @@ def check(repo: Path) -> tuple[int, list[tuple[Path, str, str]], int, int, int]:
     # printed the anchor trailer under a coverage-only failure (demonstrated). It
     # also UNDER-fired — "card has no `anchor:` line" is an anchor problem, was not
     # enumerated, and is the one message with no inline remediation, so that reader
-    # got a bare line and nothing. (Prudence, PR #451.)
+    # got a bare line and nothing. (Prudence, tenishai/techne#451.)
     problems: list[tuple[Path, str, str]] = []
     n_cards = n_anchors = n_skipped = 0
     found: set[str] = set()  # repo-relative paths of files that parsed AS cards
@@ -163,7 +163,7 @@ def check(repo: Path) -> tuple[int, list[tuple[Path, str, str]], int, int, int]:
     # `card:` frontmatter was removed" class the forward check already names, applied
     # to the file exempt from it. Third instance of one pattern in this script: the
     # check has a blind spot exactly where nothing checks the checker.
-    # (Prudence, PR #451.)
+    # (Prudence, tenishai/techne#451.)
     if MANIFEST_FILE not in found:
         detail = (
             "is missing"
@@ -191,7 +191,7 @@ def check(repo: Path) -> tuple[int, list[tuple[Path, str, str]], int, int, int]:
         # check is one-directional, and a card that was NEVER indexed can be deleted
         # for exit 0 — regenerating the false-green precisely for new cards, which
         # are the ones least likely to have been wired in carefully. It also catches
-        # an index that drifted out of the matched shape. (Prudence, PR #451.)
+        # an index that drifted out of the matched shape. (Prudence, tenishai/techne#451.)
         seam_cards = [r for r in sorted(found) if r != MANIFEST_FILE]
         if seam_cards and not indexed:
             # Blame the INDEX, not the cards. A reformat of the SEAMS block (markdown
@@ -199,7 +199,7 @@ def check(repo: Path) -> tuple[int, list[tuple[Path, str, str]], int, int, int]:
             # would then report every card as unindexed: N failures pointing at N
             # innocent files, under a trailer describing a different failure class.
             # When NOTHING matches, the defect is one line of formatting.
-            # (Prudence, PR #451.)
+            # (Prudence, tenishai/techne#451.)
             problems.append((
                 manifest,
                 f"no `→ docs/arch/*.md` index entries matched, but {len(seam_cards)} "
@@ -229,7 +229,7 @@ def check(repo: Path) -> tuple[int, list[tuple[Path, str, str]], int, int, int]:
 
     if n_cards == 0:
         # Append rather than replace: manifest problems collected above are real and
-        # were being discarded by the early return (Prudence, PR #451).
+        # were being discarded by the early return (Prudence, tenishai/techne#451).
         problems.append((repo, "no architecture cards found", "coverage"))
         return 1, problems, 0, 0, n_skipped
     return (1 if problems else 0), problems, n_cards, n_anchors, n_skipped
@@ -255,11 +255,11 @@ def main() -> int:
                 shown = where
             print(f"  ✗ {shown}: {why}")
         # Print the anchor-drift trailer ONLY when an anchor problem is actually
-        # among the failures. The coverage classes added in PR #451 (unindexed card,
+        # among the failures. The coverage classes added in tenishai/techne#451 (unindexed card,
         # index matched nothing, manifest missing/unparsed) each carry their own
         # correct inline remediation, and this footer CONTRADICTED the advice printed
         # directly above them — telling the reader to bump an `anchor:` sha that has
-        # nothing to do with the failure. (Prudence, PR #451.)
+        # nothing to do with the failure. (Prudence, tenishai/techne#451.)
         anchor_problem = any(kind == "anchor" for _where, _why, kind in problems)
         # `code == 1` is redundant-by-construction now that problems carry a kind:
         # exit 2 returns before any card is read, so no anchor-kind problem can
@@ -269,7 +269,7 @@ def main() -> int:
         # mis-tagged exit-2 problem at the check()/main() seam, which the tests do.
         # An earlier comment here claimed it was untestable; that was wrong, and a
         # durable note saying "can't be tested" talks the next maintainer out of
-        # testing it. (Prudence, PR #451.)
+        # testing it. (Prudence, tenishai/techne#451.)
         if code == 1 and anchor_problem:
             print(
                 "\nA seam changed (or an anchor is malformed) without its card being "
