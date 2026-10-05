@@ -62,6 +62,6 @@ d = door.decide("atlas", "pod_delete", "namespace:platform-prod/ingest")
 
 ## License
 
-AGPL-3.0, the GNU Affero General Public License version 3 (see [LICENSE](LICENSE)).
+AGPL-3.0-or-later, the GNU Affero General Public License version 3 or (at your option) any later version (see [LICENSE](LICENSE)).
 
-Copyright (C) 2026 tenishai
+Copyright (C) 2026 tenish and the bab contributors
