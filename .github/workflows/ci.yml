@@ -5,7 +5,12 @@ on:
     branches: [main]
 jobs:
   test:
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}  # spark (arm64, self-hosted) when set
+    # spark (arm64, self-hosted) when CI_RUNNER is set. A pull request from a fork
+    # always runs on GitHub-hosted ubuntu-latest: a self-hosted runner must never
+    # run a fork's code. Defence in depth, not the boundary (a fork's pull_request
+    # runs the fork's copy of this file); the real control is fork-PR approval.
+    # tests/test_ci_workflow.py keeps every job on this expression.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
