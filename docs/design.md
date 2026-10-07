@@ -2,6 +2,11 @@
 
 2026-09-16 · Ember · status: APPROVED (increment one: model, ceiling, live enforcement, syncs)
 
+> **Design record.** Written in September 2026 to decide what to build. Only
+> increment one exists in this repo; the console, the deploy and the SDK hook
+> below are plans. [ARCHITECTURE.md](../ARCHITECTURE.md) describes the code as
+> it is. Ember is the AI coding agent Shaz pairs with (see the README).
+
 ## Shape
 
 Actor → action → object, with three verdicts: **allow**, **approve** (a human
@@ -12,7 +17,7 @@ team membership, not pasted into each agent.
 
 | Part | What | Runtime path? |
 |---|---|---|
-| Store | OpenFGA server, new database on the `sre-agents` AlloyDB cluster (dev first) | yes |
+| Store | OpenFGA server, a new database on an existing PostgreSQL-compatible cluster (dev first) | yes |
 | Enforcement | the agent SDK policy hook: one `check` at tool dispatch, fail-closed | yes |
 | Console | kobo module: what-can, playground, grant editor, pinned assertions | no |
 | Syncs | Okta (people), topology (resources), console (grants) | no |
@@ -32,11 +37,12 @@ actions:
   - {name: log_read,   tier: read, global: true}   # global: grantable to agent:*
 ```
 
-`gen_model.py` emits, per action A on every level: `A` (allow), `A_gated`
-(approve), `can_A` (either), each inheriting from the parent level. Approver on
-a project = `member from owner`; clusters and namespaces inherit it.
-Nobody hand-edits `model.fga`; a catalogue change regenerates it and reruns
-the suite.
+The generator (`bab/model.py`) emits, per action A on every level: `A`
+(allow), `A_gated` (approve), `can_A` (either), and the team ceilings
+`ceiling_A` and `ceiling_A_gated`, each inheriting from the parent level.
+Approver on a project = `member from owner`; clusters and namespaces inherit it.
+Nobody hand-edits `model/example.fga`; a catalogue change regenerates it and
+reruns the suite.
 
 ### Types
 
@@ -53,14 +59,15 @@ Adding a level (e.g. `topic` under `cluster`) is one list entry in the catalogue
 
 ### Ceiling (what a tenant may hold at most)
 
-Per team, a list of `(action, verdict, object)` maxima, stored in the store as
-`team:T <action>_ceiling <object>` tuples. The console rejects a grant unless the
-agent's team holds a ceiling covering that action at that object or an
-ancestor, and a grant of `allow` needs an `allow` ceiling (an `approve` ceiling
-only permits `approve` grants). Enforced at **write time** in the console, not
-in the runtime model, because OpenFGA can't traverse from the agent to its team
-inside a single relation. Ceiling edits require a second team-member approval
-in the console (four-eyes), same hour.
+Per team, a list of `(action, verdict, object)` maxima, stored as
+`team:T ceiling_<action>[_gated] <object>` tuples; the model inherits them down
+the levels like grants, and an allow ceiling implies an approve ceiling. A grant
+is refused unless the agent's team holds a ceiling covering that action at that
+object or an ancestor, and a grant of `allow` needs an `allow` ceiling (an
+`approve` ceiling only permits `approve` grants). The check runs at **write
+time** (`bab.ceiling.permitted`), not at tool dispatch, because OpenFGA can't
+traverse from the agent to its team inside a single relation. Ceiling edits
+require a second team-member approval in the console (four-eyes), same hour.
 
 ### Write gate (replaces git review)
 
@@ -119,8 +126,8 @@ Runtime agents call `check` on the OpenFGA gRPC port directly, not through kobo.
 
 1. **Done (this repo)**: catalogue, generated model with ceilings, suite,
    door (fail-closed), ceiling check, both syncs, CLI, live demo.
-2. Deploy: OpenFGA on the dev cluster against a new database on the
-   `sre-agents` AlloyDB; sync CronJobs; Gojira topology endpoint.
+2. Deploy: OpenFGA on the dev cluster against a new database on an existing
+   PostgreSQL-compatible cluster; sync CronJobs; Gojira topology endpoint.
 3. SDK: the agent SDK calls `Door.decide` at tool dispatch; Atlas + Beacon adopt.
 4. Console in kobo: what-can, playground + explain, grants with the write gate,
    pinned assertions.
@@ -136,6 +143,6 @@ Runtime agents call `check` on the OpenFGA gRPC port directly, not through kobo.
 
 ## Prototype artifacts
 
-`catalogues/example.yaml`, `scripts/gen_model.py`, `model/example.fga` (generated), `model/example.fga.yaml`
-(4 tests, 16 checks, 10 list-objects, 2 list-users, all passing with
-`fga model test`).
+`catalogues/example.yaml`, `bab/model.py` (the generator), `model/example.fga`
+(generated), `model/example.fga.yaml` (the `fga model test` suite, which CI
+runs).
