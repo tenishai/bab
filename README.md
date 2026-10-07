@@ -60,6 +60,19 @@ d = door.decide("atlas", "pod_delete", "namespace:platform-prod/ingest")
 | `bab/sync/` | identity (Okta groups -> members), topology (tree + owners); reconcile owns whole relations |
 | `model/example.fga.yaml` | the fixture + assertions; `fga model test` and `fga store import` both read it |
 
+## How this was built
+
+tenishai is a small team of engineers who build with AI coding agents. Most of
+this code was written in pairing sessions with Claude models in Claude Code: a
+person set the design, directed the work and reviewed what landed, and the
+agent wrote much of the code and docs. Many commits name the agent in a
+`Co-Authored-By:` trailer, either a Claude model or Poe (earlier Raven), the
+name of the agent one of us pairs with. A commit without a trailer may still
+have had AI help.
+
+In this repo, "Ember (SRE AI)" in docs and pull requests is the agent Shaz pairs
+with. Its commits name the Claude model in the trailer, not Ember.
+
 ## License
 
 AGPL-3.0-or-later, the GNU Affero General Public License version 3 or (at your option) any later version (see [LICENSE](LICENSE)).

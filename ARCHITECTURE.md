@@ -29,6 +29,6 @@ GOTCHAS:
 - Syncs own WHOLE relations: okta owns `member`; topology owns `team`, `owner` and parent-link relations. A topology sync from a partial file deletes every link it didn't produce.
 - OpenFgaStore wraps check/list_users/list_objects errors in StoreError (door fails closed), but write/delete/read_all do not: a sync failure surfaces as a raw SDK exception.
 - The write gate with pinned assertions (README "every policy change is tested before it lands") is design, not code: nothing here runs assertions on a grant write.
-- docs/design.md is partly stale: its data-model section names ceiling tuples `<action>_ceiling` and says ceilings stay out of the runtime model; the code (and design.md's own "Decisions" section) uses `ceiling_<action>[_gated]` relations in the model. It cites `gen_model.py` / `scripts/gen_model.py`; the generator is bab/model.py.
+- docs/design.md is a design record: the console, deploy and SDK hook it describes are plans, not code.
 - bab is authorization, NOT the approval UX: it returns approvers; posting the plan and waiting for ✅ is the caller's job.
 RELATED DOCS: docs/design.md (data model, API sketch, increments), README.md.
