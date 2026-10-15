@@ -9,7 +9,7 @@ WHAT: "the door": actor → action → object authorization for agent fleets on 
 STATE: main, v0.1.0 (pyproject + bab/__init__.py), package name `tenish-bab`. Increment one of docs/design.md done 2026-09-16 (catalogue, generated model with ceilings, door, ceiling check, Okta + topology syncs, CLI, demo). Snapshot commit 364e2df. Not deployed from here; no sibling repo imports it yet.
 STACK: Python ≥3.11, hatchling. Deps: openfga-sdk ≥0.9 (sync client, imported lazily inside OpenFgaStore), pyyaml, httpx. Dev: pytest, ruff. OpenFGA CLI `fga` (FGA_VERSION 0.7.20) fetched by `make fga`. Dockerfile: python:3.12-slim, ENTRYPOINT `bab` (meant for sync CronJobs / ops checks).
 ENTRY:
-- CLI `bab` → bab/cli.py:main: `model <catalogue>` (DSL to stdout), `check --agent --action --object [--fallback-approver]` (exit 2 on deny), `sync okta|topology [--dry-run] [--file]`. Store from --url/--store-id/--model-id or BAB_FGA_URL / BAB_FGA_STORE_ID / BAB_FGA_MODEL_ID.
+- CLI `bab` → bab/cli.py:main: `model <catalogue>` (DSL to stdout), `check --agent --action --object [--fallback-approver]` (exit 2 on deny), `sync okta|topology [--dry-run] [--okta-url] [--prefix] [--file] [--gojira-url]`. Store from --url/--store-id/--model-id or BAB_FGA_URL / BAB_FGA_STORE_ID / BAB_FGA_MODEL_ID.
 - library → `from bab import Door, Catalogue, Decision, Verdict`; bab.store.OpenFgaStore.
 - Makefile: fga, model (regenerate + validate), test-model (`fga model test` on model/example.fga.yaml), demo / demo-down (OpenFGA in Docker on :18080).
 
