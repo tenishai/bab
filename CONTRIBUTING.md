@@ -12,7 +12,7 @@ python3 -m venv venv && venv/bin/pip install -e ".[dev]"
 
 ## Run the checks
 
-These are the same steps CI runs (`.github/workflows/ci.yml`):
+These are the same checks CI runs (`.github/workflows/ci.yml`; CI's venv is `.venv`):
 
 ```
 venv/bin/ruff check bab tests
@@ -22,6 +22,9 @@ git diff --exit-code model/example.fga   # the model is generated; do not hand-e
 make test-model PY=venv/bin/python
 venv/bin/pytest -q
 ```
+
+Before you push, also run `python3 scripts/check_arch_cards.py` (see AGENTS.md).
+CI doesn't run it.
 
 If you change a catalogue in `catalogues/`, regenerate the model and commit the result.
 

@@ -23,7 +23,8 @@ team membership, not pasted into each agent.
 | Syncs | Okta (people), topology (resources), console (grants) | no |
 
 The runtime never depends on the console. If the store is unreachable past a
-TTL, the SDK degrades to *approve for every mutation, allow reads*. The
+TTL, the SDK degrades to *approve for every mutation, allow reads*; with no
+fallback approvers configured, a mutation is denied (`Door`, `bab/door.py`). The
 emergency lever stays in IAM: revoke the GSA binding or scale the agent to 0.
 
 ## Data model
@@ -138,8 +139,8 @@ Runtime agents call `check` on the OpenFGA gRPC port directly, not through kobo.
   emitter; not in the first increment.
 - Requester attributes beyond team membership (time windows, ticket refs) —
   deferred until a real rule needs them; OpenFGA conditions exist if so.
-- Atlas's full action list (7 gated kinds today) and Beacon's need entering in
-  the catalogue; the prototype carries 5 representative actions.
+- The catalogue now carries Atlas's 7 gated actions and Beacon's 2, plus 3
+  global reads (`catalogues/example.yaml`, 12 actions).
 
 ## Prototype artifacts
 

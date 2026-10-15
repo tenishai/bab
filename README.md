@@ -12,8 +12,9 @@ what a child's companion may do.
   console (grants, ceiling-checked at write time).
 - The runtime path is one `check` at tool dispatch, fail-closed. The console is
   never in the runtime path; the emergency lever stays in IAM.
-- Every policy change is **tested** before it lands: pinned assertions run
-  against the candidate tuples and a failure names the assertion.
+- Policy changes are meant to be **tested** before they land: pinned assertions
+  run against the candidate tuples and a failure names the assertion. This write
+  gate is design, not code yet (docs/design.md, increment 4).
 
 Design: [docs/design.md](docs/design.md). First profile: [catalogues/example.yaml](catalogues/example.yaml).
 
@@ -31,7 +32,7 @@ make demo-down
 
 ```
 atlas     pod_delete   namespace:platform-dev/ingest   -> {"verdict": "allow", ...}
-atlas     pod_delete   namespace:platform-prod/ingest  -> {"verdict": "approve", "approvers": ["user:carol", "user:bob", "user:alice"], ...}
+atlas     pod_delete   namespace:platform-prod/ingest  -> {"verdict": "approve", "approvers": ["user:alice", "user:bob", "user:carol"], ...}
 beacon   pod_delete   namespace:data-kafka/streams   -> {"verdict": "deny", "reason": "agent:beacon holds neither pod_delete nor pod_delete_gated on ...
 --- store unreachable (fail-closed):
 {"verdict": "approve", "reason": "store unreachable; fallback approvers", "degraded": true}
@@ -48,6 +49,19 @@ door = Door(OpenFgaStore(url, store_id), catalogue.load("catalogues/example.yaml
 d = door.decide("atlas", "pod_delete", "namespace:platform-prod/ingest")
 # d.verdict in {ALLOW, APPROVE, DENY}; d.approvers; d.reason; d.degraded
 ```
+
+## Syncs
+
+```
+bab sync okta --okta-url https://okta.example.com   # or BAB_OKTA_URL; required
+bab sync topology --file topology.yaml              # or from Gojira: --gojira-url / BAB_GOJIRA_URL
+```
+
+The okta sync turns groups named `engineering_<team>` into team members;
+`--prefix` changes that prefix. Bearer tokens come from `BAB_OKTA_TOKEN` and
+`BAB_GOJIRA_TOKEN`. `--dry-run` prints the writes (`+`) and deletes (`-`)
+without applying them. Each sync owns whole relations, so it deletes any tuple
+in those relations that it didn't produce.
 
 ## Layout
 
