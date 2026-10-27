@@ -15,7 +15,8 @@ what a child's companion may do.
 - Every policy change is **tested** before it lands: pinned assertions run
   against the candidate tuples and a failure names the assertion.
 
-Design: [docs/design.md](docs/design.md). First profile: [catalogues/example.yaml](catalogues/example.yaml).
+Design: [docs/design.md](docs/design.md) (increment one, built) and
+[docs/design-leases.md](docs/design-leases.md) (next: requests, grants with expiry, one-hour leases). First profile: [catalogues/example.yaml](catalogues/example.yaml).
 
 ## Try it
 

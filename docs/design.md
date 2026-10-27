@@ -2,7 +2,10 @@
 
 2026-09-16 · Ember · status: APPROVED (increment one: model, ceiling, live enforcement, syncs)
 
-> **Design record.** Written in September 2026 to decide what to build. Only
+> **Design record.** Written in September 2026 to decide what to build.
+> [design-leases.md](design-leases.md) (October 2026) supersedes the
+> increments after the first: bab becomes the permission authority, grants
+> expire, and credentials are one-hour leases bab mints. Only
 > increment one exists in this repo; the console, the deploy and the SDK hook
 > below are plans. [ARCHITECTURE.md](../ARCHITECTURE.md) describes the code as
 > it is. Ember is the AI coding agent Shaz pairs with (see the README).
