@@ -31,4 +31,4 @@ GOTCHAS:
 - The write gate with pinned assertions (README "every policy change is tested before it lands") is design, not code: nothing here runs assertions on a grant write.
 - docs/design.md is a design record: the console, deploy and SDK hook it describes are plans, not code.
 - bab is authorization, NOT the approval UX: it returns approvers; posting the plan and waiting for ✅ is the caller's job.
-RELATED DOCS: docs/design.md (data model, API sketch, increments), README.md.
+RELATED DOCS: docs/design.md (increment one: data model, API sketch), docs/design-leases.md (proposal: bab as permission authority, conditional grants, leases, minters), README.md.
