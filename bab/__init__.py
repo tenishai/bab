@@ -3,5 +3,5 @@
 from bab.catalogue import Action, Catalogue
 from bab.door import Decision, Door, Verdict
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["Action", "Catalogue", "Decision", "Door", "Verdict"]
