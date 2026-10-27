@@ -39,9 +39,15 @@ def agent_verifier():
 
 
 def build_app():
-    store = OpenFgaStore(_required("BAB_FGA_URL"), _required("BAB_FGA_STORE_ID"),
-                         os.environ.get("BAB_FGA_MODEL_ID") or None)
     cat = cat_mod.load(os.environ.get("BAB_CATALOGUE", "catalogues/room.yaml"))
+    url, token = _required("BAB_FGA_URL"), os.environ.get("BAB_FGA_TOKEN") or None
+    store_id, model_id = os.environ.get("BAB_FGA_STORE_ID"), os.environ.get("BAB_FGA_MODEL_ID")
+    if not store_id:  # nothing pre-provisioned: find or create the store by name, write the model
+        from bab.service.fga_boot import ensure_store_and_model
+
+        store_id, model_id = ensure_store_and_model(url, cat, os.environ.get("BAB_FGA_STORE_NAME", "bab"), token,
+                                                    os.environ.get("BAB_FGA_CLI") or None)
+    store = OpenFgaStore(url, store_id, model_id or None, token)
     db = _required("BAB_DATABASE_URL")  # the room's PostgreSQL, a `bab` database beside OpenFGA's
     if db.startswith("sqlite") and os.environ.get("BAB_ALLOW_SQLITE") != "1":
         raise SystemExit("BAB_DATABASE_URL points at SQLite; a deployment uses PostgreSQL "

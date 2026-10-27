@@ -20,7 +20,8 @@ def _store(args) -> OpenFgaStore:
     store_id = args.store_id or os.environ.get("BAB_FGA_STORE_ID")
     if not store_id:
         sys.exit("store id required (--store-id or BAB_FGA_STORE_ID)")
-    return OpenFgaStore(url, store_id, args.model_id or os.environ.get("BAB_FGA_MODEL_ID"))
+    return OpenFgaStore(url, store_id, args.model_id or os.environ.get("BAB_FGA_MODEL_ID"),
+                        os.environ.get("BAB_FGA_TOKEN") or None)
 
 
 def cmd_model(args) -> int:
