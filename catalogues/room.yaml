@@ -1,0 +1,67 @@
+# A room's catalogue: integrations under one room, permissions per vendor.
+# `vendor` groups permissions for the console's picker; `group` is the vendor's own
+# section; `extra` carries what a minter needs (aws: the IAM actions a permission means).
+# Later `bab catalogue build` generates this from cloud-access packs and vendor files.
+resources: [room, integration]
+
+tiers:
+  read:    {lease_seconds: 3600, validity_days: standing}
+  mutate:  {lease_seconds: 3600, validity_days: 30}
+  destroy: {lease_seconds: 1800, validity_days: 7}
+
+actions:
+  # ---- aws (from cloud-access packs) ----
+  - name: aws_inventory_read
+    tier: read
+    vendor: aws
+    group: Inventory
+    description: See what exists across services (ViewOnlyAccess)
+    extra: {iam: ["ec2:Describe*", "elasticloadbalancing:Describe*", "ecs:Describe*", "ecs:List*", "eks:Describe*", "eks:List*", "rds:Describe*", "lambda:List*", "lambda:GetFunctionConfiguration", "iam:Get*", "iam:List*", "s3:ListAllMyBuckets", "s3:GetBucketLocation", "tag:Get*"]}
+  - name: aws_logs_read
+    tier: read
+    vendor: aws
+    group: Logs and metrics
+    description: Read CloudWatch metrics and query log groups
+    extra: {iam: ["cloudwatch:Get*", "cloudwatch:List*", "cloudwatch:Describe*", "logs:Describe*", "logs:Get*", "logs:List*", "logs:FilterLogEvents", "logs:StartQuery", "logs:StopQuery"]}
+  - name: aws_cloudtrail_read
+    tier: read
+    vendor: aws
+    group: Security
+    description: Read CloudTrail history
+    extra: {iam: ["cloudtrail:LookupEvents", "cloudtrail:GetTrail", "cloudtrail:GetTrailStatus", "cloudtrail:ListTrails"]}
+  - name: aws_security_audit_read
+    tier: read
+    vendor: aws
+    group: Security
+    description: Audit configuration (SecurityAudit)
+    extra: {iam: ["config:Describe*", "config:Get*", "guardduty:Get*", "guardduty:List*", "securityhub:Get*", "securityhub:List*", "kms:Describe*", "kms:List*"]}
+  - name: aws_cost_read
+    tier: read
+    vendor: aws
+    group: Billing
+    description: Read spend, budgets and rightsizing recommendations
+    extra: {iam: ["ce:Get*", "ce:Describe*", "ce:List*", "budgets:ViewBudget", "budgets:Describe*", "cur:Describe*", "compute-optimizer:Get*", "trustedadvisor:List*", "trustedadvisor:Describe*"]}
+  - name: aws_ecs_update_service
+    tier: mutate
+    vendor: aws
+    group: Compute
+    description: Change an ECS service's task definition or desired count
+    extra: {iam: ["ecs:UpdateService"]}
+  - name: aws_ec2_stop_instances
+    tier: destroy
+    vendor: aws
+    group: Compute
+    description: Stop EC2 instances
+    extra: {iam: ["ec2:StopInstances"]}
+
+  # ---- datadog ----
+  - {name: datadog_monitors_read,   tier: read,   vendor: datadog, group: Monitors,   description: List and read monitors}
+  - {name: datadog_monitors_write,  tier: mutate, vendor: datadog, group: Monitors,   description: Create, edit and mute monitors}
+  - {name: datadog_dashboards_read, tier: read,   vendor: datadog, group: Dashboards, description: Read dashboards}
+  - {name: datadog_logs_read,       tier: read,   vendor: datadog, group: Logs,       description: Search and read log events}
+  - {name: datadog_metrics_read,    tier: read,   vendor: datadog, group: Metrics,    description: Query metrics}
+
+  # ---- github ----
+  - {name: github_repos_read,   tier: read,    vendor: github, group: Repositories,  description: Read code, issues and pull requests}
+  - {name: github_pulls_write,  tier: mutate,  vendor: github, group: Pull requests, description: Open, comment on and review pull requests}
+  - {name: github_repos_delete, tier: destroy, vendor: github, group: Repositories,  description: Delete a repository}
