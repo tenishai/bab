@@ -4,6 +4,9 @@
   approve  -> post the plan, wait for ✅ from one of `approvers`
   deny     -> tool result explains; the LLM does not retry
 
+Every check carries `current_time`, so a grant written with an expiry stops
+answering yes at that instant (see model.py).
+
 Fail-closed: if the store cannot answer, reads are allowed and everything else
 requires approval from the agent's static fallback approvers (its config today).
 No fallback approvers -> deny. `degraded=True` marks such decisions in the audit.
@@ -13,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 
 from bab.catalogue import Catalogue
@@ -41,7 +45,7 @@ class Door:
         self.catalogue = catalogue
         self.fallback_approvers = tuple(fallback_approvers)
 
-    def decide(self, agent: str, action: str, object: str) -> Decision:
+    def decide(self, agent: str, action: str, object: str, now: datetime | None = None) -> Decision:
         act = self.catalogue.action(action)
         if act is None:
             return Decision(Verdict.DENY, f"action {action!r} is not in the catalogue")
@@ -49,11 +53,12 @@ class Door:
         if not sep or typ not in self.catalogue.resources:
             return Decision(Verdict.DENY, f"object {object!r} is not a {'/'.join(self.catalogue.resources)}")
         subject = agent if ":" in agent else f"agent:{agent}"
+        context = {"current_time": rfc3339(now)}
 
         try:
-            if self.store.check(subject, act.name, object):
+            if self.store.check(subject, act.name, object, context):
                 return Decision(Verdict.ALLOW, f"{subject} holds {act.name} on {object}")
-            if self.store.check(subject, act.gated, object):
+            if self.store.check(subject, act.gated, object, context):
                 approvers = tuple(self.store.list_users(object, "approver"))
                 if not approvers:
                     return Decision(Verdict.DENY, f"{object} has no approvers; nobody can say yes")
@@ -67,3 +72,11 @@ class Door:
                 return Decision(Verdict.APPROVE, "store unreachable; fallback approvers",
                                 self.fallback_approvers, degraded=True)
             return Decision(Verdict.DENY, "store unreachable and no fallback approvers", degraded=True)
+
+
+def rfc3339(when: datetime | None = None) -> str:
+    """The instant as OpenFGA's timestamp type wants it: RFC 3339 in UTC, whole seconds."""
+    when = when or datetime.now(UTC)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -12,6 +12,9 @@ what a child's companion may do.
   console (grants, ceiling-checked at write time).
 - The runtime path is one `check` at tool dispatch, fail-closed. The console is
   never in the runtime path; the emergency lever stays in IAM.
+- **Grants expire.** A grant carries OpenFGA's `grant_window` condition and every
+  check passes the current time, so it stops answering yes on the dot; `grants.sweep`
+  only tidies. Read-tier grants stand; mutate and destroy tiers expire by default.
 - Every policy change is **tested** before it lands: pinned assertions run
   against the candidate tuples and a failure names the assertion.
 

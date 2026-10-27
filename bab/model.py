@@ -7,11 +7,17 @@ Per action A on every resource level:
   ceiling_A       the owning TEAM may hold an allow grant here (checked at write time)
   ceiling_A_gated the team may hold an approve grant here; an allow ceiling implies it
 Approvers on the root = members of the owning team; every level below inherits.
+
+Grants may expire: `A` and `A_gated` accept `agent with grant_window`, the one
+condition the model defines. A tuple written with `expires_at` in its context
+answers yes only while the check's `current_time` is before it. Ceilings and the
+tree never carry conditions.
 """
 
 from __future__ import annotations
 
 from bab.catalogue import Catalogue
+from bab.store import CONDITION
 
 HEADER = """model
   schema 1.1
@@ -25,6 +31,11 @@ type team
 type agent
   relations
     define team: [team]
+"""
+
+FOOTER = f"""condition {CONDITION}(current_time: timestamp, expires_at: timestamp) {{
+  current_time < expires_at
+}}
 """
 
 
@@ -42,7 +53,8 @@ def generate(cat: Catalogue) -> str:
             return f" or {rel} from {parent}" if parent else ""
 
         for a in cat.actions:
-            subjects = "[agent, agent:*]" if a.global_ else "[agent]"
+            direct = "agent, agent:*" if a.global_ else "agent"
+            subjects = f"[{direct}, agent with {CONDITION}]"
             lines += [
                 f"    define {a.name}: {subjects}{inherit(a.name)}",
                 f"    define {a.gated}: {subjects}{inherit(a.gated)}",
@@ -51,4 +63,5 @@ def generate(cat: Catalogue) -> str:
                 f"    define ceiling_{a.gated}: [team] or ceiling_{a.name}{inherit(f'ceiling_{a.gated}')}",
             ]
         out.append("\n".join(lines) + "\n")
+    out.append(FOOTER)
     return "\n".join(out)

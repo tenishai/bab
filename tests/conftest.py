@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from bab.catalogue import Catalogue
-from bab.store import StoreError, Tuple
+from bab.store import StoreError
 
 
 class FakeStore:
@@ -18,9 +18,19 @@ class FakeStore:
         if self.broken:
             raise StoreError("connection refused")
 
-    def check(self, user, relation, object):
+    def check(self, user, relation, object, context=None):
         self._guard()
-        return Tuple(user, relation, object) in self.tuples
+        now = (context or {}).get("current_time")
+        for t in self.tuples:
+            if t.key != (user, relation, object):
+                continue
+            if t.expires_at is None:
+                return True
+            if now is None:
+                raise StoreError("conditional tuple checked without current_time")
+            if now < t.expires_at:
+                return True
+        return False
 
     def list_users(self, object, relation, user_type="user"):
         self._guard()
