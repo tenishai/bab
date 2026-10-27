@@ -37,6 +37,8 @@ class Action:
     description: str = ""
     global_: bool = False  # may be granted to every agent at once (agent:*)
     group: str = ""  # display grouping in a console (the vendor's own section), never a relation
+    vendor: str = ""  # which integration family this permission belongs to (aws, datadog, github)
+    extra: dict = field(default_factory=dict)  # minter data (e.g. aws: {"iam": ["ec2:Describe*"]})
 
     @property
     def gated(self) -> str:
@@ -63,6 +65,9 @@ class Catalogue:
     def tier(self, name: str) -> Tier:
         return next(t for t in self.tiers if t.name == name)
 
+    def for_vendor(self, vendor: str) -> tuple[Action, ...]:
+        return tuple(a for a in self.actions if a.vendor == vendor)
+
     @property
     def root(self) -> str:
         return self.resources[0]
@@ -88,8 +93,12 @@ class Catalogue:
             tier = entry.get("tier")
             if tier not in TIERS:
                 raise CatalogueError(f"action {name!r}: tier must be one of {TIERS}, got {tier!r}")
+            extra = entry.get("extra") or {}
+            if not isinstance(extra, dict):
+                raise CatalogueError(f"action {name!r}: extra must be a mapping")
             actions.append(Action(name, tier, entry.get("description", ""), bool(entry.get("global")),
-                                  str(entry.get("group", "") or "")))
+                                  str(entry.get("group", "") or ""), str(entry.get("vendor", "") or ""),
+                                  dict(extra)))
         names = [a.name for a in actions]
         if len(set(names)) != len(names):
             raise CatalogueError("duplicate action name")

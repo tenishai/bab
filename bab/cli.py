@@ -54,6 +54,27 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    import uvicorn
+
+    from bab.service.config import build_app
+
+    uvicorn.run(build_app(), host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+def cmd_sweep(args) -> int:
+    from datetime import UTC, datetime
+
+    from bab import grants
+
+    dead = grants.sweep(_store(args), datetime.now(UTC))
+    for t in dead:
+        print(f"- {t}")
+    print(f"swept {len(dead)} expired grants")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="bab", description="the door")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -86,6 +107,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--file", help="topology YAML (instead of Gojira)")
     s.add_argument("--gojira-url", default=os.environ.get("BAB_GOJIRA_URL", ""))
     s.set_defaults(fn=cmd_sync)
+
+    sv = sub.add_parser("serve", help="run the HTTP service (configured by BAB_* variables)")
+    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--port", type=int, default=int(os.environ.get("BAB_PORT", "8080")))
+    sv.set_defaults(fn=cmd_serve)
+
+    sw = sub.add_parser("sweep", help="delete grant tuples whose window has closed")
+    store_args(sw)
+    sw.set_defaults(fn=cmd_sweep)
 
     args = p.parse_args(argv)
     if getattr(args, "source", None) == "okta" and not args.okta_url:
