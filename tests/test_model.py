@@ -18,8 +18,10 @@ def test_every_action_gets_the_five_relations_at_every_level(cat):
         block = text.split(f"type {level}\n", 1)[1].split("\ntype ", 1)[0]
         for rel in ("pod_delete", "pod_delete_gated", "can_pod_delete", "ceiling_pod_delete", "ceiling_pod_delete_gated"):
             assert f"define {rel}:" in block, (level, rel)
-    assert "define log_read: [agent, agent:*]" in text        # global
-    assert "define pod_delete: [agent]\n" in text              # not global
+    assert "define log_read: [agent, agent:*, agent with grant_window]" in text   # global
+    assert "define pod_delete: [agent, agent with grant_window]\n" in text        # not global
+    assert "define ceiling_pod_delete: [team]" in text          # ceilings never expire
+    assert text.rstrip().endswith("condition grant_window(current_time: timestamp, expires_at: timestamp) {\n  current_time < expires_at\n}")
     assert "define approver: member from owner" in text        # root
     assert "define approver: approver from cluster" in text    # inherited
 

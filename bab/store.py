@@ -1,4 +1,9 @@
-"""Store protocol + the OpenFGA adapter. Everything above this talks to `Store`."""
+"""Store protocol + the OpenFGA adapter. Everything above this talks to `Store`.
+
+A tuple may carry an expiry. In the store that is OpenFGA's `grant_window`
+condition with `expires_at` in the tuple's context; a check passes
+`current_time` in its context and the tuple stops answering yes at that instant.
+"""
 
 from __future__ import annotations
 
@@ -9,15 +14,23 @@ from typing import Protocol
 
 log = logging.getLogger(__name__)
 
+CONDITION = "grant_window"  # the one condition the generated model defines
+
 
 @dataclass(frozen=True)
 class Tuple:
     user: str
     relation: str
     object: str
+    expires_at: str | None = None  # RFC 3339 UTC ("2026-10-27T15:04:00Z"); None = standing
 
     def __str__(self) -> str:
-        return f"{self.user} {self.relation} {self.object}"
+        base = f"{self.user} {self.relation} {self.object}"
+        return f"{base} until {self.expires_at}" if self.expires_at else base
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.user, self.relation, self.object)
 
 
 class StoreError(RuntimeError):
@@ -25,7 +38,7 @@ class StoreError(RuntimeError):
 
 
 class Store(Protocol):
-    def check(self, user: str, relation: str, object: str) -> bool: ...
+    def check(self, user: str, relation: str, object: str, context: dict | None = None) -> bool: ...
     def list_users(self, object: str, relation: str, user_type: str = "user") -> list[str]: ...
     def list_objects(self, user: str, relation: str, object_type: str) -> list[str]: ...
     def write(self, tuples: Iterable[Tuple]) -> None: ...
@@ -44,14 +57,16 @@ class OpenFgaStore:
         self._client = OpenFgaClient(cfg)
         log.debug("openfga store: url=%s store=%s model=%s", api_url, store_id, model_id)
 
-    def check(self, user: str, relation: str, object: str) -> bool:
+    def check(self, user: str, relation: str, object: str, context: dict | None = None) -> bool:
         from openfga_sdk.client.models import ClientCheckRequest
 
         try:
-            resp = self._client.check(ClientCheckRequest(user=user, relation=relation, object=object))
+            resp = self._client.check(
+                ClientCheckRequest(user=user, relation=relation, object=object, context=context)
+            )
         except Exception as exc:
             raise StoreError(f"check {user} {relation} {object}: {exc}") from exc
-        log.debug("check %s %s %s -> %s", user, relation, object, resp.allowed)
+        log.debug("check %s %s %s %s -> %s", user, relation, object, context or "", resp.allowed)
         return bool(resp.allowed)
 
     def list_users(self, object: str, relation: str, user_type: str = "user") -> list[str]:
@@ -81,8 +96,16 @@ class OpenFgaStore:
 
     def write(self, tuples: Iterable[Tuple]) -> None:
         from openfga_sdk.client.models import ClientTuple
+        from openfga_sdk.models import RelationshipCondition
 
-        body = [ClientTuple(user=t.user, relation=t.relation, object=t.object) for t in tuples]
+        body = [
+            ClientTuple(
+                user=t.user, relation=t.relation, object=t.object,
+                condition=RelationshipCondition(name=CONDITION, context={"expires_at": t.expires_at})
+                if t.expires_at else None,
+            )
+            for t in tuples
+        ]
         if body:
             self._client.write_tuples(body)
             log.info("wrote %d tuples", len(body))
@@ -90,6 +113,7 @@ class OpenFgaStore:
     def delete(self, tuples: Iterable[Tuple]) -> None:
         from openfga_sdk.client.models import ClientTuple
 
+        # Deletes name the key only; a conditional tuple is deleted by the same key.
         body = [ClientTuple(user=t.user, relation=t.relation, object=t.object) for t in tuples]
         if body:
             self._client.delete_tuples(body)
@@ -102,7 +126,10 @@ class OpenFgaStore:
         token = None
         while True:
             resp = self._client.read(ReadRequestTupleKey(), {"continuation_token": token} if token else None)
-            out += [Tuple(t.key.user, t.key.relation, t.key.object) for t in resp.tuples]
+            for t in resp.tuples:
+                cond = getattr(t.key, "condition", None)
+                expires = (cond.context or {}).get("expires_at") if cond and cond.name == CONDITION else None
+                out.append(Tuple(t.key.user, t.key.relation, t.key.object, expires))
             token = resp.continuation_token
             if not token:
                 return out

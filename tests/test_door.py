@@ -43,3 +43,17 @@ def test_fail_closed_when_store_is_down(cat):
 
     no_fallback = Door(broken, cat).decide("atlas", "pod_delete", NS)
     assert no_fallback.verdict is Verdict.DENY and no_fallback.degraded
+
+
+def test_an_expired_grant_is_a_deny_and_a_live_one_an_allow(cat):
+    from datetime import UTC, datetime
+
+    from bab.store import Tuple
+    from tests.conftest import FakeStore
+
+    store = FakeStore({Tuple("agent:atlas", "pod_delete", "namespace:p/x", "2026-10-27T15:00:00Z")})
+    door = Door(store, cat)
+    before = datetime(2026, 10, 27, 14, 59, tzinfo=UTC)
+    after = datetime(2026, 10, 27, 15, 0, tzinfo=UTC)
+    assert door.decide("atlas", "pod_delete", "namespace:p/x", now=before).verdict is Verdict.ALLOW
+    assert door.decide("atlas", "pod_delete", "namespace:p/x", now=after).verdict is Verdict.DENY

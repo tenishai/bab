@@ -15,6 +15,12 @@ import yaml
 log = logging.getLogger(__name__)
 
 TIERS = ("read", "mutate", "destroy")
+# Per tier: how long a minted lease lives, and how long a grant stays valid (None = standing).
+TIER_DEFAULTS: dict[str, tuple[int, int | None]] = {
+    "read": (3600, None),
+    "mutate": (3600, 30),
+    "destroy": (1800, 7),
+}
 IDENT = re.compile(r"^[a-z][a-z0-9_]*$")
 # Relations the generator emits itself; an action may not collide with them.
 RESERVED = {"member", "team", "owner", "approver", "user", "agent"}
@@ -30,6 +36,7 @@ class Action:
     tier: str
     description: str = ""
     global_: bool = False  # may be granted to every agent at once (agent:*)
+    group: str = ""  # display grouping in a console (the vendor's own section), never a relation
 
     @property
     def gated(self) -> str:
@@ -37,12 +44,24 @@ class Action:
 
 
 @dataclass(frozen=True)
+class Tier:
+    name: str
+    lease_seconds: int
+    validity_days: int | None  # None = a grant on this tier never expires on its own
+
+
+@dataclass(frozen=True)
 class Catalogue:
     resources: tuple[str, ...]  # root first; each level inherits from its parent
     actions: tuple[Action, ...] = field(default_factory=tuple)
+    tiers: tuple[Tier, ...] = field(default_factory=lambda: tuple(
+        Tier(n, lease, days) for n, (lease, days) in TIER_DEFAULTS.items()))
 
     def action(self, name: str) -> Action | None:
         return next((a for a in self.actions if a.name == name), None)
+
+    def tier(self, name: str) -> Tier:
+        return next(t for t in self.tiers if t.name == name)
 
     @property
     def root(self) -> str:
@@ -69,12 +88,27 @@ class Catalogue:
             tier = entry.get("tier")
             if tier not in TIERS:
                 raise CatalogueError(f"action {name!r}: tier must be one of {TIERS}, got {tier!r}")
-            actions.append(Action(name, tier, entry.get("description", ""), bool(entry.get("global"))))
+            actions.append(Action(name, tier, entry.get("description", ""), bool(entry.get("global")),
+                                  str(entry.get("group", "") or "")))
         names = [a.name for a in actions]
         if len(set(names)) != len(names):
             raise CatalogueError("duplicate action name")
+
+        overrides = raw.get("tiers") or {}
+        for t in overrides:
+            if t not in TIERS:
+                raise CatalogueError(f"tiers: unknown tier {t!r}")
+        tiers = []
+        for t, (lease, days) in TIER_DEFAULTS.items():
+            o = overrides.get(t) or {}
+            lease = int(o.get("lease_seconds", lease))
+            days = o.get("validity_days", days)
+            days = None if days in (None, "standing") else int(days)
+            if lease <= 0 or (days is not None and days <= 0):
+                raise CatalogueError(f"tiers.{t}: lease_seconds and validity_days must be positive")
+            tiers.append(Tier(t, lease, days))
         log.debug("catalogue: %d levels, %d actions", len(resources), len(actions))
-        return cls(resources, tuple(actions))
+        return cls(resources, tuple(actions), tuple(tiers))
 
 
 def load(path: str | Path) -> Catalogue:

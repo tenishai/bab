@@ -37,8 +37,24 @@ tuples:
   - {user: agent:atlas,   relation: node_pool_create_gated, object: project:acme-platform-prod}
   - {user: agent:beacon, relation: kafka_topic_config_update_gated, object: project:acme-data-prod}
   - {user: "agent:*",    relation: log_read,               object: project:acme-legacy-dev}
+  # a grant with an expiry: the console wrote it with the grant_window condition
+  - user: agent:beacon
+    relation: gcloud_read
+    object: project:acme-data-prod
+    condition: {name: grant_window, context: {expires_at: "2026-11-01T00:00:00Z"}}
 
 tests:
+  - name: beacon — an expiring grant answers yes before its window closes, no after, down the tree
+    check:
+      - user: agent:beacon
+        object: cluster:data-kafka
+        context: {current_time: "2026-10-27T00:00:00Z"}
+        assertions: {gcloud_read: true, can_gcloud_read: true}
+      - user: agent:beacon
+        object: cluster:data-kafka
+        context: {current_time: "2026-11-01T00:00:00Z"}
+        assertions: {gcloud_read: false, can_gcloud_read: false}
+
   - name: atlas — allow on dev, approval on prod, inherited three levels down
     check:
       - user: agent:atlas
