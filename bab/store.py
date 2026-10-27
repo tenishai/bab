@@ -49,11 +49,16 @@ class Store(Protocol):
 class OpenFgaStore:
     """Thin sync adapter over openfga_sdk. Any SDK/network failure becomes StoreError."""
 
-    def __init__(self, api_url: str, store_id: str, model_id: str | None = None):
+    def __init__(self, api_url: str, store_id: str, model_id: str | None = None, api_token: str | None = None):
         from openfga_sdk import ClientConfiguration
         from openfga_sdk.sync import OpenFgaClient
 
         cfg = ClientConfiguration(api_url=api_url, store_id=store_id, authorization_model_id=model_id)
+        if api_token:  # OpenFGA's preshared-key authn
+            from openfga_sdk.credentials import CredentialConfiguration, Credentials
+
+            cfg.credentials = Credentials(method="api_token",
+                                          configuration=CredentialConfiguration(api_token=api_token))
         self._client = OpenFgaClient(cfg)
         log.debug("openfga store: url=%s store=%s model=%s", api_url, store_id, model_id)
 

@@ -20,7 +20,8 @@ def _store(args) -> OpenFgaStore:
     store_id = args.store_id or os.environ.get("BAB_FGA_STORE_ID")
     if not store_id:
         sys.exit("store id required (--store-id or BAB_FGA_STORE_ID)")
-    return OpenFgaStore(url, store_id, args.model_id or os.environ.get("BAB_FGA_MODEL_ID"))
+    return OpenFgaStore(url, store_id, args.model_id or os.environ.get("BAB_FGA_MODEL_ID"),
+                        os.environ.get("BAB_FGA_TOKEN") or None)
 
 
 def cmd_model(args) -> int:
@@ -51,6 +52,35 @@ def cmd_sync(args) -> int:
         print(f"+ {t}")
     for t in delete:
         print(f"- {t}")
+    return 0
+
+
+def _port_from_env(default: int = 8080) -> int:
+    """BAB_PORT, tolerating the `tcp://host:port` Kubernetes injects for a Service named bab."""
+    raw = os.environ.get("BAB_PORT", "").strip()
+    if not raw:
+        return default
+    return int(raw.rsplit(":", 1)[-1])
+
+
+def cmd_serve(args) -> int:
+    import uvicorn
+
+    from bab.service.config import build_app
+
+    uvicorn.run(build_app(), host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+def cmd_sweep(args) -> int:
+    from datetime import UTC, datetime
+
+    from bab import grants
+
+    dead = grants.sweep(_store(args), datetime.now(UTC))
+    for t in dead:
+        print(f"- {t}")
+    print(f"swept {len(dead)} expired grants")
     return 0
 
 
@@ -86,6 +116,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--file", help="topology YAML (instead of Gojira)")
     s.add_argument("--gojira-url", default=os.environ.get("BAB_GOJIRA_URL", ""))
     s.set_defaults(fn=cmd_sync)
+
+    sv = sub.add_parser("serve", help="run the HTTP service (configured by BAB_* variables)")
+    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--port", type=int, default=_port_from_env())
+    sv.set_defaults(fn=cmd_serve)
+
+    sw = sub.add_parser("sweep", help="delete grant tuples whose window has closed")
+    store_args(sw)
+    sw.set_defaults(fn=cmd_sweep)
 
     args = p.parse_args(argv)
     if getattr(args, "source", None) == "okta" and not args.okta_url:
