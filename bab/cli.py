@@ -55,6 +55,14 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def _port_from_env(default: int = 8080) -> int:
+    """BAB_PORT, tolerating the `tcp://host:port` Kubernetes injects for a Service named bab."""
+    raw = os.environ.get("BAB_PORT", "").strip()
+    if not raw:
+        return default
+    return int(raw.rsplit(":", 1)[-1])
+
+
 def cmd_serve(args) -> int:
     import uvicorn
 
@@ -111,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sv = sub.add_parser("serve", help="run the HTTP service (configured by BAB_* variables)")
     sv.add_argument("--host", default="0.0.0.0")
-    sv.add_argument("--port", type=int, default=int(os.environ.get("BAB_PORT", "8080")))
+    sv.add_argument("--port", type=int, default=_port_from_env())
     sv.set_defaults(fn=cmd_serve)
 
     sw = sub.add_parser("sweep", help="delete grant tuples whose window has closed")
