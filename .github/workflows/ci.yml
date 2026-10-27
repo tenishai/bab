@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
-      - run: rm -rf .venv && python -m venv .venv && .venv/bin/pip install -q -e ".[dev]"
+      - run: rm -rf .venv && python -m venv .venv && .venv/bin/pip install -q -e ".[dev,service,aws]"
       - run: .venv/bin/ruff check bab tests
       - run: make fga
       - name: model is generated from the catalogue, not hand-edited
