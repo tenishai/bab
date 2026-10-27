@@ -13,11 +13,11 @@ def test_session_policy_is_the_union_of_the_granted_permissions_iam_actions():
     assert session_policy([cat.action("datadog_logs_read")]) is None
 
 
-def test_aws_minter_assumes_with_source_identity_and_the_policy():
+def test_aws_minter_assumes_with_the_agent_in_the_session_name_and_the_policy():
     calls = []
 
-    def assume(role_arn, token, name, source_identity, seconds, policy):
-        calls.append((role_arn, token, name, source_identity, seconds, policy))
+    def assume(role_arn, token, name, seconds, policy):
+        calls.append((role_arn, token, name, seconds, policy))
         return {"Credentials": {"AccessKeyId": "AKIA", "SecretAccessKey": "s", "SessionToken": "t",
                                 "Expiration": datetime(2026, 10, 27, 13, 0, tzinfo=UTC)},
                 "AssumedRoleUser": {"Arn": "arn:aws:sts::123456789012:assumed-role/KoboAccess-Role/bab-sherlock"}}
@@ -26,8 +26,8 @@ def test_aws_minter_assumes_with_source_identity_and_the_policy():
     m = AwsMinter(token_source=lambda aud: f"jwt-for-{aud}", assume=assume)
     out = m.mint("sherlock", "aws-prod", {"role_arn": "arn:aws:iam::123456789012:role/KoboAccess-Role"},
                  [cat.action("aws_logs_read")], 3600)
-    assert calls[0][1:5] == ("jwt-for-sts.amazonaws.com", "bab-sherlock", "sherlock", 3600)
-    assert calls[0][5]["Statement"][0]["Action"][0] == "cloudwatch:Describe*"
+    assert calls[0][1:4] == ("jwt-for-sts.amazonaws.com", "bab-sherlock", 3600)  # the agent rides in the session name
+    assert calls[0][4]["Statement"][0]["Action"][0] == "cloudwatch:Describe*"
     assert out.credential["aws_access_key_id"] == "AKIA" and out.handle == {}
 
 

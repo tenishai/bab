@@ -114,19 +114,20 @@ class AwsMinter:
         self.assume = assume or self._assume
 
     @staticmethod
-    def _assume(role_arn: str, token: str, name: str, source_identity: str, seconds: int,
-                policy: dict | None) -> dict:
+    def _assume(role_arn: str, token: str, name: str, seconds: int, policy: dict | None) -> dict:
+        """AssumeRoleWithWebIdentity. It takes no SourceIdentity (AssumeRole does); the agent's
+        name rides in RoleSessionName, which CloudTrail records as the assumed-role ARN's suffix."""
         try:
             import botocore.session
             from botocore import UNSIGNED
             from botocore.config import Config
-            from botocore.exceptions import ClientError
+            from botocore.exceptions import BotoCoreError, ClientError
         except ImportError as exc:  # pragma: no cover
             raise MintError("botocore is not installed; install bab with the [aws] extra") from exc
         sts = botocore.session.get_session().create_client(
             "sts", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
         kwargs = {"RoleArn": role_arn, "RoleSessionName": name, "WebIdentityToken": token,
-                  "DurationSeconds": seconds, "SourceIdentity": source_identity}
+                  "DurationSeconds": seconds}
         if policy:
             kwargs["Policy"] = json.dumps(policy)
         try:
@@ -134,6 +135,8 @@ class AwsMinter:
         except ClientError as exc:
             err = exc.response.get("Error", {})
             raise MintError(f"AWS refused {role_arn}: {err.get('Code', 'error')} {err.get('Message', '')}".strip()) from exc
+        except BotoCoreError as exc:
+            raise MintError(f"AWS call failed: {exc}") from exc
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
         role_arn = str(spec.get("role_arn", "")).strip()
@@ -143,7 +146,7 @@ class AwsMinter:
         seconds = max(MIN_SECONDS, min(MAX_SECONDS, seconds))
         policy = session_policy(permissions)
         token = self.token_source(audience)
-        resp = self.assume(role_arn, token, session_name("bab-", agent), session_name("", agent), seconds, policy)
+        resp = self.assume(role_arn, token, session_name("bab-", agent), seconds, policy)
         creds = resp["Credentials"]
         exp = creds["Expiration"]
         expires = exp.timestamp() if hasattr(exp, "timestamp") else float(exp)
