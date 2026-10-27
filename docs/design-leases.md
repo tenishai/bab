@@ -166,7 +166,7 @@ principal the vendor trusts.
 
 | family | how bab mints | scoped to the granted set by | max life |
 |---|---|---|---|
-| AWS | `AssumeRoleWithWebIdentity` into the account's `KoboAccess-Role`, trust = bab's own cloud identity, `SourceIdentity=<agent>` | a session policy built from the granted permissions | 1 h (role max) |
+| AWS | `AssumeRoleWithWebIdentity` into the account's `KoboAccess-Role`, trust = bab's own cloud identity, `RoleSessionName=bab-<agent>` (that API takes no SourceIdentity) | a session policy built from the granted permissions | 1 h (role max) |
 | Google Cloud | `generateAccessToken` on the connection's service account | bab's check only; the token carries the connection's role (no session policy on this cloud) | 1 h |
 | Azure | workload identity federation client assertion | bab's check only | about 1 h |
 | GitHub | App installation token | `permissions` and `repositories` narrowing on the token request | 1 h |
@@ -215,7 +215,7 @@ instance):
 | `events` | everything else bab did (sweeps, revokes, minter failures) |
 
 Per-call activity lives with the vendor and names the agent: CloudTrail
-rows carry `SourceIdentity`, GitHub audit carries the installation token's
+rows carry the session name `bab-<agent>` in the assumed-role ARN, GitHub audit carries the installation token's
 actor, Datadog audit carries the per-lease key. The console's Activity view
 reads bab's leases and links to the vendor's log for the window. bab does
 not proxy calls and does not try to see them.
