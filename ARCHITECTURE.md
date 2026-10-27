@@ -1,12 +1,12 @@
 ---
 card: repo-card:bab
 updated: 2026-10-27
-anchor: pyproject.toml sha=fd6efd5a6f09bbc300e15d37d6e3946ef3f2f9dd
+anchor: pyproject.toml sha=3a2e2c9bcdb25633aba73c68bcc70f6870361c06
 ---
 # bab — repo card
 
 WHAT: "the door": actor → action → object authorization for agent fleets on OpenFGA, with three verdicts: allow, approve (a human on the owning team says yes), deny (default). A YAML catalogue generates the OpenFGA model; `Door.decide` is the one runtime check, meant to run at tool dispatch.
-STATE: main, v0.1.0 (pyproject + bab/__init__.py), package name `tenish-bab`. Increment one of docs/design.md done 2026-09-16 (catalogue, generated model with ceilings, door, ceiling check, Okta + topology syncs, CLI, demo). Snapshot commit 364e2df. Not deployed from here; no sibling repo imports it yet.
+STATE: main, v0.2.0 (pyproject + bab/__init__.py), package name `tenish-bab`. Increment one of docs/design.md (catalogue, model with ceilings, door, syncs, CLI) tagged v0.1.0; increments two and three of docs/design-leases.md (expiring grants, `bab serve`, ledger, AWS minter) are 0.2.0. Deployed on one dev cluster through a sibling config repo (bab + OpenFGA, Postgres-backed); CHANGELOG.md from 0.2.0.
 STACK: Python ≥3.11, hatchling. Deps: openfga-sdk ≥0.9 (sync client, imported lazily inside OpenFgaStore), pyyaml, httpx. Extras: service (fastapi, uvicorn, sqlalchemy, PyJWT), postgres (psycopg), aws (botocore). Dev: pytest, ruff, httpx. OpenFGA CLI `fga` (FGA_VERSION 0.7.20) fetched by `make fga`. Dockerfile: python:3.12-slim, ENTRYPOINT `bab` (meant for sync CronJobs / ops checks).
 ENTRY:
 - CLI `bab` → bab/cli.py:main: `model <catalogue>` (DSL to stdout), `check --agent --action --object [--fallback-approver]` (exit 2 on deny), `sync okta|topology [--dry-run] [--file]`, `serve [--host --port]` (the HTTP service from BAB_*), `sweep` (delete expired grant tuples). Store from --url/--store-id/--model-id or BAB_FGA_URL / BAB_FGA_STORE_ID / BAB_FGA_MODEL_ID.

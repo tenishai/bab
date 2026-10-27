@@ -73,7 +73,9 @@ class IntegrationBody(BaseModel):
 
 def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, console: ConsoleAuth,
                minters: dict[str, Minter], settings: Settings) -> FastAPI:
-    app = FastAPI(title="bab", version="0.2.0-dev")
+    from importlib.metadata import version as _v
+
+    app = FastAPI(title="bab", version=_v("tenish-bab"))
     door = Door(store, cat)
 
     # ---- callers -----------------------------------------------------------
