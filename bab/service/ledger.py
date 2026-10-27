@@ -1,7 +1,10 @@
 """The ledger: bab's own record of what was asked, decided, granted and leased.
 
-OpenFGA answers the question; these tables are the audit. SQLite by default,
-PostgreSQL in a deployment (BAB_DATABASE_URL). Tables are created at boot.
+OpenFGA answers the question; these tables are the audit. In a deployment they
+live in a `bab` database on the room's PostgreSQL instance, next to OpenFGA's
+own database (BAB_DATABASE_URL, `postgresql+psycopg://...`); `bab serve` refuses
+SQLite unless told it is a laptop run. Tests use SQLite in memory. Tables are
+created at boot.
 """
 
 from __future__ import annotations

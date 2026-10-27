@@ -42,7 +42,11 @@ def build_app():
     store = OpenFgaStore(_required("BAB_FGA_URL"), _required("BAB_FGA_STORE_ID"),
                          os.environ.get("BAB_FGA_MODEL_ID") or None)
     cat = cat_mod.load(os.environ.get("BAB_CATALOGUE", "catalogues/room.yaml"))
-    ledger = Ledger(os.environ.get("BAB_DATABASE_URL", "sqlite+pysqlite:///bab.db"))
+    db = _required("BAB_DATABASE_URL")  # the room's PostgreSQL, a `bab` database beside OpenFGA's
+    if db.startswith("sqlite") and os.environ.get("BAB_ALLOW_SQLITE") != "1":
+        raise SystemExit("BAB_DATABASE_URL points at SQLite; a deployment uses PostgreSQL "
+                         "(set BAB_ALLOW_SQLITE=1 for a laptop run)")
+    ledger = Ledger(db)
     settings = Settings(room=_required("BAB_ROOM"), admin_team=_required("BAB_ADMIN_TEAM"),
                         security_team=_required("BAB_SECURITY_TEAM"))
     return create_app(store, cat, ledger, agent_verifier(), ConsoleAuth(_required("BAB_CONSOLE_TOKEN")),
