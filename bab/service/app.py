@@ -335,7 +335,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 raise HTTPException(502, f"no lease: {exc}") from exc
             expires = datetime.fromtimestamp(minted.expires_at, tz=UTC)
             lease = Lease(agent=caller.name, integration=body.integration, permissions=[a.name for a in granted],
-                          task=body.task, minter=minter.name, issued_at=now, expires_at=expires, handle=minted.handle)
+                          task=body.task, minter=integ.vendor, issued_at=now, expires_at=expires, handle=minted.handle)
             s.add(lease)
             s.commit()
             log.info("lease %s -> %s on %s (%d permissions, %ds)", lease.id, caller.name, body.integration,

@@ -67,7 +67,7 @@ class Lease(Base):
     integration: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     permissions: Mapped[list] = mapped_column(JSON, nullable=False)
     task: Mapped[str | None] = mapped_column(Text, nullable=True)
-    minter: Mapped[str] = mapped_column(String(32), nullable=False)
+    minter: Mapped[str] = mapped_column(String(32), nullable=False)  # the vendor key in the minters registry
     issued_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     handle: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # what the minter needs to end it early
