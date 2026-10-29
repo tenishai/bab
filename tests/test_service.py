@@ -282,6 +282,28 @@ def test_an_organization_hub_and_its_accounts(world):
     assert minter.minted[-1]["spec"] == {"hub_role_arn": hub, "audience": None, "spoke_role_arn": spoke, "external_id": "x1",
                                          "account_id": "111111111111", "name": "acme-prod"}
     assert c.post("/leases", json={"integration": "acme-aws", "permissions": ["aws_inventory_read"]}, headers=AGENT).status_code == 409
+
+    # Discover: with one external id on the organization, every account is probed through the
+    # hub for the spoke role; the ones that carry it are what a console registers next.
+    assert c.post("/integrations/acme-aws/discover", json={}, headers=ADMIN).status_code == 409  # no external id yet
+    c.put("/integrations/acme-aws", json={"vendor": "aws", "spec": {"hub_role_arn": hub, "name": "acme-aws", "external_id": "org-x"}},
+          headers=ADMIN)
+    found = c.post("/integrations/acme-aws/discover", json={"role_name": "KoboAccess-Role"}, headers=ADMIN).json()
+    assert found["external_id"] == "org-x"
+    by_id = {a["id"]: a for a in found["accounts"]}
+    assert by_id["111111111111"]["connected"] is True and by_id["111111111111"]["reachable"] is True
+    assert by_id["222222222222"]["reachable"] is False and "refused" in by_id["222222222222"]["reason"]
+    assert by_id["222222222222"]["role_arn"] == "arn:aws:iam::222222222222:role/KoboAccess-Role"
+    assert ("arn:aws:iam::222222222222:role/KoboAccess-Role", hub, "org-x") in minter.probed
+    # An account connected without its own external id leases with the organization's.
+    c.put("/integrations/acme-data", json={"vendor": "aws", "parent": "acme-aws", "ceiling": ["aws_inventory_read"],
+                                           "spec": {"spoke_role_arn": "arn:aws:iam::222222222222:role/KoboAccess-Role",
+                                                    "account_id": "222222222222", "name": "acme-data"}}, headers=ADMIN)
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "acme-data", "permissions": ["aws_inventory_read"]}, headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    assert c.post("/leases", json={"integration": "acme-data"}, headers=AGENT).status_code == 200
+    assert minter.minted[-1]["spec"]["external_id"] == "org-x"
+    assert c.delete("/integrations/acme-data", headers=ADMIN).json()["removed"] == "acme-data"
     # The organization cannot go while an account hangs under it.
     assert c.delete("/integrations/acme-aws", headers=ADMIN).status_code == 409
     assert c.delete("/integrations/acme-prod", headers=ADMIN).json()["removed"] == "acme-prod"

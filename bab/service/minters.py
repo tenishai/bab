@@ -53,6 +53,9 @@ class StaticMinter:
         self.now = now
         self.ended: list[dict] = []
         self.minted: list[dict] = []
+        self.probed: list[tuple] = []
+        # Accounts whose spoke role is missing, for discover tests.
+        self.refusing_accounts: set[str] = {"222222222222"}
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
         self.minted.append({"agent": agent, "integration": integration_id, "spec": dict(spec)})
@@ -69,9 +72,12 @@ class StaticMinter:
 
     def probe(self, role_arn: str, audience: str = "sts.amazonaws.com", hub_role_arn: str | None = None,
               external_id: str | None = None) -> dict:
+        self.probed.append((role_arn, hub_role_arn, external_id))
         for arn in (hub_role_arn, role_arn):
             if arn and "refuse" in arn:
                 raise MintError(f"AWS refused {arn}: AccessDenied")
+        if hub_role_arn and role_arn.split(":")[4] in self.refusing_accounts:
+            raise MintError(f"AWS refused {role_arn}: AccessDenied")
         return {"account": role_arn.split(":")[4], "assumed_arn": role_arn.replace(":role/", ":assumed-role/") + "/bab-probe",
                 "hops": 2 if hub_role_arn else 1}
 
