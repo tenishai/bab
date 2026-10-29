@@ -6,6 +6,12 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-29
+
+### Added
+
+- **One external id per organization, and discover.** An organization's row may carry `external_id`; a spoke connected without one of its own leases with the organization's, so one spoke template deploys the role to every member account. `POST /integrations/{org}/discover` lists the accounts through the hub and probes each active one for the spoke role (`role_name`, default `KoboAccess-Role`) with that id, eight at a time, and says which are reachable, which are connected, and why the rest are not. The listing carries an organization's external id.
+
 ## [0.4.3] - 2026-10-29
 
 ### Changed
