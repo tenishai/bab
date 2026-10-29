@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-29
+
 ### Added
 
 - **Vendors have a kind.** The catalogue's `vendors:` map says whether a vendor is a `cloud` (connected one account, project or subscription at a time, with the unit named: `account`, `project`, `subscription`) or a `service` (one connection whose read capabilities its own API or MCP server exposes). `GET /catalogue` lists vendors with kind, label and permission counts; `GET /catalogue/{vendor}` carries them too.
