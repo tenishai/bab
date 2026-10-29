@@ -31,6 +31,17 @@ class Integration(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class AgentRow(Base):
+    """One agent the room knows, and which pod identity is that agent (from the topology push)."""
+
+    __tablename__ = "agents"
+    name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    team: Mapped[str] = mapped_column(String(100), nullable=False)
+    namespace: Mapped[str | None] = mapped_column(String(63), nullable=True, index=True)
+    service_account: Mapped[str | None] = mapped_column(String(253), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class Request(Base):
     __tablename__ = "requests"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -101,6 +112,20 @@ class Ledger:
 
     def event(self, s: Session, at: datetime, kind: str, actor: str | None, **detail) -> None:
         s.add(Event(at=at, kind=kind, actor=actor, detail=detail))
+
+    def resolve_agent(self, s: Session, name: str, namespace: str | None) -> str | None:
+        """Which agent a pod identity is. `name` is the service account; a row whose
+        (namespace, service_account) matches wins, then a row named like the service
+        account. None when the room's topology knows agents and this is not one of them;
+        `name` itself when no topology has been pushed yet."""
+        if s.scalar(select(AgentRow.name).limit(1)) is None:
+            return name
+        if namespace:
+            hit = s.scalar(select(AgentRow.name).where(AgentRow.namespace == namespace,
+                                                       AgentRow.service_account == name))
+            if hit:
+                return hit
+        return s.scalar(select(AgentRow.name).where(AgentRow.name == name))
 
     def active_grants(self, s: Session, agent: str, integration: str | None = None) -> list[GrantRow]:
         q = select(GrantRow).where(GrantRow.agent == agent, GrantRow.revoked_at.is_(None))

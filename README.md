@@ -61,7 +61,7 @@ d = door.decide("atlas", "pod_delete", "namespace:platform-prod/ingest")
 | `bab/model.py` | catalogue -> OpenFGA DSL (allow / approve / either / two ceilings, per level) |
 | `bab/door.py` | the decision at tool dispatch, fail-closed |
 | `bab/ceiling.py` | write-time check: may this team hold this grant? |
-| `bab/sync/` | identity (Okta groups -> members), topology (tree + owners); reconcile owns whole relations |
+| `bab/sync/` | identity (Okta groups -> members), topology (agents -> teams, root owners; pushed by the room or read from a file); reconcile owns whole relations |
 | `model/example.fga.yaml` | the fixture + assertions; `fga model test` and `fga store import` both read it |
 
 ## How this was built

@@ -46,8 +46,10 @@ OpenFGA still answers the one question (does `agent:x` hold `p` on
 An agent proves itself with the Kubernetes service account token its pod
 already carries, projected with audience `bab`. bab verifies the JWT against
 the cluster issuer, reads `system:serviceaccount:<ns>:<name>` from `sub`,
-and maps it to `agent:<name>` through the topology sync (which already owns
-`agent → team` and now also `agent → namespace, service account`). No agent
+and maps it to `agent:<name>` through the topology the room pushes
+(`PUT /topology`: each agent with its `namespace` and `service_account`). A
+pod the topology does not name is refused; before any topology is pushed the
+agent is its service account's name. No agent
 secret, no agent-specific cloud principal, nothing to rotate. A person
 calling the console routes come in through the console's own identity (the
 room's IAP header) and are `user:<email>`.

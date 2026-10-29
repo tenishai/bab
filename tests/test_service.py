@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from bab import catalogue
 from bab.service.app import Settings, create_app
-from bab.service.identity import ConsoleAuth, StaticVerifier
+from bab.service.identity import Caller, ConsoleAuth, IdentityError, StaticVerifier
 from bab.service.ledger import Ledger
 from bab.service.minters import StaticMinter
 from bab.store import Tuple
@@ -145,3 +145,65 @@ def test_a_gated_permission_turns_a_lease_into_a_one_hour_request(world):
     assert r.status_code == 200
     held = c.get("/agents/sherlock/grants", headers=OWNER).json()["grants"][0]
     assert held["expires_at"] == "2026-10-27T13:00:00Z"
+
+
+class PodVerifier:
+    """Tokens name a pod identity (service account + namespace), the way TokenReview answers."""
+
+    def __init__(self, pods: dict[str, tuple[str, str]]):
+        self.pods = pods
+
+    def verify(self, token: str) -> Caller:
+        try:
+            sa, ns = self.pods[token]
+        except KeyError as exc:
+            raise IdentityError("unknown token") from exc
+        return Caller("agent", sa, namespace=ns)
+
+
+@pytest.fixture
+def pods():
+    clock = {"now": T0}
+    store = FakeStore({Tuple("user:kyle@example.com", "member", "team:admins")})
+    cat = catalogue.load("catalogues/room.yaml")
+    minter = StaticMinter(now=lambda: clock["now"].timestamp())
+    verifier = PodVerifier({"ledger-pod": ("agent-ledger", "ledger"), "stray-pod": ("default", "kube-system")})
+    app = create_app(store, cat, Ledger(), verifier, ConsoleAuth("console-secret"), {"aws": minter},
+                     Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"]))
+    return TestClient(app), store
+
+
+def test_topology_push_names_the_agent_behind_a_pod_identity(pods):
+    c, store = pods
+    # Before any topology, the agent is its service account (how 0.2.0 behaved).
+    r = c.post("/leases", json={"integration": "aws-prod"}, headers={"Authorization": "Bearer ledger-pod"})
+    assert r.status_code == 404 and "aws-prod" in r.text  # verified as agent-ledger, no such integration
+
+    body = {"agents": [{"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"}],
+            "rooms": [{"name": "acme", "team": "admins"}]}
+    assert c.put("/topology", json=body, headers=OWNER).status_code == 403  # a reviewer pushes
+    out = c.put("/topology", json=body, headers=ADMIN).json()
+    assert out == {"agents": 1, "removed": 0, "tuples_written": 2, "tuples_deleted": 0}
+    assert Tuple("team:sre", "team", "agent:ledger") in store.tuples
+    assert Tuple("team:admins", "owner", "room:acme") in store.tuples
+    assert c.get("/agents", headers=OWNER).json()["agents"] == [
+        {"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"}]
+
+    # Connect, grant to the agent by the name the room uses, and the pod's lease lands under it.
+    connect(c, ["aws_inventory_read"])
+    rid = c.post("/requests", json={"agent": "ledger", "integration": "aws-prod",
+                                    "permissions": ["aws_inventory_read"]}, headers=OWNER).json()["id"]
+    assert c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN).json()["results"][0]["status"] == "approved"
+    r = c.post("/leases", json={"integration": "aws-prod", "task": "count instances"},
+               headers={"Authorization": "Bearer ledger-pod"})
+    assert r.status_code == 200, r.text
+    assert c.get("/leases", headers=OWNER).json()["leases"][0]["agent"] == "ledger"
+
+    # A pod the topology does not name is not an agent, whatever its service account is called.
+    r = c.post("/leases", json={"integration": "aws-prod"}, headers={"Authorization": "Bearer stray-pod"})
+    assert r.status_code == 401 and "not an agent this room knows" in r.text
+
+    # The push owns team and owner; the room link that connect wrote survives a second push.
+    out = c.put("/topology", json={"agents": [], "rooms": []}, headers=ADMIN).json()
+    assert out["removed"] == 1 and out["tuples_deleted"] == 2
+    assert Tuple("room:acme", "room", "integration:aws-prod") in store.tuples

@@ -16,17 +16,20 @@ def test_okta_groups_become_team_members():
     assert okta.team_name("everyone") is None
 
 
-def test_topology_tree_and_ownership(cat):
-    topo = {"agents": [{"name": "atlas", "team": "platform-infra"}],
+def test_topology_owns_teams_and_root_ownership_only(cat):
+    topo = {"agents": [{"name": "atlas", "team": "platform-infra", "namespace": "atlas", "service_account": "agent-atlas"},
+                       {"name": "echo", "team": "platform-infra"}],
             "projects": [{"name": "acme-platform-prod", "team": "platform-infra"}, {"name": "acme-legacy-dev"}],
-            "clusters": [{"name": "platform-prod", "project": "acme-platform-prod"}],
-            "namespaces": [{"name": "platform-prod/ingest", "cluster": "platform-prod"}]}
+            # Levels under the root are connected in the room, never synced (#19).
+            "clusters": [{"name": "platform-prod", "project": "acme-platform-prod"}]}
     got = set(topology.tuples(topo, cat))
     assert got == {Tuple("team:platform-infra", "team", "agent:atlas"),
-                   Tuple("team:platform-infra", "owner", "project:acme-platform-prod"),
-                   Tuple("project:acme-platform-prod", "project", "cluster:platform-prod"),
-                   Tuple("cluster:platform-prod", "cluster", "namespace:platform-prod/ingest")}
-    assert topology.relations(cat) == {"team", "owner", "project", "cluster"}
+                   Tuple("team:platform-infra", "team", "agent:echo"),
+                   Tuple("team:platform-infra", "owner", "project:acme-platform-prod")}
+    assert topology.relations(cat) == {"team", "owner"}
+    assert topology.agents(topo) == [
+        {"name": "atlas", "team": "platform-infra", "namespace": "atlas", "service_account": "agent-atlas"},
+        {"name": "echo", "team": "platform-infra", "namespace": None, "service_account": None}]
 
 
 def test_reconcile_owns_its_relations_only():
