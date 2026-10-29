@@ -100,20 +100,33 @@ class OpenFgaStore:
         return sorted(resp.objects)
 
     def write(self, tuples: Iterable[Tuple]) -> None:
+        """Write tuples so the store ends up holding them. OpenFGA refuses a write whose
+        key already exists (HTTP 400), so a tuple already there is skipped, and one whose
+        expiry differs is replaced; a repeated connect or re-grant is then harmless."""
         from openfga_sdk.client.models import ClientTuple
         from openfga_sdk.models import RelationshipCondition
 
+        wanted = list(tuples)
+        if not wanted:
+            return
+        have = {t.key: t for t in self.read_all()}
+        fresh = [t for t in wanted if t.key not in have]
+        changed = [t for t in wanted if t.key in have and have[t.key].expires_at != t.expires_at]
+        skipped = len(wanted) - len(fresh) - len(changed)
+        if changed:
+            self.delete(changed)
         body = [
             ClientTuple(
                 user=t.user, relation=t.relation, object=t.object,
                 condition=RelationshipCondition(name=CONDITION, context={"expires_at": t.expires_at})
                 if t.expires_at else None,
             )
-            for t in tuples
+            for t in fresh + changed
         ]
         if body:
             self._client.write_tuples(body)
-            log.info("wrote %d tuples", len(body))
+        log.info("wrote %d tuples (%d new, %d expiry changed, %d already present)",
+                 len(body), len(fresh), len(changed), skipped)
 
     def delete(self, tuples: Iterable[Tuple]) -> None:
         from openfga_sdk.client.models import ClientTuple
