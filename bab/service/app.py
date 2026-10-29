@@ -138,6 +138,13 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     Console = Annotated[Caller, Depends(console_caller)]
     Agent = Annotated[Caller, Depends(agent_caller)]
 
+    # A credential still good for the same agent, integration and permissions: handed back
+    # instead of minted again, so a runtime may ask on every call (and a revoke bites on
+    # the next one, since the grant is checked before this cache is consulted) without a
+    # new vendor session each time. Memory only; a restart simply mints afresh.
+    live: dict[tuple[str, str, tuple[str, ...]], tuple[int, dict, float, str]] = {}
+    LIVE_MARGIN_S = 120
+
     def is_member(actor: str, team: str) -> bool:
         try:
             return store.check(f"user:{actor}", "member", settings.team(team))
@@ -491,6 +498,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             ledger.event(s, now, "grant.revoked", caller.actor, grant=grant_id, agent=g.agent,
                          permission=g.permission)
             s.commit()
+        for key in [k for k in live if k[0] == g.agent and k[1] == g.integration]:
+            live.pop(key, None)
         return {"revoked": grant_id}
 
     @app.post("/leases")
@@ -537,6 +546,17 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                           "request_id": pending.id if pending else None}
                 raise HTTPException(202 if gated else 403, detail)
             seconds = min(cat.tier(a.tier).lease_seconds for a in granted)
+            key = (caller.name, body.integration, tuple(sorted(a.name for a in granted)))
+            held = live.get(key)
+            if held and held[2] - now.timestamp() > LIVE_MARGIN_S:
+                lease_id, credential, expires_ts, note = held
+                if pending is not None:
+                    s.commit()
+                return {"lease_id": lease_id, "integration": body.integration, "vendor": integ.vendor,
+                        "granted": list(key[2]), "refused": refused,
+                        "waiting_for_approval": [a.name for a in gated], "request_id": pending.id if pending else None,
+                        "credential": credential, "expires_at": rfc3339(datetime.fromtimestamp(expires_ts, tz=UTC)),
+                        "note": note, "reused": True}
             try:
                 minted = minter.mint(caller.name, body.integration, mint_spec, granted, seconds)
             except MintError as exc:
@@ -548,12 +568,13 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                           task=body.task, minter=integ.vendor, issued_at=now, expires_at=expires, handle=minted.handle)
             s.add(lease)
             s.commit()
+            live[key] = (lease.id, minted.credential, minted.expires_at, minted.note)
             log.info("lease %s -> %s on %s (%d permissions, %ds)", lease.id, caller.name, body.integration,
                      len(granted), seconds)
             return {"lease_id": lease.id, "integration": body.integration, "vendor": integ.vendor,
                     "granted": [a.name for a in granted], "refused": refused,
                     "waiting_for_approval": [a.name for a in gated], "request_id": pending.id if pending else None,
-                    "credential": minted.credential, "expires_at": rfc3339(expires), "note": minted.note}
+                    "credential": minted.credential, "expires_at": rfc3339(expires), "note": minted.note, "reused": False}
 
     @app.get("/leases")
     def list_leases(_: Console, agent: str | None = None, integration: str | None = None,
