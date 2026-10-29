@@ -20,9 +20,10 @@ from bab import ceiling, grants
 from bab.catalogue import Catalogue
 from bab.door import Door, Verdict, rfc3339
 from bab.service.identity import Caller, ConsoleAuth, IdentityError
-from bab.service.ledger import GrantRow, Integration, Lease, Ledger, Request
+from bab.service.ledger import AgentRow, GrantRow, Integration, Lease, Ledger, Request
 from bab.service.minters import Minter, MintError
 from bab.store import Store, StoreError, Tuple
+from bab.sync import reconcile, topology
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,28 @@ class IntegrationBody(BaseModel):
     ceiling: list[str] = Field(default_factory=list)
 
 
+class TopologyAgent(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    team: str = Field(min_length=1, max_length=100)
+    namespace: str | None = Field(default=None, max_length=63)
+    service_account: str | None = Field(default=None, max_length=253)
+
+
+class TopologyRoot(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    team: str | None = Field(default=None, max_length=100)
+
+
+class TopologyBody(BaseModel):
+    """What the room knows: its agents (with the pod identity that is each one) and its teams.
+    The same shape `bab sync topology` reads from a file; here the room pushes it."""
+
+    agents: list[TopologyAgent] = Field(default_factory=list, max_length=5000)
+    # Omitted (None) = the pusher has no opinion on who owns the root and the
+    # `owner` relation is left alone; given (even empty) = it is owned here.
+    rooms: list[TopologyRoot] | None = Field(default=None, max_length=100)
+
+
 def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, console: ConsoleAuth,
                minters: dict[str, Minter], settings: Settings) -> FastAPI:
     from importlib.metadata import version as _v
@@ -85,9 +108,15 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         if scheme.lower() != "bearer" or not token:
             raise HTTPException(401, "an agent proves itself with its service account token")
         try:
-            return agent_verifier.verify(token)
+            caller = agent_verifier.verify(token)
         except IdentityError as exc:
             raise HTTPException(401, str(exc)) from exc
+        # The token names a service account; the room's topology says which agent that is.
+        with ledger.session() as s:
+            agent = ledger.resolve_agent(s, caller.name, caller.namespace)
+        if agent is None:
+            raise HTTPException(401, f"{caller.namespace}/{caller.name} is not an agent this room knows")
+        return Caller(caller.kind, agent, actor=caller.actor, namespace=caller.namespace)
 
     def console_caller(x_bab_console_token: str = Header(default=""),
                        x_bab_actor: str = Header(default="")) -> Caller:
@@ -210,6 +239,66 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                          ceiling=len(acts), teams=len(teams))
             s.commit()
         return {"integration": integration, "vendor": body.vendor, "ceiling": [a.name for a in acts], "teams": teams}
+
+    @app.put("/topology")
+    def put_topology(body: TopologyBody, caller: Console):
+        """The room pushes its agents and teams. Owns the `team` and `owner` relations and the
+        agents table; everything else in the store is untouched. The console token is the
+        authority here (the topology is the room's own fact, not a person's decision); the
+        actor is recorded, and may be the room itself."""
+        now = settings.now()
+        topo = body.model_dump()
+        rooms = topo.pop("rooms")
+        topo[f"{cat.root}s"] = rooms or []
+        owned = topology.relations(cat) if rooms is not None else {"team"}
+        with ledger.session() as s:
+            try:
+                written, deleted = reconcile(store, topology.tuples(topo, cat), owned)
+                # A team that appears after an integration was connected has no
+                # ceiling there yet; connect gives every team the same one, so
+                # give it the same one now (the same tuples connect writes).
+                have = set(store.read_all())
+                teams = sorted({f"team:{a['team']}" for a in topology.agents(topo)})
+                extend = [Tuple(team, f"ceiling_{p}", obj(i.id)) for i in s.scalars(select(Integration))
+                          for team in teams for p in i.ceiling
+                          if Tuple(team, f"ceiling_{p}", obj(i.id)) not in have]
+                if extend:
+                    store.write(extend)
+            except StoreError as exc:
+                raise HTTPException(503, f"the store cannot answer: {exc}") from exc
+            keep = set()
+            for a in topology.agents(topo):
+                keep.add(a["name"])
+                row = s.get(AgentRow, a["name"]) or AgentRow(name=a["name"], team=a["team"], updated_at=now)
+                row.team, row.namespace, row.service_account, row.updated_at = (
+                    a["team"], a["namespace"], a["service_account"], now)
+                s.add(row)
+            gone = [r for r in s.scalars(select(AgentRow)) if r.name not in keep]
+            for r in gone:
+                s.delete(r)
+            ledger.event(s, now, "topology.put", caller.actor, agents=len(keep), removed=len(gone),
+                         tuples_written=len(written) + len(extend), tuples_deleted=len(deleted))
+            s.commit()
+        log.info("topology from %s: %d agents (%d removed), tuples +%d -%d, ceilings +%d", caller.actor,
+                 len(keep), len(gone), len(written), len(deleted), len(extend))
+        return {"agents": len(keep), "removed": len(gone), "tuples_written": len(written) + len(extend),
+                "tuples_deleted": len(deleted)}
+
+    @app.get("/integrations")
+    def list_integrations(caller: Console):
+        """Every connected integration and its ceiling: what a picker may offer."""
+        with ledger.session() as s:
+            rows = list(s.scalars(select(Integration).order_by(Integration.id)))
+        return {"integrations": [{"integration": r.id, "vendor": r.vendor, "ceiling": list(r.ceiling),
+                                  "created_at": r.created_at.isoformat(), "updated_at": r.updated_at.isoformat()}
+                                 for r in rows]}
+
+    @app.get("/agents")
+    def list_agents(caller: Console):
+        with ledger.session() as s:
+            rows = list(s.scalars(select(AgentRow).order_by(AgentRow.name)))
+        return {"agents": [{"name": r.name, "team": r.team, "namespace": r.namespace,
+                            "service_account": r.service_account} for r in rows]}
 
     @app.post("/requests", status_code=201)
     def post_request(body: RequestBody, caller: Console):

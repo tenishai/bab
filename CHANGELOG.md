@@ -12,10 +12,13 @@ All notable changes to bab are documented here. The format follows
 
 ### Added
 
+- `PUT /topology` (console): the room pushes its agents and teams. Each agent may name the pod identity that is it (`namespace`, `service_account`); bab resolves a lease caller through that mapping, so a pod whose service account is `agent-ledger` leases as the agent `ledger`, and a pod the topology does not name is refused (#18). A team that appears after an integration was connected gets that integration's ceiling, the same tuples connect writes. `GET /agents` lists what was pushed; `GET /integrations` lists what is connected and each ceiling.
+
 - A release workflow: a `vX.Y.Z` tag builds the multi-arch image (linux/amd64, linux/arm64), publishes it to ghcr under the tag and the short sha, and records the digest on the GitHub release. No image is built on a push to main.
 
 ### Changed
 
+- The topology sync owns the `team` and `owner` relations only. It no longer writes or deletes the level under the root (`room` -> `integration`): that link is written when a person connects an integration, and a sync that also owned it deleted connected integrations on its next run (#19).
 - The image is pinned end to end: base image by digest, Python packages from `uv.lock` (new) with hashes verified by pip, the fga CLI by version.
 
 

@@ -1,14 +1,19 @@
-"""Topology sync: the resource tree and who owns it.
+"""Topology sync: the agents, their teams, and who owns the root resource.
 
-Shape (YAML file today; Gojira's /api/v1/topology tomorrow, same shape):
+Shape (a YAML file, Gojira's /api/v1/topology, or the body the room PUTs to
+/topology; all the same):
 
-  teams:      [{name: platform-infra}]
-  agents:     [{name: atlas, team: platform-infra}]
-  projects:   [{name: acme-platform-prod, team: platform-infra}]
-  clusters:   [{name: platform-prod, project: acme-platform-prod}]
-  namespaces: [{name: platform-prod/ingest, cluster: platform-prod}]
+  teams:  [{name: platform-infra}]
+  agents: [{name: atlas, team: platform-infra, namespace: atlas, service_account: agent-atlas}]
+  rooms:  [{name: acme, team: platform-infra}]
 
-Levels below the root are generic: each entry names its parent by the parent level's key.
+The sync owns two relations: `team` (agent -> team) and `owner` (team -> root).
+It does not own the levels under the root: integrations are connected in the
+room by a person (PUT /integrations), and a sync that also wrote the `room`
+relation would delete those links on its next run (seen live, #19).
+
+An agent's `namespace` and `service_account` say which pod identity is that
+agent. They are optional; without them the agent is its service account's name.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ log = logging.getLogger(__name__)
 
 
 def relations(cat: Catalogue) -> set[str]:
-    return {"team", "owner", *cat.resources[:-1]}
+    return {"team", "owner"}
 
 
 def tuples(topo: dict, cat: Catalogue) -> Iterable[Tuple]:
@@ -36,9 +41,16 @@ def tuples(topo: dict, cat: Catalogue) -> Iterable[Tuple]:
     for p in topo.get(f"{root}s") or ():
         if p.get("team"):
             yield Tuple(f"team:{p['team']}", "owner", f"{root}:{p['name']}")
-    for parent, level in zip(cat.resources, cat.resources[1:]):
-        for item in topo.get(f"{level}s") or ():
-            yield Tuple(f"{parent}:{item[parent]}", parent, f"{level}:{item['name']}")
+
+
+def agents(topo: dict) -> list[dict]:
+    """The agent entries, normalised: name, team, namespace, service_account (the last two may be None)."""
+    out = []
+    for a in topo.get("agents") or ():
+        out.append({"name": str(a["name"]), "team": str(a["team"]),
+                    "namespace": (str(a["namespace"]) if a.get("namespace") else None),
+                    "service_account": (str(a["service_account"]) if a.get("service_account") else None)})
+    return out
 
 
 def from_file(path: str | Path) -> dict:
