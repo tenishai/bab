@@ -61,3 +61,32 @@ def test_write_of_nothing_touches_nothing():
     s = _store([Tuple("room:kobo", "room", "integration:x")])
     s.write([])
     assert s._client.written == [] and s._client.deleted == []
+
+
+def test_writes_and_deletes_go_in_batches_of_one_hundred():
+    from bab.store import WRITE_BATCH, OpenFgaStore, Tuple
+
+    class Client:
+        def __init__(self):
+            self.writes, self.deletes = [], []
+            self.tuples = []
+
+        def read(self, key, options=None):
+            return type("R", (), {"tuples": (), "continuation_token": None})()
+
+        def write_tuples(self, body):
+            assert len(body) <= WRITE_BATCH
+            self.writes.append(len(body))
+
+        def delete_tuples(self, body):
+            assert len(body) <= WRITE_BATCH
+            self.deletes.append(len(body))
+
+    client = Client()
+    store = OpenFgaStore.__new__(OpenFgaStore)
+    store._client = client
+    many = [Tuple(f"team:t{i}", "ceiling_x", "integration:a") for i in range(250)]
+    store.write(many)
+    assert client.writes == [100, 100, 50]
+    store.delete(many)
+    assert client.deletes == [100, 100, 50]
