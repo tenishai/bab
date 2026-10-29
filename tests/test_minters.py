@@ -44,3 +44,31 @@ def test_agent_is_the_service_account_name():
         pass
     else:
         raise AssertionError("a person is not an agent")
+
+
+def test_aws_minter_hops_through_the_hub_for_an_account_under_an_organization():
+    hops = []
+
+    def assume(role_arn, token, name, seconds, policy):
+        hops.append(("web-identity", role_arn, name, seconds, policy))
+        return {"Credentials": {"AccessKeyId": "HUB", "SecretAccessKey": "s", "SessionToken": "t",
+                                "Expiration": datetime(2026, 10, 27, 13, 0, tzinfo=UTC)},
+                "AssumedRoleUser": {"Arn": "arn:aws:sts::999999999999:assumed-role/BabHub/bab-sherlock"}}
+
+    def assume_role(creds, role_arn, name, seconds, policy, external_id):
+        hops.append(("assume-role", creds["AccessKeyId"], role_arn, name, seconds, bool(policy), external_id))
+        return {"Credentials": {"AccessKeyId": "SPOKE", "SecretAccessKey": "s", "SessionToken": "t",
+                                "Expiration": datetime(2026, 10, 27, 13, 0, tzinfo=UTC)},
+                "AssumedRoleUser": {"Arn": "arn:aws:sts::111111111111:assumed-role/BabSpoke/bab-sherlock"}}
+
+    cat = catalogue.load("catalogues/room.yaml")
+    m = AwsMinter(token_source=lambda aud: "jwt", assume=assume, assume_role=assume_role)
+    out = m.mint("sherlock", "acme-prod",
+                 {"hub_role_arn": "arn:aws:iam::999999999999:role/BabHub", "spoke_role_arn": "arn:aws:iam::111111111111:role/BabSpoke",
+                  "external_id": "x1"}, [cat.action("aws_s3_read")], 3600)
+    # Hop one: bab's identity into the hub, briefly, no policy. Hop two: the hub into the spoke
+    # with the external id, the session policy and the agent's name, which CloudTrail records.
+    assert hops[0][:3] == ("web-identity", "arn:aws:iam::999999999999:role/BabHub", "bab-sherlock") and hops[0][4] is None
+    assert hops[1] == ("assume-role", "HUB", "arn:aws:iam::111111111111:role/BabSpoke", "bab-sherlock", 3600, True, "x1")
+    assert out.credential["aws_access_key_id"] == "SPOKE"
+    assert out.credential["assumed_role_arn"].endswith("BabSpoke/bab-sherlock")

@@ -248,3 +248,40 @@ def test_identity_probe_and_disconnect(world):
     assert not [t for t in store.tuples if t.object == "integration:aws-prod"]
     assert c.get("/integrations", headers=OWNER).json()["integrations"] == []
     assert c.delete("/integrations/aws-prod", headers=ADMIN).status_code == 404
+
+
+def test_an_organization_hub_and_its_accounts(world):
+    c, _, _, minter = world
+    hub = "arn:aws:iam::999999999999:role/BabHub"
+    # The organization row: the hub role, no ceiling (nothing is granted on an organization).
+    out = c.put("/integrations/acme-aws", json={"vendor": "aws", "spec": {"hub_role_arn": hub, "name": "acme-aws"}},
+                headers=ADMIN).json()
+    assert out["kind"] == "org" and out["parent"] is None
+    # Its accounts, as the hub sees them, none connected yet.
+    accts = c.get("/integrations/acme-aws/accounts", headers=OWNER).json()["accounts"]
+    assert [(a["id"], a["connected"]) for a in accts] == [("111111111111", False), ("222222222222", False)]
+    # A spoke under it: probed through the hub, then connected with the parent.
+    spoke = "arn:aws:iam::111111111111:role/BabSpoke"
+    assert c.post("/probe/aws", json={"role_arn": spoke, "hub_role_arn": hub, "external_id": "x1"}, headers=ADMIN).json()["hops"] == 2
+    bad = c.put("/integrations/acme-prod", json={"vendor": "aws", "parent": "nope", "spec": {}}, headers=ADMIN)
+    assert bad.status_code == 422
+    out = c.put("/integrations/acme-prod", json={"vendor": "aws", "parent": "acme-aws", "ceiling": ["aws_inventory_read"],
+                                                 "spec": {"spoke_role_arn": spoke, "external_id": "x1", "account_id": "111111111111", "name": "acme-prod"}},
+                headers=ADMIN).json()
+    assert out["kind"] == "account" and out["parent"] == "acme-aws"
+    rows = {r["integration"]: r for r in c.get("/integrations", headers=OWNER).json()["integrations"]}
+    assert rows["acme-aws"]["kind"] == "org" and rows["acme-prod"]["parent"] == "acme-aws" and rows["acme-prod"]["account_id"] == "111111111111"
+    accts = {a["id"]: a for a in c.get("/integrations/acme-aws/accounts", headers=OWNER).json()["accounts"]}
+    assert accts["111111111111"]["connected"] is True and accts["111111111111"]["integration"] == "acme-prod"
+    # A lease on the account carries the hub to the minter; a lease on the organization is refused.
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "acme-prod", "permissions": ["aws_inventory_read"]}, headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    r = c.post("/leases", json={"integration": "acme-prod"}, headers=AGENT)
+    assert r.status_code == 200, r.text
+    assert minter.minted[-1]["spec"] == {"hub_role_arn": hub, "audience": None, "spoke_role_arn": spoke, "external_id": "x1",
+                                         "account_id": "111111111111", "name": "acme-prod"}
+    assert c.post("/leases", json={"integration": "acme-aws", "permissions": ["aws_inventory_read"]}, headers=AGENT).status_code == 409
+    # The organization cannot go while an account hangs under it.
+    assert c.delete("/integrations/acme-aws", headers=ADMIN).status_code == 409
+    assert c.delete("/integrations/acme-prod", headers=ADMIN).json()["removed"] == "acme-prod"
+    assert c.delete("/integrations/acme-aws", headers=ADMIN).json()["removed"] == "acme-aws"

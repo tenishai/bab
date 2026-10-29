@@ -52,8 +52,10 @@ class StaticMinter:
     def __init__(self, now=time.time):
         self.now = now
         self.ended: list[dict] = []
+        self.minted: list[dict] = []
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
+        self.minted.append({"agent": agent, "integration": integration_id, "spec": dict(spec)})
         token = base64.urlsafe_b64encode(json.dumps({
             "agent": agent, "integration": integration_id, "permissions": [p.name for p in permissions],
         }).encode()).decode()
@@ -65,10 +67,17 @@ class StaticMinter:
     def identity(self, audience: str = "sts.amazonaws.com") -> dict:
         return {"subject": "static-minter", "email": None, "audience": audience}
 
-    def probe(self, role_arn: str, audience: str = "sts.amazonaws.com") -> dict:
-        if "refuse" in role_arn:
-            raise MintError(f"AWS refused {role_arn}: AccessDenied")
-        return {"account": role_arn.split(":")[4], "assumed_arn": role_arn.replace(":role/", ":assumed-role/") + "/bab-probe"}
+    def probe(self, role_arn: str, audience: str = "sts.amazonaws.com", hub_role_arn: str | None = None,
+              external_id: str | None = None) -> dict:
+        for arn in (hub_role_arn, role_arn):
+            if arn and "refuse" in arn:
+                raise MintError(f"AWS refused {arn}: AccessDenied")
+        return {"account": role_arn.split(":")[4], "assumed_arn": role_arn.replace(":role/", ":assumed-role/") + "/bab-probe",
+                "hops": 2 if hub_role_arn else 1}
+
+    def list_accounts(self, hub_role_arn: str, audience: str = "sts.amazonaws.com") -> list[dict]:
+        return [{"id": "111111111111", "name": "acme-prod", "email": None, "status": "ACTIVE"},
+                {"id": "222222222222", "name": "acme-data", "email": None, "status": "ACTIVE"}]
 
 
 # ---- AWS: AssumeRoleWithWebIdentity with a session policy -----------------------
@@ -135,11 +144,20 @@ def session_policy(permissions: list[Action]) -> dict | None:
 
 
 class AwsMinter:
+    """Two shapes of connection. Flat: `role_arn`, assumed with bab's identity. Hub and spoke
+    (one hub role per AWS organization, in its management account): `hub_role_arn` assumed
+    with bab's identity, then `spoke_role_arn` in the member account assumed from the hub
+    with `external_id`; the session policy and the agent's session name go on the second
+    hop, which is the one CloudTrail in the member account records. No cross-organization
+    assumes: a second organization is a second hub."""
+
     name = "aws"
 
-    def __init__(self, token_source=web_identity_token, assume=None):
+    def __init__(self, token_source=web_identity_token, assume=None, assume_role=None, list_org_accounts=None):
         self.token_source = token_source
         self.assume = assume or self._assume
+        self.assume_role = assume_role or self._assume_role
+        self.list_org_accounts = list_org_accounts or self._list_org_accounts
 
     @staticmethod
     def _assume(role_arn: str, token: str, name: str, seconds: int, policy: dict | None) -> dict:
@@ -166,15 +184,83 @@ class AwsMinter:
         except BotoCoreError as exc:
             raise MintError(f"AWS call failed: {exc}") from exc
 
+    @staticmethod
+    def _assume_role(creds: dict, role_arn: str, name: str, seconds: int, policy: dict | None,
+                     external_id: str | None) -> dict:
+        """The second hop: AssumeRole from the hub's session into the member account's role."""
+        try:
+            import botocore.session
+            from botocore.exceptions import BotoCoreError, ClientError
+        except ImportError as exc:  # pragma: no cover
+            raise MintError("botocore is not installed; install bab with the [aws] extra") from exc
+        sts = botocore.session.get_session().create_client(
+            "sts", region_name="us-east-1", aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+        kwargs = {"RoleArn": role_arn, "RoleSessionName": name, "DurationSeconds": seconds}
+        if external_id:
+            kwargs["ExternalId"] = external_id
+        if policy:
+            kwargs["Policy"] = json.dumps(policy)
+        try:
+            return sts.assume_role(**kwargs)
+        except ClientError as exc:
+            err = exc.response.get("Error", {})
+            raise MintError(f"AWS refused {role_arn}: {err.get('Code', 'error')} {err.get('Message', '')}".strip()) from exc
+        except BotoCoreError as exc:
+            raise MintError(f"AWS call failed: {exc}") from exc
+
+    @staticmethod
+    def _list_org_accounts(creds: dict) -> list[dict]:
+        """Every account in the organization the hub's session can see."""
+        try:
+            import botocore.session
+            from botocore.exceptions import BotoCoreError, ClientError
+        except ImportError as exc:  # pragma: no cover
+            raise MintError("botocore is not installed; install bab with the [aws] extra") from exc
+        org = botocore.session.get_session().create_client(
+            "organizations", region_name="us-east-1", aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+        out, token = [], None
+        try:
+            while True:
+                page = org.list_accounts(NextToken=token) if token else org.list_accounts()
+                out += [{"id": a["Id"], "name": a.get("Name"), "email": a.get("Email"), "status": a.get("Status")}
+                        for a in page.get("Accounts", [])]
+                token = page.get("NextToken")
+                if not token:
+                    return sorted(out, key=lambda a: (a["name"] or "", a["id"]))
+        except ClientError as exc:
+            err = exc.response.get("Error", {})
+            raise MintError(f"AWS refused listing the organization's accounts: {err.get('Code', 'error')} "
+                            f"{err.get('Message', '')}".strip()) from exc
+        except BotoCoreError as exc:
+            raise MintError(f"AWS call failed: {exc}") from exc
+
+    def _hub(self, hub_role_arn: str, audience: str, agent: str) -> dict:
+        """First hop: bab's identity into the organization's hub role, briefly, no policy."""
+        if not _ROLE_ARN.match(hub_role_arn):
+            raise MintError(f"{hub_role_arn!r} is not an IAM role ARN")
+        token = self.token_source(audience)
+        return self.assume(hub_role_arn, token, session_name("bab-", agent), MIN_SECONDS, None)["Credentials"]
+
     def mint(self, agent, integration_id, spec, permissions, seconds):
-        role_arn = str(spec.get("role_arn", "")).strip()
-        if not _ROLE_ARN.match(role_arn):
-            raise MintError(f"integration {integration_id!r} has no IAM role ARN to assume")
         audience = str(spec.get("audience") or DEFAULT_AUDIENCE)
         seconds = max(MIN_SECONDS, min(MAX_SECONDS, seconds))
         policy = session_policy(permissions)
-        token = self.token_source(audience)
-        resp = self.assume(role_arn, token, session_name("bab-", agent), seconds, policy)
+        hub, spoke = str(spec.get("hub_role_arn", "")).strip(), str(spec.get("spoke_role_arn", "")).strip()
+        if hub and spoke:
+            if not _ROLE_ARN.match(spoke):
+                raise MintError(f"integration {integration_id!r} has no IAM role ARN to assume")
+            hub_creds = self._hub(hub, audience, agent)
+            # Role chaining caps a session at an hour; the lease is an hour anyway.
+            resp = self.assume_role(hub_creds, spoke, session_name("bab-", agent), min(seconds, 3600), policy,
+                                    str(spec.get("external_id") or "") or None)
+        else:
+            role_arn = str(spec.get("role_arn", "")).strip()
+            if not _ROLE_ARN.match(role_arn):
+                raise MintError(f"integration {integration_id!r} has no IAM role ARN to assume")
+            token = self.token_source(audience)
+            resp = self.assume(role_arn, token, session_name("bab-", agent), seconds, policy)
         creds = resp["Credentials"]
         exp = creds["Expiration"]
         expires = exp.timestamp() if hasattr(exp, "timestamp") else float(exp)
@@ -200,14 +286,26 @@ class AwsMinter:
         return {"subject": str(claims.get("sub", "")), "email": claims.get("email"), "audience": audience,
                 "issuer": claims.get("iss")}
 
-    def probe(self, role_arn: str, audience: str = DEFAULT_AUDIENCE) -> dict:
-        """Assume the role once, briefly, with no policy: does its trust admit bab?"""
+    def probe(self, role_arn: str, audience: str = DEFAULT_AUDIENCE, hub_role_arn: str | None = None,
+              external_id: str | None = None) -> dict:
+        """Assume the role once, briefly, with no policy: does its trust admit bab (a hub or a
+        flat role), or the hub (a spoke, when `hub_role_arn` is given)?"""
         if not _ROLE_ARN.match(role_arn):
             raise MintError(f"{role_arn!r} is not an IAM role ARN")
-        token = self.token_source(audience)
-        resp = self.assume(role_arn, token, "bab-probe", MIN_SECONDS, None)
+        if hub_role_arn:
+            hub_creds = self._hub(hub_role_arn, audience, "probe")
+            resp = self.assume_role(hub_creds, role_arn, "bab-probe", MIN_SECONDS, None, external_id or None)
+            hops = 2
+        else:
+            token = self.token_source(audience)
+            resp = self.assume(role_arn, token, "bab-probe", MIN_SECONDS, None)
+            hops = 1
         arn = resp["AssumedRoleUser"]["Arn"]
-        return {"account": arn.split(":")[4], "assumed_arn": arn}
+        return {"account": arn.split(":")[4], "assumed_arn": arn, "hops": hops}
+
+    def list_accounts(self, hub_role_arn: str, audience: str = DEFAULT_AUDIENCE) -> list[dict]:
+        """The organization's accounts, as the hub can see them."""
+        return self.list_org_accounts(self._hub(hub_role_arn, audience, "discover"))
 
 
 def default_minters() -> dict[str, Minter]:

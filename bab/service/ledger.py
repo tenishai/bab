@@ -27,8 +27,23 @@ class Integration(Base):
     vendor: Mapped[str] = mapped_column(String(32), nullable=False)
     spec: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # role_arn, audience, ...
     ceiling: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # permissions the connection can honour
+    # A cloud account under its organization's row (hub-and-spoke): the parent holds the hub
+    # role bab assumes with its own identity, this row the spoke role the hub assumes next.
+    parent: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    @property
+    def kind(self) -> str:
+        """`org` (holds a hub role), `account` (a cloud account, under an org or flat), or `connection`."""
+        if self.parent:
+            return "account"
+        spec = self.spec or {}
+        if spec.get("hub_role_arn"):
+            return "org"
+        if spec.get("role_arn") or spec.get("spoke_role_arn"):
+            return "account"
+        return "connection"
 
 
 class AgentRow(Base):
@@ -105,7 +120,18 @@ class Ledger:
             kwargs["poolclass"] = StaticPool
         self.engine = create_engine(url, **kwargs)
         Base.metadata.create_all(self.engine)
+        self._ensure_columns()
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+
+    def _ensure_columns(self) -> None:
+        """create_all never alters an existing table; a column added after a database was
+        born is added here, once, by name. Small enough not to want a migration tool yet."""
+        from sqlalchemy import inspect, text
+
+        have = {c["name"] for c in inspect(self.engine).get_columns("integrations")}
+        if "parent" not in have:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE integrations ADD COLUMN parent VARCHAR(64)"))
 
     def session(self) -> Session:
         return self.sessions()
