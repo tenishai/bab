@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-29
+
 ### Changed
 
 - **A live credential is handed back, not minted again.** `POST /leases` returns the credential already minted for the same agent, integration and permissions while it has more than two minutes left (`reused: true`), after checking the grants as always. A runtime may therefore ask on every call, which is what makes a revoke stop the next call: the grant check fails, and a revoke also drops the held credential. One lease row per mint, as before.
