@@ -72,6 +72,11 @@ class IntegrationBody(BaseModel):
     ceiling: list[str] = Field(default_factory=list)
 
 
+class ProbeBody(BaseModel):
+    role_arn: str = Field(min_length=20, max_length=2048)
+    audience: str | None = Field(default=None, max_length=256)
+
+
 class TopologyAgent(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     team: str = Field(min_length=1, max_length=100)
@@ -299,6 +304,53 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                  len(keep), len(gone), len(written), len(deleted), len(extend))
         return {"agents": len(keep), "removed": len(gone), "tuples_written": len(written) + len(extend),
                 "tuples_deleted": len(deleted)}
+
+    @app.get("/identity/{vendor}")
+    def identity(vendor: str, _: Console):
+        """Who bab is to a vendor: what an account owner writes into a trust policy."""
+        minter = minters.get(vendor)
+        if minter is None or not hasattr(minter, "identity"):
+            raise HTTPException(501, f"bab cannot mint for {vendor!r} yet")
+        try:
+            return minter.identity()
+        except MintError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @app.post("/probe/{vendor}")
+    def probe(vendor: str, body: ProbeBody, caller: Console):
+        """Try a connection before saving it: does the role's trust admit bab?"""
+        reviewer(caller)
+        minter = minters.get(vendor)
+        if minter is None or not hasattr(minter, "probe"):
+            raise HTTPException(501, f"bab cannot mint for {vendor!r} yet")
+        try:
+            out = minter.probe(body.role_arn, body.audience or "sts.amazonaws.com")
+        except MintError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return out
+
+    @app.delete("/integrations/{integration}")
+    def delete_integration(integration: str, caller: Console):
+        """Disconnect: the row, every active grant on it (revoked), and every tuple
+        naming it (room link, ceilings, grants). Leases already minted run out on their own."""
+        reviewer(caller)
+        now = settings.now()
+        with ledger.session() as s:
+            row = integration_or_404(s, integration)
+            revoked = 0
+            for g in ledger.active_grants_on(s, integration):
+                g.revoked_at, g.revoked_by = now, caller.actor
+                revoked += 1
+            try:
+                gone = [t for t in store.read_all() if t.object == obj(integration)]
+                store.delete(gone)
+            except StoreError as exc:
+                raise HTTPException(503, f"the store cannot answer: {exc}") from exc
+            s.delete(row)
+            ledger.event(s, now, "integration.removed", caller.actor, integration=integration,
+                         grants_revoked=revoked, tuples_deleted=len(gone))
+            s.commit()
+        return {"removed": integration, "grants_revoked": revoked, "tuples_deleted": len(gone)}
 
     @app.get("/integrations")
     def list_integrations(caller: Console):

@@ -62,6 +62,14 @@ class StaticMinter:
     def end(self, handle):
         self.ended.append(handle)
 
+    def identity(self, audience: str = "sts.amazonaws.com") -> dict:
+        return {"subject": "static-minter", "email": None, "audience": audience}
+
+    def probe(self, role_arn: str, audience: str = "sts.amazonaws.com") -> dict:
+        if "refuse" in role_arn:
+            raise MintError(f"AWS refused {role_arn}: AccessDenied")
+        return {"account": role_arn.split(":")[4], "assumed_arn": role_arn.replace(":role/", ":assumed-role/") + "/bab-probe"}
+
 
 # ---- AWS: AssumeRoleWithWebIdentity with a session policy -----------------------
 
@@ -179,6 +187,27 @@ class AwsMinter:
 
     def end(self, handle):  # AWS cannot recall a session; the lease length is the revocation.
         return None
+
+    def identity(self, audience: str = DEFAULT_AUDIENCE) -> dict:
+        """Who bab is to AWS: the claims of its own identity token (the `sub` an account
+        owner writes into a role's trust policy, with `oaud` = the audience)."""
+        token = self.token_source(audience)
+        try:
+            payload = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except (IndexError, ValueError) as exc:
+            raise MintError("bab's identity token is not a JWT") from exc
+        return {"subject": str(claims.get("sub", "")), "email": claims.get("email"), "audience": audience,
+                "issuer": claims.get("iss")}
+
+    def probe(self, role_arn: str, audience: str = DEFAULT_AUDIENCE) -> dict:
+        """Assume the role once, briefly, with no policy: does its trust admit bab?"""
+        if not _ROLE_ARN.match(role_arn):
+            raise MintError(f"{role_arn!r} is not an IAM role ARN")
+        token = self.token_source(audience)
+        resp = self.assume(role_arn, token, "bab-probe", MIN_SECONDS, None)
+        arn = resp["AssumedRoleUser"]["Arn"]
+        return {"account": arn.split(":")[4], "assumed_arn": arn}
 
 
 def default_minters() -> dict[str, Minter]:

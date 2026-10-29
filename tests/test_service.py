@@ -224,3 +224,27 @@ def test_topology_push_names_the_agent_behind_a_pod_identity(pods):
     assert out["tuples_deleted"] == 1
     # The room link that connect wrote survives every push.
     assert Tuple("room:acme", "room", "integration:aws-prod") in store.tuples
+
+
+def test_identity_probe_and_disconnect(world):
+    c, store, _, _ = world
+    assert c.get("/identity/aws", headers=OWNER).json()["subject"] == "static-minter"
+    assert c.get("/identity/datadog", headers=OWNER).status_code == 501
+    # A probe before saving: the owner cannot, a reviewer can, AWS's no is a 409 with its sentence.
+    arn = "arn:aws:iam::123456789012:role/KoboAccess-Role"
+    assert c.post("/probe/aws", json={"role_arn": arn}, headers=OWNER).status_code == 403
+    assert c.post("/probe/aws", json={"role_arn": arn}, headers=ADMIN).json()["account"] == "123456789012"
+    r = c.post("/probe/aws", json={"role_arn": "arn:aws:iam::123456789012:role/refuse-me"}, headers=ADMIN)
+    assert r.status_code == 409 and "AccessDenied" in r.text
+
+    connect(c, ["aws_inventory_read"])
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "aws-prod", "permissions": ["aws_inventory_read"]},
+                 headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    assert len(c.get("/agents/sherlock/grants", headers=OWNER).json()["grants"]) == 1
+    # Disconnect: the row, the grant (revoked), and every tuple naming the integration.
+    out = c.delete("/integrations/aws-prod", headers=ADMIN).json()
+    assert out["removed"] == "aws-prod" and out["grants_revoked"] == 1 and out["tuples_deleted"] >= 3
+    assert not [t for t in store.tuples if t.object == "integration:aws-prod"]
+    assert c.get("/integrations", headers=OWNER).json()["integrations"] == []
+    assert c.delete("/integrations/aws-prod", headers=ADMIN).status_code == 404
