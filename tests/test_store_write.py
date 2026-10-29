@@ -45,10 +45,10 @@ def _store(existing):
 
 
 def test_write_skips_present_replaces_changed_and_writes_new():
-    room = Tuple("room:kobo", "room", "integration:fubo-it")
-    grant_old = Tuple("agent:a", "aws_logs_read", "integration:fubo-it", "2026-11-01T00:00:00Z")
-    grant_new = Tuple("agent:a", "aws_logs_read", "integration:fubo-it", "2026-12-01T00:00:00Z")
-    ceiling = Tuple("team:sre", "ceiling_aws_logs_read", "integration:fubo-it")
+    room = Tuple("room:kobo", "room", "integration:aws-audit")
+    grant_old = Tuple("agent:a", "aws_logs_read", "integration:aws-audit", "2026-11-01T00:00:00Z")
+    grant_new = Tuple("agent:a", "aws_logs_read", "integration:aws-audit", "2026-12-01T00:00:00Z")
+    ceiling = Tuple("team:sre", "ceiling_aws_logs_read", "integration:aws-audit")
     s = _store([room, grant_old])
 
     s.write([room, grant_new, ceiling])
