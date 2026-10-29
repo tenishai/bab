@@ -271,6 +271,7 @@ def test_an_organization_hub_and_its_accounts(world):
     assert out["kind"] == "account" and out["parent"] == "acme-aws"
     rows = {r["integration"]: r for r in c.get("/integrations", headers=OWNER).json()["integrations"]}
     assert rows["acme-aws"]["kind"] == "org" and rows["acme-prod"]["parent"] == "acme-aws" and rows["acme-prod"]["account_id"] == "111111111111"
+    assert rows["acme-aws"]["hub_role_arn"] == hub and rows["acme-prod"]["hub_role_arn"] is None
     accts = {a["id"]: a for a in c.get("/integrations/acme-aws/accounts", headers=OWNER).json()["accounts"]}
     assert accts["111111111111"]["connected"] is True and accts["111111111111"]["integration"] == "acme-prod"
     # A lease on the account carries the hub to the minter; a lease on the organization is refused.

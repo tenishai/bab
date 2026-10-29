@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `GET /integrations` carries an organization row's `hub_role_arn` (not a secret; a console renders the trust a member account's role must carry from it).
+
 ## [0.4.0] - 2026-10-29
 
 ### Added

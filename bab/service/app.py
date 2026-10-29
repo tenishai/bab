@@ -398,6 +398,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                   "kind": r.kind, "parent": r.parent,
                                   "name": str((r.spec or {}).get("name") or r.id),
                                   "account_id": (r.spec or {}).get("account_id"),
+                                  # An organization's hub ARN is not a secret; a console needs it to
+                                  # render the trust a member account's role must carry.
+                                  "hub_role_arn": (r.spec or {}).get("hub_role_arn") if r.kind == "org" else None,
                                   "created_at": r.created_at.isoformat(), "updated_at": r.updated_at.isoformat()}
                                  for r in rows]}
 
