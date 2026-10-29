@@ -127,6 +127,9 @@ class Ledger:
                 return hit
         return s.scalar(select(AgentRow.name).where(AgentRow.name == name))
 
+    def active_grants_on(self, s: Session, integration: str) -> list[GrantRow]:
+        return list(s.scalars(select(GrantRow).where(GrantRow.integration == integration, GrantRow.revoked_at.is_(None))))
+
     def active_grants(self, s: Session, agent: str, integration: str | None = None) -> list[GrantRow]:
         q = select(GrantRow).where(GrantRow.agent == agent, GrantRow.revoked_at.is_(None))
         if integration:
