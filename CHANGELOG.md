@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Faster release builds.** The lockfile export runs once on the build host instead of once per target architecture, and unchanged layers come from a registry cache (`ghcr.io/tenishai/bab:buildcache`). The image's contents do not change.
+
 ## [0.3.1] - 2026-10-29
 
 ### Added

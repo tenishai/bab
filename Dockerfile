@@ -2,7 +2,7 @@
 # the lock (uv export --frozen writes requirements with hashes, pip verifies them),
 # the fga CLI by version. A bump is a line in a PR with the reason next to it.
 # Multi-arch: TARGETARCH is set by buildx (amd64 | arm64); a plain docker build gets amd64.
-FROM python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159 AS deps
+FROM --platform=$BUILDPLATFORM python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159 AS deps
 ARG UV_VERSION=0.11.21
 WORKDIR /lock
 COPY pyproject.toml uv.lock ./
