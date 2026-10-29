@@ -50,8 +50,14 @@ def test_connect_writes_the_ceiling_for_every_team_and_the_room_link(world):
     assert Tuple("team:sre", "ceiling_aws_inventory_read", "integration:aws-prod") in store.tuples
     # The picker's tree, grouped the vendor's way, with the tier as a column.
     tree = c.get("/catalogue/aws", headers=OWNER).json()
-    assert {g["name"] for g in tree["groups"]} >= {"Inventory", "Logs and metrics", "Billing"}
+    assert {g["name"] for g in tree["groups"]} >= {"Compute", "Storage", "Security", "Billing"}
+    assert (tree["kind"], tree["label"], tree["account"]) == ("cloud", "AWS", "account")
     assert tree["tiers"][0] == {"name": "read", "lease_seconds": 3600, "validity_days": None}
+    # The vendor list: clouds are connected per account, services are one connection.
+    vendors = {v["vendor"]: v for v in c.get("/catalogue", headers=OWNER).json()["vendors"]}
+    assert vendors["aws"]["kind"] == "cloud" and vendors["gcp"]["account"] == "project"
+    assert vendors["datadog"] == {"vendor": "datadog", "kind": "service", "label": "Datadog", "account": None,
+                                  "permissions": {"read": 12, "mutate": 1}}
 
 
 def test_ask_decide_hold_lease_revoke_sweep(world):
