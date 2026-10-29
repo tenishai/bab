@@ -286,3 +286,27 @@ def test_an_organization_hub_and_its_accounts(world):
     assert c.delete("/integrations/acme-aws", headers=ADMIN).status_code == 409
     assert c.delete("/integrations/acme-prod", headers=ADMIN).json()["removed"] == "acme-prod"
     assert c.delete("/integrations/acme-aws", headers=ADMIN).json()["removed"] == "acme-aws"
+
+
+def test_a_live_credential_is_reused_and_a_revoke_ends_it(world):
+    c, _, clock, minter = world
+    connect(c, ["aws_inventory_read"])
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "aws-prod", "permissions": ["aws_inventory_read"]},
+                 headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    first = c.post("/leases", json={"integration": "aws-prod", "task": "one"}, headers=AGENT).json()
+    second = c.post("/leases", json={"integration": "aws-prod", "task": "two"}, headers=AGENT).json()
+    # The runtime may ask on every call: the same credential comes back while it is good.
+    assert first["reused"] is False and second["reused"] is True
+    assert second["lease_id"] == first["lease_id"] and second["credential"] == first["credential"]
+    assert len(minter.minted) == 1
+    assert len(c.get("/leases", headers=OWNER).json()["leases"]) == 1
+    # Near the end of its life a fresh one is minted.
+    clock["now"] = T0 + timedelta(seconds=3600 - 60)
+    third = c.post("/leases", json={"integration": "aws-prod"}, headers=AGENT).json()
+    assert third["reused"] is False and third["lease_id"] != first["lease_id"]
+    # Revoke: the grant check fails before the cache is consulted, and the cache is dropped.
+    gid = c.get("/agents/sherlock/grants", headers=OWNER).json()["grants"][0]["id"]
+    c.delete(f"/grants/{gid}", headers=ADMIN)
+    r = c.post("/leases", json={"integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=AGENT)
+    assert r.status_code == 403
