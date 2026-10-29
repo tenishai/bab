@@ -6,6 +6,16 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Vendors have a kind.** The catalogue's `vendors:` map says whether a vendor is a `cloud` (connected one account, project or subscription at a time, with the unit named: `account`, `project`, `subscription`) or a `service` (one connection whose read capabilities its own API or MCP server exposes). `GET /catalogue` lists vendors with kind, label and permission counts; `GET /catalogue/{vendor}` carries them too.
+- **One read permission per cloud service.** The room catalogue offers AWS by service (EC2, S3, RDS, IAM, CloudTrail, ...; 40 entries), Google Cloud by service (viewer roles; 23) and Azure by area (built-in reader roles; 8), plus the read capabilities of Datadog (13) and Atlassian (9). The cloud-access bundles stay under "Bundles" for grants that already name them.
+
+### Changed
+
+- **The AWS session policy denies data-plane reads.** Every minted session carries a Deny for object bodies, secret and parameter values, table items, queue messages, stream records, query result rows and decryption, whatever a permission's IAM list says. A read permission is configuration and listings.
+- `aws_cloudtrail_read` now covers trails, event history and Lake queries; `aws_cloudtrail_lake_query` (0.3.0) is folded into it.
+
 ## [0.3.0] - 2026-10-29
 
 ### Fixed

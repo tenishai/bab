@@ -204,6 +204,20 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def healthz():
         return {"ok": True, "room": settings.room}
 
+    @app.get("/catalogue")
+    def catalogue_vendors(_: Console):
+        """Every vendor the catalogue knows: its kind (cloud or service), label, and how many
+        permissions it offers per tier."""
+        out = []
+        for name in cat.vendor_names():
+            v = cat.vendor(name)
+            tiers: dict[str, int] = {}
+            for a in cat.for_vendor(name):
+                tiers[a.tier] = tiers.get(a.tier, 0) + 1
+            out.append({"vendor": name, "kind": v.kind, "label": v.label, "account": v.account or None,
+                        "permissions": tiers})
+        return {"vendors": out}
+
     @app.get("/catalogue/{vendor}")
     def catalogue(vendor: str, _: Console):
         groups: dict[str, list] = {}
@@ -212,7 +226,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 {"name": a.name, "tier": a.tier, "description": a.description})
         if not groups:
             raise HTTPException(404, f"the catalogue has no permissions for {vendor!r}")
-        return {"vendor": vendor, "groups": [{"name": g, "permissions": ps} for g, ps in groups.items()],
+        v = cat.vendor(vendor)
+        return {"vendor": vendor, "kind": v.kind, "label": v.label, "account": v.account or None,
+                "groups": [{"name": g, "permissions": ps} for g, ps in groups.items()],
                 "tiers": [{"name": t.name, "lease_seconds": t.lease_seconds, "validity_days": t.validity_days}
                           for t in cat.tiers]}
 

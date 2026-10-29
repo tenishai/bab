@@ -95,15 +95,35 @@ def web_identity_token(audience: str) -> str:
     return resp.text.strip()
 
 
+# Data-plane reads a read permission never means: object bodies, secret and parameter
+# values, table items, queue messages, stream records, query result rows, decryption.
+# Denied in every session whatever a permission's `iam` list says, so a wildcard like
+# s3:Get* in a catalogue entry can widen configuration reads but never reach the data.
+DATA_PLANE_DENY = (
+    "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTorrent", "s3:SelectObjectContent",
+    "secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue",
+    "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory",
+    "kms:Decrypt", "kms:GenerateDataKey*", "kms:GetPublicKey",
+    "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan",
+    "dynamodb:ExecuteStatement", "dynamodb:PartiQLSelect",
+    "sqs:ReceiveMessage", "kinesis:GetRecords", "kinesis:GetShardIterator",
+    "athena:GetQueryResults", "athena:GetQueryResultsStream",
+    "rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement", "redshift-data:GetStatementResult",
+    "timestream-query:Query", "lambda:GetFunction", "lambda:GetLayerVersion",
+)
+
+
 def session_policy(permissions: list[Action]) -> dict | None:
     """The IAM session policy that narrows the role to the granted permissions.
     Each permission's `extra.iam` lists its IAM actions; a permission without one
-    adds nothing, and if none has one the role's own policy is the only wall."""
+    adds nothing, and if none has one the role's own policy is the only wall. Every
+    policy carries the data-plane Deny: a lease is for configuration and listings."""
     actions = sorted({a for p in permissions for a in (p.extra.get("iam") or [])})
     if not actions:
         return None
     return {"Version": "2012-10-17",
-            "Statement": [{"Sid": "BabLease", "Effect": "Allow", "Action": actions, "Resource": "*"}]}
+            "Statement": [{"Sid": "BabLease", "Effect": "Allow", "Action": actions, "Resource": "*"},
+                          {"Sid": "BabNoData", "Effect": "Deny", "Action": list(DATA_PLANE_DENY), "Resource": "*"}]}
 
 
 class AwsMinter:

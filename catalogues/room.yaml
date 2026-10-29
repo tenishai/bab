@@ -1,7 +1,17 @@
 # A room's catalogue: integrations under one room, permissions per vendor.
-# `vendor` groups permissions for the console's picker; `group` is the vendor's own
-# section; `extra` carries what a minter needs (aws: the IAM actions a permission means).
-# Later `bab catalogue build` generates this from cloud-access packs and vendor files.
+#
+# Two kinds of vendor. A CLOUD (aws, gcp, azure) is connected one account, project or
+# subscription at a time; a permission is read access to one service there, and the
+# minter narrows the leased session to it. A SERVICE (datadog, atlassian, github) is one
+# connection; a permission is one read capability the vendor's own API or MCP server
+# exposes, and the gateway in front of it is what honours the grant.
+#
+# `vendor` names the family; `group` is the vendor's own section; `extra` carries what a
+# minter needs (aws: IAM actions; gcp: roles; azure: role definitions). Read permissions
+# on a cloud are the service's Describe/Get/List surface; the AWS minter adds a standing
+# Deny for data-plane reads (object bodies, secret values, parameter values, table items,
+# queue messages) whatever a permission lists, so "read" here means configuration and
+# listings, never the data a service holds.
 resources: [room, integration]
 
 tiers:
@@ -9,65 +19,171 @@ tiers:
   mutate:  {lease_seconds: 3600, validity_days: 30}
   destroy: {lease_seconds: 1800, validity_days: 7}
 
-actions:
-  # ---- aws (from cloud-access packs) ----
-  - name: aws_inventory_read
-    tier: read
-    vendor: aws
-    group: Inventory
-    description: See what exists across services (ViewOnlyAccess)
-    extra: {iam: ["ec2:Describe*", "elasticloadbalancing:Describe*", "ecs:Describe*", "ecs:List*", "eks:Describe*", "eks:List*", "rds:Describe*", "lambda:List*", "lambda:GetFunctionConfiguration", "iam:Get*", "iam:List*", "s3:ListAllMyBuckets", "s3:GetBucketLocation", "tag:Get*"]}
-  - name: aws_logs_read
-    tier: read
-    vendor: aws
-    group: Logs and metrics
-    description: Read CloudWatch metrics and query log groups
-    extra: {iam: ["cloudwatch:Get*", "cloudwatch:List*", "cloudwatch:Describe*", "logs:Describe*", "logs:Get*", "logs:List*", "logs:FilterLogEvents", "logs:StartQuery", "logs:StopQuery"]}
-  - name: aws_cloudtrail_read
-    tier: read
-    vendor: aws
-    group: Security
-    description: Read CloudTrail history
-    extra: {iam: ["cloudtrail:LookupEvents", "cloudtrail:GetTrail", "cloudtrail:GetTrailStatus", "cloudtrail:ListTrails"]}
-  - name: aws_cloudtrail_lake_query
-    tier: read
-    vendor: aws
-    group: Security
-    description: Run and read CloudTrail Lake queries against an event data store
-    extra: {iam: ["cloudtrail:StartQuery", "cloudtrail:GetQueryResults", "cloudtrail:DescribeQuery", "cloudtrail:CancelQuery", "cloudtrail:ListEventDataStores", "cloudtrail:GetEventDataStore"]}
-  - name: aws_security_audit_read
-    tier: read
-    vendor: aws
-    group: Security
-    description: Audit configuration (SecurityAudit)
-    extra: {iam: ["config:Describe*", "config:Get*", "guardduty:Get*", "guardduty:List*", "securityhub:Get*", "securityhub:List*", "kms:Describe*", "kms:List*"]}
-  - name: aws_cost_read
-    tier: read
-    vendor: aws
-    group: Billing
-    description: Read spend, budgets and rightsizing recommendations
-    extra: {iam: ["ce:Get*", "ce:Describe*", "ce:List*", "budgets:ViewBudget", "budgets:Describe*", "cur:Describe*", "compute-optimizer:Get*", "trustedadvisor:List*", "trustedadvisor:Describe*"]}
-  - name: aws_ecs_update_service
-    tier: mutate
-    vendor: aws
-    group: Compute
-    description: Change an ECS service's task definition or desired count
-    extra: {iam: ["ecs:UpdateService"]}
-  - name: aws_ec2_stop_instances
-    tier: destroy
-    vendor: aws
-    group: Compute
-    description: Stop EC2 instances
-    extra: {iam: ["ec2:StopInstances"]}
+vendors:
+  aws:       {kind: cloud,   label: AWS,       account: account}
+  gcp:       {kind: cloud,   label: Google Cloud, account: project}
+  azure:     {kind: cloud,   label: Azure,     account: subscription}
+  datadog:   {kind: service, label: Datadog}
+  atlassian: {kind: service, label: Atlassian}
+  github:    {kind: service, label: GitHub}
 
-  # ---- datadog ----
-  - {name: datadog_monitors_read,   tier: read,   vendor: datadog, group: Monitors,   description: List and read monitors}
-  - {name: datadog_monitors_write,  tier: mutate, vendor: datadog, group: Monitors,   description: Create, edit and mute monitors}
-  - {name: datadog_dashboards_read, tier: read,   vendor: datadog, group: Dashboards, description: Read dashboards}
-  - {name: datadog_logs_read,       tier: read,   vendor: datadog, group: Logs,       description: Search and read log events}
-  - {name: datadog_metrics_read,    tier: read,   vendor: datadog, group: Metrics,    description: Query metrics}
+actions:
+  # ---- aws: one read permission per service ----
+  - {name: aws_ec2_read, tier: read, vendor: aws, group: Compute, description: "EC2: instances, volumes, images, VPCs, subnets, security groups",
+     extra: {iam: ["ec2:Describe*", "ec2:Get*"]}}
+  - {name: aws_autoscaling_read, tier: read, vendor: aws, group: Compute, description: "Auto Scaling groups and policies",
+     extra: {iam: ["autoscaling:Describe*"]}}
+  - {name: aws_elb_read, tier: read, vendor: aws, group: Compute, description: "Load balancers, listeners and target groups",
+     extra: {iam: ["elasticloadbalancing:Describe*"]}}
+  - {name: aws_ecs_read, tier: read, vendor: aws, group: Compute, description: "ECS clusters, services and task definitions",
+     extra: {iam: ["ecs:Describe*", "ecs:List*"]}}
+  - {name: aws_eks_read, tier: read, vendor: aws, group: Compute, description: "EKS clusters, node groups and add-ons",
+     extra: {iam: ["eks:Describe*", "eks:List*"]}}
+  - {name: aws_lambda_read, tier: read, vendor: aws, group: Compute, description: "Lambda functions, configuration and aliases",
+     extra: {iam: ["lambda:Get*", "lambda:List*"]}}
+  - {name: aws_ecr_read, tier: read, vendor: aws, group: Compute, description: "ECR repositories and image metadata",
+     extra: {iam: ["ecr:Describe*", "ecr:List*", "ecr:GetRepositoryPolicy", "ecr:GetLifecyclePolicy"]}}
+  - {name: aws_s3_read, tier: read, vendor: aws, group: Storage, description: "S3 buckets: configuration, policies and object listings (not object contents)",
+     extra: {iam: ["s3:List*", "s3:GetBucket*", "s3:GetAccountPublicAccessBlock", "s3:GetEncryptionConfiguration", "s3:GetLifecycleConfiguration", "s3:GetReplicationConfiguration", "s3:GetObjectTagging", "s3:GetObjectAcl"]}}
+  - {name: aws_efs_read, tier: read, vendor: aws, group: Storage, description: "EFS file systems and mount targets",
+     extra: {iam: ["elasticfilesystem:Describe*"]}}
+  - {name: aws_backup_read, tier: read, vendor: aws, group: Storage, description: "AWS Backup plans, vaults and jobs",
+     extra: {iam: ["backup:Describe*", "backup:Get*", "backup:List*"]}}
+  - {name: aws_rds_read, tier: read, vendor: aws, group: Database, description: "RDS and Aurora instances, clusters, snapshots and parameters",
+     extra: {iam: ["rds:Describe*", "rds:List*"]}}
+  - {name: aws_dynamodb_read, tier: read, vendor: aws, group: Database, description: "DynamoDB tables and settings (not items)",
+     extra: {iam: ["dynamodb:Describe*", "dynamodb:List*"]}}
+  - {name: aws_elasticache_read, tier: read, vendor: aws, group: Database, description: "ElastiCache clusters and replication groups",
+     extra: {iam: ["elasticache:Describe*", "elasticache:List*"]}}
+  - {name: aws_redshift_read, tier: read, vendor: aws, group: Database, description: "Redshift clusters and snapshots",
+     extra: {iam: ["redshift:Describe*"]}}
+  - {name: aws_route53_read, tier: read, vendor: aws, group: Networking, description: "Route 53 hosted zones and records",
+     extra: {iam: ["route53:Get*", "route53:List*", "route53domains:Get*", "route53domains:List*"]}}
+  - {name: aws_cloudfront_read, tier: read, vendor: aws, group: Networking, description: "CloudFront distributions",
+     extra: {iam: ["cloudfront:Get*", "cloudfront:List*"]}}
+  - {name: aws_apigateway_read, tier: read, vendor: aws, group: Networking, description: "API Gateway APIs, stages and routes",
+     extra: {iam: ["apigateway:GET"]}}
+  - {name: aws_iam_read, tier: read, vendor: aws, group: Security, description: "IAM users, roles, policies and their attachments",
+     extra: {iam: ["iam:Get*", "iam:List*", "iam:GenerateCredentialReport", "iam:GenerateServiceLastAccessedDetails", "iam:SimulatePrincipalPolicy", "access-analyzer:Get*", "access-analyzer:List*"]}}
+  - {name: aws_kms_read, tier: read, vendor: aws, group: Security, description: "KMS keys, aliases and policies (never decrypt)",
+     extra: {iam: ["kms:Describe*", "kms:List*", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus"]}}
+  - {name: aws_secretsmanager_read, tier: read, vendor: aws, group: Security, description: "Secrets Manager: names, tags and rotation (never values)",
+     extra: {iam: ["secretsmanager:Describe*", "secretsmanager:List*", "secretsmanager:GetResourcePolicy"]}}
+  - {name: aws_ssm_read, tier: read, vendor: aws, group: Security, description: "Systems Manager inventory, patch state and parameter names (never values)",
+     extra: {iam: ["ssm:Describe*", "ssm:List*", "ssm:GetInventory", "ssm:GetPatchBaseline"]}}
+  - {name: aws_cloudtrail_read, tier: read, vendor: aws, group: Security, description: "CloudTrail: trails, event history and Lake queries",
+     extra: {iam: ["cloudtrail:Describe*", "cloudtrail:Get*", "cloudtrail:List*", "cloudtrail:LookupEvents", "cloudtrail:StartQuery", "cloudtrail:CancelQuery"]}}
+  - {name: aws_guardduty_read, tier: read, vendor: aws, group: Security, description: "GuardDuty detectors and findings",
+     extra: {iam: ["guardduty:Get*", "guardduty:List*"]}}
+  - {name: aws_securityhub_read, tier: read, vendor: aws, group: Security, description: "Security Hub findings, standards and insights",
+     extra: {iam: ["securityhub:Get*", "securityhub:List*", "securityhub:Describe*"]}}
+  - {name: aws_config_read, tier: read, vendor: aws, group: Security, description: "AWS Config rules, resources and compliance",
+     extra: {iam: ["config:Describe*", "config:Get*", "config:List*", "config:Select*"]}}
+  - {name: aws_acm_read, tier: read, vendor: aws, group: Security, description: "Certificates (ACM)",
+     extra: {iam: ["acm:Describe*", "acm:List*", "acm:GetCertificate"]}}
+  - {name: aws_waf_read, tier: read, vendor: aws, group: Security, description: "WAF web ACLs, rules and logging",
+     extra: {iam: ["wafv2:Get*", "wafv2:List*", "wafv2:Describe*"]}}
+  - {name: aws_cloudwatch_read, tier: read, vendor: aws, group: Observability, description: "CloudWatch metrics, alarms and dashboards",
+     extra: {iam: ["cloudwatch:Get*", "cloudwatch:List*", "cloudwatch:Describe*"]}}
+  - {name: aws_logs_read, tier: read, vendor: aws, group: Observability, description: "CloudWatch Logs: log groups, streams and queries",
+     extra: {iam: ["logs:Describe*", "logs:Get*", "logs:List*", "logs:FilterLogEvents", "logs:StartQuery", "logs:StopQuery"]}}
+  - {name: aws_xray_read, tier: read, vendor: aws, group: Observability, description: "X-Ray traces and service map",
+     extra: {iam: ["xray:Get*", "xray:List*", "xray:BatchGetTraces"]}}
+  - {name: aws_sqs_read, tier: read, vendor: aws, group: Messaging, description: "SQS queues and attributes (not messages)",
+     extra: {iam: ["sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:ListQueues", "sqs:ListQueueTags", "sqs:ListDeadLetterSourceQueues"]}}
+  - {name: aws_sns_read, tier: read, vendor: aws, group: Messaging, description: "SNS topics and subscriptions",
+     extra: {iam: ["sns:Get*", "sns:List*"]}}
+  - {name: aws_eventbridge_read, tier: read, vendor: aws, group: Messaging, description: "EventBridge buses, rules and targets",
+     extra: {iam: ["events:Describe*", "events:List*"]}}
+  - {name: aws_kinesis_read, tier: read, vendor: aws, group: Messaging, description: "Kinesis streams and shards (not records)",
+     extra: {iam: ["kinesis:Describe*", "kinesis:List*"]}}
+  - {name: aws_athena_read, tier: read, vendor: aws, group: Analytics, description: "Athena workgroups, catalogues and query history (not results)",
+     extra: {iam: ["athena:Get*", "athena:List*", "athena:BatchGet*"]}}
+  - {name: aws_glue_read, tier: read, vendor: aws, group: Analytics, description: "Glue databases, tables, crawlers and jobs",
+     extra: {iam: ["glue:Get*", "glue:List*", "glue:BatchGet*", "glue:Search*"]}}
+  - {name: aws_cloudformation_read, tier: read, vendor: aws, group: Management, description: "CloudFormation stacks, resources and drift",
+     extra: {iam: ["cloudformation:Describe*", "cloudformation:Get*", "cloudformation:List*", "cloudformation:Detect*"]}}
+  - {name: aws_organizations_read, tier: read, vendor: aws, group: Management, description: "Organizations: accounts, OUs and policies",
+     extra: {iam: ["organizations:Describe*", "organizations:List*"]}}
+  - {name: aws_tags_read, tier: read, vendor: aws, group: Management, description: "Resource groups and tags across services",
+     extra: {iam: ["tag:Get*", "resource-groups:Get*", "resource-groups:List*", "resource-groups:Search*", "resource-explorer-2:Search", "resource-explorer-2:Get*", "resource-explorer-2:List*"]}}
+  - {name: aws_health_read, tier: read, vendor: aws, group: Management, description: "AWS Health events and Trusted Advisor checks",
+     extra: {iam: ["health:Describe*", "trustedadvisor:Describe*", "trustedadvisor:List*", "support:DescribeTrustedAdvisor*"]}}
+  - {name: aws_cost_read, tier: read, vendor: aws, group: Billing, description: "Cost Explorer, budgets and rightsizing recommendations",
+     extra: {iam: ["ce:Get*", "ce:Describe*", "ce:List*", "budgets:ViewBudget", "budgets:Describe*", "cur:Describe*", "compute-optimizer:Get*", "pricing:Get*", "pricing:Describe*"]}}
+  # Bundles from the cloud-access packs, kept for grants that already name them.
+  - {name: aws_inventory_read, tier: read, vendor: aws, group: Bundles, description: "ViewOnlyAccess bundle: what exists across services",
+     extra: {iam: ["ec2:Describe*", "elasticloadbalancing:Describe*", "ecs:Describe*", "ecs:List*", "eks:Describe*", "eks:List*", "rds:Describe*", "lambda:List*", "lambda:GetFunctionConfiguration", "iam:Get*", "iam:List*", "s3:ListAllMyBuckets", "s3:GetBucketLocation", "tag:Get*"]}}
+  - {name: aws_security_audit_read, tier: read, vendor: aws, group: Bundles, description: "SecurityAudit bundle: Config, GuardDuty, Security Hub, KMS metadata",
+     extra: {iam: ["config:Describe*", "config:Get*", "guardduty:Get*", "guardduty:List*", "securityhub:Get*", "securityhub:List*", "kms:Describe*", "kms:List*"]}}
+  # Write tiers stay explicit and rare.
+  - {name: aws_ecs_update_service, tier: mutate, vendor: aws, group: Compute, description: "Change an ECS service's task definition or desired count",
+     extra: {iam: ["ecs:UpdateService"]}}
+  - {name: aws_ec2_stop_instances, tier: destroy, vendor: aws, group: Compute, description: "Stop EC2 instances",
+     extra: {iam: ["ec2:StopInstances"]}}
+
+  # ---- gcp: one read permission per service (a viewer role the minter binds for the lease) ----
+  - {name: gcp_compute_read, tier: read, vendor: gcp, group: Compute, description: "Compute Engine: instances, disks, networks, firewalls", extra: {roles: ["roles/compute.viewer"]}}
+  - {name: gcp_gke_read, tier: read, vendor: gcp, group: Compute, description: "GKE clusters and node pools", extra: {roles: ["roles/container.viewer"]}}
+  - {name: gcp_run_read, tier: read, vendor: gcp, group: Compute, description: "Cloud Run services and revisions", extra: {roles: ["roles/run.viewer"]}}
+  - {name: gcp_functions_read, tier: read, vendor: gcp, group: Compute, description: "Cloud Functions", extra: {roles: ["roles/cloudfunctions.viewer"]}}
+  - {name: gcp_storage_read, tier: read, vendor: gcp, group: Storage, description: "Cloud Storage buckets and their configuration (not object contents)", extra: {roles: ["roles/storage.bucketViewer"]}}
+  - {name: gcp_artifactregistry_read, tier: read, vendor: gcp, group: Storage, description: "Artifact Registry repositories and images", extra: {roles: ["roles/artifactregistry.reader"]}}
+  - {name: gcp_sql_read, tier: read, vendor: gcp, group: Database, description: "Cloud SQL instances, databases and backups", extra: {roles: ["roles/cloudsql.viewer"]}}
+  - {name: gcp_bigquery_read, tier: read, vendor: gcp, group: Database, description: "BigQuery datasets, tables and jobs (metadata, not rows)", extra: {roles: ["roles/bigquery.metadataViewer", "roles/bigquery.resourceViewer"]}}
+  - {name: gcp_spanner_read, tier: read, vendor: gcp, group: Database, description: "Spanner instances and databases", extra: {roles: ["roles/spanner.viewer"]}}
+  - {name: gcp_memorystore_read, tier: read, vendor: gcp, group: Database, description: "Memorystore Redis instances", extra: {roles: ["roles/redis.viewer"]}}
+  - {name: gcp_dns_read, tier: read, vendor: gcp, group: Networking, description: "Cloud DNS zones and records", extra: {roles: ["roles/dns.reader"]}}
+  - {name: gcp_network_read, tier: read, vendor: gcp, group: Networking, description: "Network Management connectivity tests and topology", extra: {roles: ["roles/networkmanagement.viewer"]}}
+  - {name: gcp_iam_read, tier: read, vendor: gcp, group: Security, description: "IAM policies, roles and service accounts", extra: {roles: ["roles/iam.securityReviewer"]}}
+  - {name: gcp_kms_read, tier: read, vendor: gcp, group: Security, description: "Cloud KMS key rings and keys (never decrypt)", extra: {roles: ["roles/cloudkms.viewer"]}}
+  - {name: gcp_secretmanager_read, tier: read, vendor: gcp, group: Security, description: "Secret Manager: secrets and versions metadata (never values)", extra: {roles: ["roles/secretmanager.viewer"]}}
+  - {name: gcp_securitycenter_read, tier: read, vendor: gcp, group: Security, description: "Security Command Center findings", extra: {roles: ["roles/securitycenter.findingsViewer"]}}
+  - {name: gcp_asset_read, tier: read, vendor: gcp, group: Security, description: "Cloud Asset Inventory", extra: {roles: ["roles/cloudasset.viewer"]}}
+  - {name: gcp_logging_read, tier: read, vendor: gcp, group: Observability, description: "Cloud Logging entries, sinks and buckets", extra: {roles: ["roles/logging.viewer"]}}
+  - {name: gcp_monitoring_read, tier: read, vendor: gcp, group: Observability, description: "Cloud Monitoring metrics, alerts and dashboards", extra: {roles: ["roles/monitoring.viewer"]}}
+  - {name: gcp_pubsub_read, tier: read, vendor: gcp, group: Messaging, description: "Pub/Sub topics and subscriptions (not messages)", extra: {roles: ["roles/pubsub.viewer"]}}
+  - {name: gcp_dataflow_read, tier: read, vendor: gcp, group: Analytics, description: "Dataflow jobs", extra: {roles: ["roles/dataflow.viewer"]}}
+  - {name: gcp_resourcemanager_read, tier: read, vendor: gcp, group: Management, description: "Projects, folders and enabled services", extra: {roles: ["roles/browser", "roles/serviceusage.serviceUsageViewer"]}}
+  - {name: gcp_billing_read, tier: read, vendor: gcp, group: Billing, description: "Billing accounts and budgets", extra: {roles: ["roles/billing.viewer"]}}
+
+  # ---- azure: one read permission per area (a built-in role the minter assigns for the lease) ----
+  - {name: azure_resources_read, tier: read, vendor: azure, group: Management, description: "Everything in the subscription, read-only (Reader)", extra: {roles: ["Reader"]}}
+  - {name: azure_monitor_read, tier: read, vendor: azure, group: Observability, description: "Azure Monitor metrics, alerts and logs (Monitoring Reader)", extra: {roles: ["Monitoring Reader"]}}
+  - {name: azure_loganalytics_read, tier: read, vendor: azure, group: Observability, description: "Log Analytics workspaces and queries (Log Analytics Reader)", extra: {roles: ["Log Analytics Reader"]}}
+  - {name: azure_keyvault_read, tier: read, vendor: azure, group: Security, description: "Key Vault vaults and their configuration, never secret values (Key Vault Reader)", extra: {roles: ["Key Vault Reader"]}}
+  - {name: azure_security_read, tier: read, vendor: azure, group: Security, description: "Defender for Cloud recommendations and alerts (Security Reader)", extra: {roles: ["Security Reader"]}}
+  - {name: azure_aks_read, tier: read, vendor: azure, group: Compute, description: "AKS clusters, read-only (Azure Kubernetes Service RBAC Reader)", extra: {roles: ["Azure Kubernetes Service RBAC Reader"]}}
+  - {name: azure_network_read, tier: read, vendor: azure, group: Networking, description: "Virtual networks, NSGs and load balancers (Reader on networking)", extra: {roles: ["Reader"]}}
+  - {name: azure_cost_read, tier: read, vendor: azure, group: Billing, description: "Cost Management data and budgets (Cost Management Reader)", extra: {roles: ["Cost Management Reader"]}}
+
+  # ---- datadog: the read capabilities its API and MCP server expose ----
+  - {name: datadog_monitors_read,   tier: read,   vendor: datadog, group: Monitors,     description: "List and read monitors and their status"}
+  - {name: datadog_monitors_write,  tier: mutate, vendor: datadog, group: Monitors,     description: "Create, edit and mute monitors"}
+  - {name: datadog_dashboards_read, tier: read,   vendor: datadog, group: Dashboards,   description: "Read dashboards and notebooks"}
+  - {name: datadog_logs_read,       tier: read,   vendor: datadog, group: Logs,         description: "Search and read log events"}
+  - {name: datadog_metrics_read,    tier: read,   vendor: datadog, group: Metrics,      description: "Query metrics and read metric metadata"}
+  - {name: datadog_events_read,     tier: read,   vendor: datadog, group: Events,       description: "Search the event stream"}
+  - {name: datadog_incidents_read,  tier: read,   vendor: datadog, group: Incidents,    description: "Read incidents, their timelines and attachments"}
+  - {name: datadog_hosts_read,      tier: read,   vendor: datadog, group: Infrastructure, description: "List hosts, containers and processes"}
+  - {name: datadog_apm_read,        tier: read,   vendor: datadog, group: APM,          description: "Read services, traces and spans"}
+  - {name: datadog_slos_read,       tier: read,   vendor: datadog, group: SLOs,         description: "Read SLOs and their history"}
+  - {name: datadog_synthetics_read, tier: read,   vendor: datadog, group: Synthetics,   description: "Read synthetic tests and results"}
+  - {name: datadog_rum_read,        tier: read,   vendor: datadog, group: RUM,          description: "Search RUM events and read applications"}
+  - {name: datadog_security_read,   tier: read,   vendor: datadog, group: Security,     description: "Read security signals and rules"}
+
+  # ---- atlassian: the read capabilities its MCP server exposes ----
+  - {name: atlassian_jira_issues_read,     tier: read, vendor: atlassian, group: Jira,       description: "Read issues and search with JQL"}
+  - {name: atlassian_jira_projects_read,   tier: read, vendor: atlassian, group: Jira,       description: "List projects, issue types and fields"}
+  - {name: atlassian_jira_boards_read,     tier: read, vendor: atlassian, group: Jira,       description: "Read boards, sprints and backlogs"}
+  - {name: atlassian_jira_history_read,    tier: read, vendor: atlassian, group: Jira,       description: "Read issue changelogs, comments and transitions"}
+  - {name: atlassian_jira_users_read,      tier: read, vendor: atlassian, group: Jira,       description: "Look up people and account ids"}
+  - {name: atlassian_confluence_pages_read, tier: read, vendor: atlassian, group: Confluence, description: "Read pages, blog posts and their history"}
+  - {name: atlassian_confluence_search,     tier: read, vendor: atlassian, group: Confluence, description: "Search content with CQL"}
+  - {name: atlassian_confluence_spaces_read, tier: read, vendor: atlassian, group: Confluence, description: "List spaces and page trees"}
+  - {name: atlassian_confluence_comments_read, tier: read, vendor: atlassian, group: Confluence, description: "Read comments on pages"}
 
   # ---- github ----
-  - {name: github_repos_read,   tier: read,    vendor: github, group: Repositories,  description: Read code, issues and pull requests}
-  - {name: github_pulls_write,  tier: mutate,  vendor: github, group: Pull requests, description: Open, comment on and review pull requests}
-  - {name: github_repos_delete, tier: destroy, vendor: github, group: Repositories,  description: Delete a repository}
+  - {name: github_repos_read,   tier: read,    vendor: github, group: Repositories,  description: "Read code, issues and pull requests"}
+  - {name: github_pulls_write,  tier: mutate,  vendor: github, group: Pull requests, description: "Open, comment on and review pull requests"}
+  - {name: github_repos_delete, tier: destroy, vendor: github, group: Repositories,  description: "Delete a repository"}

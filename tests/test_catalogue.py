@@ -23,3 +23,18 @@ def test_loads_example_profile():
 def test_rejects_bad_catalogues(raw, msg):
     with pytest.raises(CatalogueError, match=msg):
         Catalogue.from_dict(raw)
+
+
+def test_vendors_have_a_kind_and_a_default():
+    from bab.catalogue import Catalogue, CatalogueError
+
+    cat = Catalogue.from_dict({"resources": ["room"], "vendors": {"aws": {"kind": "cloud", "label": "AWS", "account": "account"}},
+                               "actions": [{"name": "aws_s3_read", "tier": "read", "vendor": "aws"},
+                                           {"name": "pagerduty_incidents_read", "tier": "read", "vendor": "pagerduty"}]})
+    assert cat.vendor("aws").kind == "cloud" and cat.vendor("aws").account == "account"
+    assert cat.vendor("pagerduty").kind == "service" and cat.vendor("pagerduty").label == "pagerduty"
+    assert cat.vendor_names() == ("aws", "pagerduty")
+    import pytest
+
+    with pytest.raises(CatalogueError, match="kind"):
+        Catalogue.from_dict({"resources": ["room"], "vendors": {"x": {"kind": "planet"}}})

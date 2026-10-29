@@ -45,6 +45,21 @@ class Action:
         return f"{self.name}_gated"
 
 
+VENDOR_KINDS = ("cloud", "service")
+
+
+@dataclass(frozen=True)
+class Vendor:
+    """A family of integrations. A `cloud` is connected one account, project or
+    subscription at a time (`account` names that unit the vendor's way); a
+    `service` is one connection whose read capabilities its own API exposes."""
+
+    name: str
+    kind: str = "service"
+    label: str = ""
+    account: str = ""  # cloud only: "account" | "project" | "subscription"
+
+
 @dataclass(frozen=True)
 class Tier:
     name: str
@@ -58,6 +73,7 @@ class Catalogue:
     actions: tuple[Action, ...] = field(default_factory=tuple)
     tiers: tuple[Tier, ...] = field(default_factory=lambda: tuple(
         Tier(n, lease, days) for n, (lease, days) in TIER_DEFAULTS.items()))
+    vendors: tuple[Vendor, ...] = field(default_factory=tuple)
 
     def action(self, name: str) -> Action | None:
         return next((a for a in self.actions if a.name == name), None)
@@ -67,6 +83,17 @@ class Catalogue:
 
     def for_vendor(self, vendor: str) -> tuple[Action, ...]:
         return tuple(a for a in self.actions if a.vendor == vendor)
+
+    def vendor(self, name: str) -> Vendor:
+        """The vendor's entry, or a plain `service` one for a vendor only the actions name."""
+        return next((v for v in self.vendors if v.name == name), Vendor(name, "service", name))
+
+    def vendor_names(self) -> tuple[str, ...]:
+        seen = [v.name for v in self.vendors]
+        for a in self.actions:
+            if a.vendor and a.vendor not in seen:
+                seen.append(a.vendor)
+        return tuple(seen)
 
     @property
     def root(self) -> str:
@@ -116,8 +143,17 @@ class Catalogue:
             if lease <= 0 or (days is not None and days <= 0):
                 raise CatalogueError(f"tiers.{t}: lease_seconds and validity_days must be positive")
             tiers.append(Tier(t, lease, days))
-        log.debug("catalogue: %d levels, %d actions", len(resources), len(actions))
-        return cls(resources, tuple(actions), tuple(tiers))
+        vendors: list[Vendor] = []
+        for vname, spec in (raw.get("vendors") or {}).items():
+            spec = spec or {}
+            if not IDENT.match(str(vname)):
+                raise CatalogueError(f"bad vendor name {vname!r}")
+            kind = str(spec.get("kind", "service"))
+            if kind not in VENDOR_KINDS:
+                raise CatalogueError(f"vendor {vname!r}: kind must be one of {VENDOR_KINDS}, got {kind!r}")
+            vendors.append(Vendor(str(vname), kind, str(spec.get("label") or vname), str(spec.get("account") or "")))
+        log.debug("catalogue: %d levels, %d actions, %d vendors", len(resources), len(actions), len(vendors))
+        return cls(resources, tuple(actions), tuple(tiers), tuple(vendors))
 
 
 def load(path: str | Path) -> Catalogue:
