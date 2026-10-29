@@ -179,18 +179,25 @@ def test_topology_push_names_the_agent_behind_a_pod_identity(pods):
     r = c.post("/leases", json={"integration": "aws-prod"}, headers={"Authorization": "Bearer ledger-pod"})
     assert r.status_code == 404 and "aws-prod" in r.text  # verified as agent-ledger, no such integration
 
+    # Connect first, with no team in the store yet: the ceiling has nobody to land on.
+    connect(c, ["aws_inventory_read"])
+    (integ,) = c.get("/integrations", headers=OWNER).json()["integrations"]
+    assert (integ["integration"], integ["vendor"], integ["ceiling"]) == ("aws-prod", "aws", ["aws_inventory_read"])
+    assert integ["created_at"].startswith("2026-10-27T12:00:00")
+
     body = {"agents": [{"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"}],
             "rooms": [{"name": "acme", "team": "admins"}]}
-    assert c.put("/topology", json=body, headers=OWNER).status_code == 403  # a reviewer pushes
-    out = c.put("/topology", json=body, headers=ADMIN).json()
-    assert out == {"agents": 1, "removed": 0, "tuples_written": 2, "tuples_deleted": 0}
+    # The console pushes as the room itself: the token is the authority, the actor is recorded.
+    out = c.put("/topology", json=body, headers={**OWNER, "X-Bab-Actor": "room@console"}).json()
+    # team + owner, plus the connected integration's ceiling extended to the new team.
+    assert out == {"agents": 1, "removed": 0, "tuples_written": 3, "tuples_deleted": 0}
     assert Tuple("team:sre", "team", "agent:ledger") in store.tuples
     assert Tuple("team:admins", "owner", "room:acme") in store.tuples
+    assert Tuple("team:sre", "ceiling_aws_inventory_read", "integration:aws-prod") in store.tuples
     assert c.get("/agents", headers=OWNER).json()["agents"] == [
         {"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"}]
 
-    # Connect, grant to the agent by the name the room uses, and the pod's lease lands under it.
-    connect(c, ["aws_inventory_read"])
+    # Grant to the agent by the name the room uses, and the pod's lease lands under it.
     rid = c.post("/requests", json={"agent": "ledger", "integration": "aws-prod",
                                     "permissions": ["aws_inventory_read"]}, headers=OWNER).json()["id"]
     assert c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN).json()["results"][0]["status"] == "approved"
@@ -203,7 +210,11 @@ def test_topology_push_names_the_agent_behind_a_pod_identity(pods):
     r = c.post("/leases", json={"integration": "aws-prod"}, headers={"Authorization": "Bearer stray-pod"})
     assert r.status_code == 401 and "not an agent this room knows" in r.text
 
-    # The push owns team and owner; the room link that connect wrote survives a second push.
+    # A push without `rooms` leaves ownership alone; with `rooms: []` it owns (and empties) it.
+    out = c.put("/topology", json={"agents": []}, headers=ADMIN).json()
+    assert out["removed"] == 1 and out["tuples_deleted"] == 1
+    assert Tuple("team:admins", "owner", "room:acme") in store.tuples
     out = c.put("/topology", json={"agents": [], "rooms": []}, headers=ADMIN).json()
-    assert out["removed"] == 1 and out["tuples_deleted"] == 2
+    assert out["tuples_deleted"] == 1
+    # The room link that connect wrote survives every push.
     assert Tuple("room:acme", "room", "integration:aws-prod") in store.tuples
