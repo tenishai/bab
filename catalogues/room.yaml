@@ -29,6 +29,12 @@ actions:
     group: Security
     description: Read CloudTrail history
     extra: {iam: ["cloudtrail:LookupEvents", "cloudtrail:GetTrail", "cloudtrail:GetTrailStatus", "cloudtrail:ListTrails"]}
+  - name: aws_cloudtrail_lake_query
+    tier: read
+    vendor: aws
+    group: Security
+    description: Run and read CloudTrail Lake queries against an event data store
+    extra: {iam: ["cloudtrail:StartQuery", "cloudtrail:GetQueryResults", "cloudtrail:DescribeQuery", "cloudtrail:CancelQuery", "cloudtrail:ListEventDataStores", "cloudtrail:GetEventDataStore"]}
   - name: aws_security_audit_read
     tier: read
     vendor: aws
