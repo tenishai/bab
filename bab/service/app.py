@@ -8,6 +8,7 @@ caller's claim about what it holds.
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
@@ -80,6 +81,11 @@ class ProbeBody(BaseModel):
     # Given: `role_arn` is a spoke, reached from this hub (with this external id).
     hub_role_arn: str | None = Field(default=None, max_length=2048)
     external_id: str | None = Field(default=None, max_length=1224)
+
+
+class DiscoverBody(BaseModel):
+    # The spoke role's name, the same in every member account (one template, one StackSet).
+    role_name: str = Field(default="KoboAccess-Role", min_length=1, max_length=64, pattern=r"^[\w+=,.@-]+$")
 
 
 class TopologyAgent(BaseModel):
@@ -370,6 +376,54 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         return {"organization": integration,
                 "accounts": [{**a, "integration": children.get(a["id"]), "connected": a["id"] in children} for a in accounts]}
 
+    @app.post("/integrations/{integration}/discover")
+    def org_discover(integration: str, body: DiscoverBody, caller: Console):
+        """Which of an organization's accounts already carry the spoke role: every active
+        account the hub can see is probed through the hub with the organization's external
+        id (one id per organization, so one template deploys the role everywhere). What a
+        console registers next, without a person adding accounts one at a time."""
+        reviewer(caller)
+        with ledger.session() as s:
+            row = integration_or_404(s, integration)
+            if row.kind != "org":
+                raise HTTPException(409, f"{integration!r} is not an organization")
+            spec = row.spec or {}
+            external_id = str(spec.get("external_id") or "")
+            if not external_id:
+                raise HTTPException(409, f"{integration!r} has no external id; connect it again from a console that sets one")
+            minter = minters.get(row.vendor)
+            if minter is None or not hasattr(minter, "list_accounts") or not hasattr(minter, "probe"):
+                raise HTTPException(501, f"bab cannot discover accounts for {row.vendor!r}")
+            hub = str(spec.get("hub_role_arn")); audience = str(spec.get("audience") or "sts.amazonaws.com")
+            children = {str((c.spec or {}).get("account_id", "")): c.id
+                        for c in s.scalars(select(Integration).where(Integration.parent == integration))}
+            try:
+                accounts = minter.list_accounts(hub, audience)
+            except MintError as exc:
+                raise HTTPException(502, str(exc)) from exc
+            now = settings.now()
+            ledger.event(s, now, "integration.discover", caller.actor, integration=integration, accounts=len(accounts))
+            s.commit()
+
+        def look(a: dict) -> dict:
+            arn = f"arn:aws:iam::{a['id']}:role/{body.role_name}"
+            out = {**a, "role_arn": arn, "integration": children.get(a["id"]), "connected": a["id"] in children,
+                   "reachable": None, "reason": None}
+            if a.get("status") not in (None, "ACTIVE"):
+                out["reason"] = f"account is {a.get('status')}"
+                return out
+            try:
+                minter.probe(arn, audience, hub_role_arn=hub, external_id=external_id)
+                out["reachable"] = True
+            except MintError as exc:
+                out["reachable"], out["reason"] = False, str(exc)
+            return out
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            looked = list(pool.map(look, accounts))
+        return {"organization": integration, "external_id": external_id, "role_name": body.role_name,
+                "accounts": looked}
+
     @app.delete("/integrations/{integration}")
     def delete_integration(integration: str, caller: Console):
         """Disconnect: the row, every active grant on it (revoked), and every tuple
@@ -408,6 +462,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                   # An organization's hub ARN is not a secret; a console needs it to
                                   # render the trust a member account's role must carry.
                                   "hub_role_arn": (r.spec or {}).get("hub_role_arn") if r.kind == "org" else None,
+                                  "external_id": (r.spec or {}).get("external_id") if r.kind == "org" else None,
                                   "created_at": r.created_at.isoformat(), "updated_at": r.updated_at.isoformat()}
                                  for r in rows]}
 
@@ -517,7 +572,10 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             if integ.parent:
                 parent = s.get(Integration, integ.parent)
                 if parent is not None:
+                    # The organization's external id is every spoke's unless the account was
+                    # connected with one of its own (the per-account shape, kept working).
                     mint_spec = {"hub_role_arn": parent.spec.get("hub_role_arn"), "audience": parent.spec.get("audience"),
+                                 "external_id": parent.spec.get("external_id"),
                                  **{k: v for k, v in mint_spec.items() if v is not None}}
             wanted = permissions_or_422(body.permissions, integ.vendor) if body.permissions else [
                 cat.action(g.permission) for g in ledger.active_grants(s, caller.name, body.integration)
