@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Connecting an account with a full ceiling returned 500.** Registering an integration writes a ceiling tuple per permission per team, more than the 100 operations OpenFGA allows in one write once the catalogue has forty read permissions. Writes and deletes go in batches of 100 now.
+
 ## [0.4.1] - 2026-10-29
 
 ### Changed

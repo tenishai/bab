@@ -17,6 +17,9 @@ log = logging.getLogger(__name__)
 CONDITION = "grant_window"  # the one condition the generated model defines
 
 
+
+WRITE_BATCH = 100  # OpenFGA's limit on operations per write call
+
 @dataclass(frozen=True)
 class Tuple:
     user: str
@@ -123,8 +126,10 @@ class OpenFgaStore:
             )
             for t in fresh + changed
         ]
-        if body:
-            self._client.write_tuples(body)
+        # OpenFGA caps one write at 100 operations; connecting an account writes a ceiling
+        # tuple per permission per team, which is more than that for a whole catalogue.
+        for i in range(0, len(body), WRITE_BATCH):
+            self._client.write_tuples(body[i:i + WRITE_BATCH])
         log.info("wrote %d tuples (%d new, %d expiry changed, %d already present)",
                  len(body), len(fresh), len(changed), skipped)
 
@@ -133,8 +138,9 @@ class OpenFgaStore:
 
         # Deletes name the key only; a conditional tuple is deleted by the same key.
         body = [ClientTuple(user=t.user, relation=t.relation, object=t.object) for t in tuples]
+        for i in range(0, len(body), WRITE_BATCH):
+            self._client.delete_tuples(body[i:i + WRITE_BATCH])
         if body:
-            self._client.delete_tuples(body)
             log.info("deleted %d tuples", len(body))
 
     def read_all(self) -> list[Tuple]:
