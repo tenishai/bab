@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-29
+
 ### Added
 
 - `GET /identity/{vendor}`: who bab is to that vendor (for AWS, the `sub` an account owner writes into a role's trust policy). `POST /probe/{vendor}` (reviewer): try a role once before saving a connection; AWS's refusal comes back as a 409 with its sentence. `DELETE /integrations/{id}` (reviewer): disconnect, revoking every active grant on it and removing every tuple that named it.
