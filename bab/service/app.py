@@ -70,11 +70,16 @@ class IntegrationBody(BaseModel):
     vendor: str = Field(min_length=1, max_length=32)
     spec: dict = Field(default_factory=dict)
     ceiling: list[str] = Field(default_factory=list)
+    # A cloud account under its organization's row: the parent holds the hub role.
+    parent: str | None = Field(default=None, max_length=64)
 
 
 class ProbeBody(BaseModel):
     role_arn: str = Field(min_length=20, max_length=2048)
     audience: str | None = Field(default=None, max_length=256)
+    # Given: `role_arn` is a spoke, reached from this hub (with this external id).
+    hub_role_arn: str | None = Field(default=None, max_length=2048)
+    external_id: str | None = Field(default=None, max_length=1224)
 
 
 class TopologyAgent(BaseModel):
@@ -244,11 +249,18 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         acts = permissions_or_422(body.ceiling, body.vendor)
         now = settings.now()
         with ledger.session() as s:
+            if body.parent:
+                parent = s.get(Integration, body.parent)
+                if parent is None or parent.vendor != body.vendor or parent.kind != "org":
+                    raise HTTPException(422, f"{body.parent!r} is not a connected {body.vendor} organization")
+                if body.parent == integration:
+                    raise HTTPException(422, "an integration cannot be its own parent")
             row = s.get(Integration, integration)
             if row is None:
                 row = Integration(id=integration, vendor=body.vendor, created_at=now)
                 s.add(row)
             row.vendor, row.spec, row.ceiling, row.updated_at = body.vendor, body.spec, [a.name for a in acts], now
+            row.parent = body.parent
             try:
                 teams = sorted({t.user for t in store.read_all() if t.relation == "team"})
                 tuples = [Tuple(f"room:{settings.room}", "room", obj(integration))]
@@ -259,7 +271,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             ledger.event(s, now, "integration.put", caller.actor, integration=integration, vendor=body.vendor,
                          ceiling=len(acts), teams=len(teams))
             s.commit()
-        return {"integration": integration, "vendor": body.vendor, "ceiling": [a.name for a in acts], "teams": teams}
+        return {"integration": integration, "vendor": body.vendor, "ceiling": [a.name for a in acts], "teams": teams,
+                "parent": body.parent, "kind": row.kind}
 
     @app.put("/topology")
     def put_topology(body: TopologyBody, caller: Console):
@@ -324,10 +337,31 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         if minter is None or not hasattr(minter, "probe"):
             raise HTTPException(501, f"bab cannot mint for {vendor!r} yet")
         try:
-            out = minter.probe(body.role_arn, body.audience or "sts.amazonaws.com")
+            out = minter.probe(body.role_arn, body.audience or "sts.amazonaws.com",
+                               hub_role_arn=body.hub_role_arn, external_id=body.external_id)
         except MintError as exc:
             raise HTTPException(409, str(exc)) from exc
         return out
+
+    @app.get("/integrations/{integration}/accounts")
+    def org_accounts(integration: str, caller: Console):
+        """An organization's accounts as its hub sees them, each marked connected when a row
+        under this organization names it. What a console offers to connect next."""
+        with ledger.session() as s:
+            row = integration_or_404(s, integration)
+            if row.kind != "org":
+                raise HTTPException(409, f"{integration!r} is not an organization")
+            minter = minters.get(row.vendor)
+            if minter is None or not hasattr(minter, "list_accounts"):
+                raise HTTPException(501, f"bab cannot list accounts for {row.vendor!r}")
+            children = {str((c.spec or {}).get("account_id", "")): c.id
+                        for c in s.scalars(select(Integration).where(Integration.parent == integration))}
+            try:
+                accounts = minter.list_accounts(str(row.spec.get("hub_role_arn")), str(row.spec.get("audience") or "sts.amazonaws.com"))
+            except MintError as exc:
+                raise HTTPException(502, str(exc)) from exc
+        return {"organization": integration,
+                "accounts": [{**a, "integration": children.get(a["id"]), "connected": a["id"] in children} for a in accounts]}
 
     @app.delete("/integrations/{integration}")
     def delete_integration(integration: str, caller: Console):
@@ -337,6 +371,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         now = settings.now()
         with ledger.session() as s:
             row = integration_or_404(s, integration)
+            children = list(s.scalars(select(Integration.id).where(Integration.parent == integration)))
+            if children:
+                raise HTTPException(409, f"{integration!r} still has accounts under it: {', '.join(children)}; disconnect those first")
             revoked = 0
             for g in ledger.active_grants_on(s, integration):
                 g.revoked_at, g.revoked_by = now, caller.actor
@@ -358,6 +395,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         with ledger.session() as s:
             rows = list(s.scalars(select(Integration).order_by(Integration.id)))
         return {"integrations": [{"integration": r.id, "vendor": r.vendor, "ceiling": list(r.ceiling),
+                                  "kind": r.kind, "parent": r.parent,
+                                  "name": str((r.spec or {}).get("name") or r.id),
+                                  "account_id": (r.spec or {}).get("account_id"),
                                   "created_at": r.created_at.isoformat(), "updated_at": r.updated_at.isoformat()}
                                  for r in rows]}
 
@@ -456,9 +496,17 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         context = {"current_time": rfc3339(now)}
         with ledger.session() as s:
             integ = integration_or_404(s, body.integration)
+            if integ.kind == "org":
+                raise HTTPException(409, f"{body.integration!r} is an organization; a lease is for one of its accounts")
             minter = minters.get(integ.vendor)
             if minter is None:
                 raise HTTPException(501, f"bab cannot mint for {integ.vendor!r} yet")
+            mint_spec = dict(integ.spec or {})
+            if integ.parent:
+                parent = s.get(Integration, integ.parent)
+                if parent is not None:
+                    mint_spec = {"hub_role_arn": parent.spec.get("hub_role_arn"), "audience": parent.spec.get("audience"),
+                                 **{k: v for k, v in mint_spec.items() if v is not None}}
             wanted = permissions_or_422(body.permissions, integ.vendor) if body.permissions else [
                 cat.action(g.permission) for g in ledger.active_grants(s, caller.name, body.integration)
                 if cat.action(g.permission) and not g.gated]
@@ -487,7 +535,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 raise HTTPException(202 if gated else 403, detail)
             seconds = min(cat.tier(a.tier).lease_seconds for a in granted)
             try:
-                minted = minter.mint(caller.name, body.integration, integ.spec, granted, seconds)
+                minted = minter.mint(caller.name, body.integration, mint_spec, granted, seconds)
             except MintError as exc:
                 ledger.event(s, now, "lease.failed", caller.name, integration=body.integration, error=str(exc))
                 s.commit()

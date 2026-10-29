@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Organizations and their accounts (hub and spoke).** An AWS integration may be an organization: its row holds a hub role in the management account that bab assumes with its own identity. Accounts connect under it (`parent`) with a spoke role and an external ID; a lease on an account is two hops, the second carrying the session policy and the agent's name, which the member account's CloudTrail records. One hub per organization; a second organization is a second row, never a cross-organization assume. `GET /integrations/{org}/accounts` lists the organization's accounts through the hub, each marked connected or not; `POST /probe/{vendor}` takes `hub_role_arn` and `external_id` to try a spoke; `GET /integrations` carries `kind` (org, account, connection), `parent`, `name` and `account_id`. A lease on an organization row is refused; an organization with accounts under it cannot be disconnected. Flat connections (one role bab assumes directly) keep working unchanged.
+
 ## [0.3.2] - 2026-10-29
 
 ### Added
