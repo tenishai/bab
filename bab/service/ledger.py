@@ -100,6 +100,8 @@ class Lease(Base):
     issued_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     handle: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # what the minter needs to end it early
+    # None: the agent asked with its own token. "gateway": the tool gateway asked for it.
+    via: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class Event(Base):
@@ -132,6 +134,10 @@ class Ledger:
         if "parent" not in have:
             with self.engine.begin() as conn:
                 conn.execute(text("ALTER TABLE integrations ADD COLUMN parent VARCHAR(64)"))
+        have = {c["name"] for c in inspect(self.engine).get_columns("leases")}
+        if "via" not in have:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE leases ADD COLUMN via VARCHAR(16)"))
 
     def session(self) -> Session:
         return self.sessions()
