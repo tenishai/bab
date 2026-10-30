@@ -4,11 +4,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from bab import catalogue
 from bab.service.app import Settings, create_app
 from bab.service.identity import Caller, ConsoleAuth, IdentityError, StaticVerifier
-from bab.service.ledger import Ledger
+from bab.service.ledger import Event, Ledger
 from bab.service.minters import StaticMinter
 from bab.store import Tuple
 from tests.conftest import FakeStore
@@ -30,9 +31,11 @@ def world():
     })
     cat = catalogue.load("catalogues/room.yaml")
     minter = StaticMinter(now=lambda: clock["now"].timestamp())
-    app = create_app(store, cat, Ledger(), StaticVerifier({"sherlock-token": "sherlock"}),
+    ledger = Ledger()
+    app = create_app(store, cat, ledger, StaticVerifier({"sherlock-token": "sherlock"}),
                      ConsoleAuth("console-secret"), {"aws": minter},
                      Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"]))
+    app.state.ledger = ledger  # for tests that read the audit trail
     return TestClient(app), store, clock, minter
 
 
@@ -332,3 +335,44 @@ def test_a_live_credential_is_reused_and_a_revoke_ends_it(world):
     c.delete(f"/grants/{gid}", headers=ADMIN)
     r = c.post("/leases", json={"integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=AGENT)
     assert r.status_code == 403
+
+
+def test_talking_to_another_agent_is_a_grant_the_switchboard_reads_never_a_lease(world):
+    c, _, _, minter = world
+    # The other agent is an integration of the `agents` vendor: one per agent, id = its name.
+    out = c.put("/integrations/watson", json={"vendor": "agents", "ceiling": ["a2a_ask"]}, headers=ADMIN).json()
+    assert out["kind"] == "connection" and out["ceiling"] == ["a2a_ask"]
+    vendors = {v["vendor"]: v for v in c.get("/catalogue", headers=OWNER).json()["vendors"]}
+    assert vendors["agents"] == {"vendor": "agents", "kind": "service", "label": "Other agents", "account": None,
+                                 "permissions": {"read": 1}}
+    assert c.get("/catalogue/agents", headers=OWNER).json()["groups"][0]["name"] == "Colleagues"
+    assert c.get("/agents/sherlock/talks-to", headers=OWNER).json() == {"agent": "sherlock", "talks_to": []}
+
+    # Gate one: the asker's owner requests it, a reviewer approves it in Review, like any permission.
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "watson", "permissions": ["a2a_ask"]}, headers=OWNER).json()["id"]
+    out = c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN).json()["results"][0]
+    assert out["outcome"] == {"a2a_ask": "granted"}
+    assert c.get("/agents/sherlock/talks-to", headers=OWNER).json()["talks_to"] == ["watson"]
+    assert c.get("/agents/watson/talks-to", headers=OWNER).json()["talks_to"] == []  # not symmetric
+
+    # Talking is never minted: a lease on another agent is refused with the reason.
+    r = c.post("/leases", json={"integration": "watson"}, headers=AGENT)
+    assert r.status_code == 409 and r.json()["detail"] == "talking is granted, not leased: the switchboard reads the grant"
+
+    # Gate two, the second wall: a lease for another agent's task is refused whatever is held, and recorded.
+    connect(c, ["aws_inventory_read"])
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    r = c.post("/leases", json={"integration": "aws-prod", "task": "watson asked", "on_behalf_of": ["watson"]}, headers=AGENT)
+    assert r.status_code == 403 and r.json()["detail"] == "a credential is never borrowed for another agent's task"
+    assert minter.minted == []
+    with c.app.state.ledger.session() as s:
+        (ev,) = s.scalars(select(Event).where(Event.kind == "lease.refused"))
+    assert ev.actor == "sherlock" and ev.detail["integration"] == "aws-prod" and ev.detail["on_behalf_of"] == ["watson"]
+    # An empty list is nobody: the agent's own task, leased as always.
+    assert c.post("/leases", json={"integration": "aws-prod", "on_behalf_of": []}, headers=AGENT).status_code == 200
+
+    # Revoked, the pair is gone from the switchboard's list.
+    gid = next(g["id"] for g in c.get("/agents/sherlock/grants", headers=OWNER).json()["grants"] if g["integration"] == "watson")
+    assert c.delete(f"/grants/{gid}", headers=ADMIN).status_code == 200
+    assert c.get("/agents/sherlock/talks-to", headers=OWNER).json()["talks_to"] == []
