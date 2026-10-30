@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-10-30
+
 ### Added
 
 - **Datadog leases: a scoped application key per lease, deleted when the lease ends.** A `DatadogMinter` is registered when the bab pod names a service account (`DD_SERVICE_ACCOUNT_ID`, with `DD_API_KEY`, `DD_MGMT_APP_KEY` and `DD_SITE`, default `datadoghq.com`). A lease creates an application key on that service account named `bab-<agent>-<yyyymmddhhmm>`, scoped to the union of the granted permissions' `extra.scopes`, for at most an hour; the credential is `{dd_api_key, dd_app_key, dd_site}`, the handle the key id. Every Datadog permission in the room catalogue now carries its scopes (`monitors_read`, `metrics_read` + `timeseries_query`, `logs_read_data`, ..., `monitors_write` for the one mutate). A lease whose permissions name no scope is refused: an unscoped key would be the whole service account. `GET /identity/datadog` is the service account; `POST /probe/datadog` creates and deletes a key named `bab-probe` (the body's `role_arn` may be omitted, or carry the service account id for bab to confirm). Without `DD_SERVICE_ACCOUNT_ID` nothing changes: a Datadog lease still answers 501.
