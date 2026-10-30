@@ -86,8 +86,11 @@ def test_datadog_minter_mints_a_key_scoped_to_the_union_and_named_for_the_agent(
                                 "DD_SITE": "datadoghq.eu"}, http=dd,
                                now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
     perms = [cat.action("datadog_metrics_read"), cat.action("datadog_monitors_read"), cat.action("datadog_security_read")]
-    assert dd_scopes(perms) == ["metrics_read", "monitors_read", "security_monitoring_rules_read",
+    assert dd_scopes(perms) == ["mcp_read", "metrics_read", "monitors_read", "security_monitoring_rules_read",
                                 "security_monitoring_signals_read", "timeseries_query"]
+    # A mutate permission adds mcp_write; a read-only lease never carries it; no scopes stay none.
+    assert dd_scopes([cat.action("datadog_monitors_write")]) == ["mcp_read", "mcp_write", "monitors_write"]
+    assert dd_scopes([]) == []
     out = m.mint("sherlock", "datadog", {}, perms, 7200)
     method, url, body = dd.calls[0]
     assert (method, url) == ("POST", "https://api.datadoghq.eu/api/v2/service_accounts/sa-123/application_keys")

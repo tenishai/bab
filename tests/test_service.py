@@ -478,13 +478,13 @@ def test_a_datadog_lease_is_a_scoped_key_that_a_revoke_or_expiry_deletes(gateway
     assert lease["credential"] == {"dd_api_key": "api-xyz", "dd_app_key": "secret-kid-2", "dd_site": "datadoghq.com"}
     assert lease["expires_at"] == "2026-10-27T13:00:00Z" and lease["note"] == "application key scoped to the granted permissions"
     key = dd.keys["kid-2"]
-    assert key["name"].startswith("bab-ledger-") and key["scopes"] == ["metrics_read", "monitors_read", "timeseries_query"]
+    assert key["name"].startswith("bab-ledger-") and key["scopes"] == ["mcp_read", "metrics_read", "monitors_read", "timeseries_query"]
     # Revoking one permission deletes the key the agent holds: the next lease is narrower and new.
     gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"] if g["permission"] == "datadog_metrics_read")
     assert c.delete(f"/grants/{gid}", headers=ADMIN).json() == {"revoked": gid, "leases_ended": 1}
     assert "kid-2" not in dd.keys
     r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog"}, headers=GATEWAY).json()
-    assert r["reused"] is False and r["credential"]["dd_app_key"] == "secret-kid-3" and dd.keys["kid-3"]["scopes"] == ["monitors_read"]
+    assert r["reused"] is False and r["credential"]["dd_app_key"] == "secret-kid-3" and dd.keys["kid-3"]["scopes"] == ["mcp_read", "monitors_read"]
     # Expiry: the next lease request, from anyone, deletes keys whose hour is up.
     clock["now"] = T0 + timedelta(hours=2)
     c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog"}, headers=GATEWAY)
