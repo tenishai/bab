@@ -42,7 +42,7 @@ class Settings:
     admin_team: str  # team:<name> whose members decide
     security_team: str  # team:<name> required for the destroy tier
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
-    # The tool gateway's pod identity, `<namespace>/<service account>`: the one caller that
+    # The tool gateway's pod identity, `<namespace>/<service account>` (e.g. `liminal/liminal`): the one caller that
     # may lease for a named agent (POST /leases/for-agent). None: that lane is closed.
     gateway_service_account: str | None = None
 
@@ -743,8 +743,16 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         with the row marked `via: gateway`. `on_behalf_of` is refused here as everywhere."""
         with ledger.session() as s:
             if s.scalar(select(AgentRow.name).limit(1)) is not None and s.get(AgentRow, body.agent) is None:
-                raise HTTPException(404, f"{body.agent!r} is not an agent this room knows")
-        return lease_for(body.agent, LeaseBody(**body.model_dump(exclude={"agent"})), "gateway")
+                raise HTTPException(403, f"{body.agent} is not an agent this room knows")
+        try:
+            return lease_for(body.agent, LeaseBody(**body.model_dump(exclude={"agent"})), "gateway")
+        except HTTPException as exc:
+            # The gateway shows a 403's detail to the model as one sentence; 404 stays "not connected".
+            if exc.status_code == 403 and isinstance(exc.detail, dict):
+                refused = ", ".join(exc.detail.get("refused") or [])
+                raise HTTPException(403, f"{body.agent} does not hold {refused} on {body.integration}" if refused
+                                    else f"{body.agent} holds nothing on {body.integration}") from exc
+            raise
 
     @app.get("/leases")
     def list_leases(_: Console, agent: str | None = None, integration: str | None = None,

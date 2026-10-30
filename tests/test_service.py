@@ -452,7 +452,12 @@ def test_the_gateway_leases_for_a_granted_agent_and_nobody_else_may(gateway):
     # An ungranted agent gets nothing; an agent the room does not know is a 404; borrowing is refused.
     r = c.post("/leases/for-agent", json={"agent": "watson", "integration": "aws-prod"}, headers=GATEWAY)
     assert r.status_code == 403 and "holds nothing" in r.text
-    assert c.post("/leases/for-agent", json={"agent": "moriarty", "integration": "aws-prod"}, headers=GATEWAY).status_code == 404
+    r = c.post("/leases/for-agent", json={"agent": "moriarty", "integration": "aws-prod"}, headers=GATEWAY)
+    assert r.status_code == 403 and r.json()["detail"] == "moriarty is not an agent this room knows"
+    # Named permissions nobody granted: still one plain sentence (the agent's own path gets the list).
+    r = c.post("/leases/for-agent", json={"agent": "watson", "integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=GATEWAY)
+    assert r.status_code == 403 and r.json()["detail"] == "watson does not hold aws_inventory_read on aws-prod"
+    assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "nope"}, headers=GATEWAY).status_code == 404
     r = c.post("/leases/for-agent", json={**body, "on_behalf_of": ["watson"]}, headers=GATEWAY)
     assert r.status_code == 403 and r.json()["detail"] == "a credential is never borrowed for another agent's task"
 
