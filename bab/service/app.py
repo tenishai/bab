@@ -265,8 +265,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
     @app.put("/integrations/{integration}")
     def put_integration(integration: str, body: IntegrationBody, caller: Console):
-        """Connect (or re-describe) an integration and set its ceiling: the most any agent may hold there."""
-        reviewer(caller)
+        """Connect (or re-describe) an integration and set its ceiling: the most any agent may hold there.
+        An `agents` integration is the room's own fact (which agents exist), like the topology: the console
+        token is the authority and any actor may write it; every other vendor takes a reviewer."""
+        if body.vendor != AGENTS_VENDOR:
+            reviewer(caller)
         acts = permissions_or_422(body.ceiling, body.vendor)
         now = settings.now()
         with ledger.session() as s:
@@ -436,7 +439,10 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def delete_integration(integration: str, caller: Console):
         """Disconnect: the row, every active grant on it (revoked), and every tuple
         naming it (room link, ceilings, grants). Leases already minted run out on their own."""
-        reviewer(caller)
+        with ledger.session() as s0:
+            row0 = s0.get(Integration, integration)
+        if row0 is None or row0.vendor != AGENTS_VENDOR:
+            reviewer(caller)
         now = settings.now()
         with ledger.session() as s:
             row = integration_or_404(s, integration)

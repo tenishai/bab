@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- An `agents` integration is the room's own fact: `PUT` and `DELETE /integrations/{agent}` for that vendor take the console token from any actor, the way the topology push does, so the room registers its agents at boot as itself. Every other vendor still takes an admin or security reviewer.
+
 ## [0.4.5] - 2026-10-30
 
 ### Added
