@@ -82,8 +82,9 @@ def test_datadog_minter_mints_a_key_scoped_to_the_union_and_named_for_the_agent(
 
     cat = catalogue.load("catalogues/room.yaml")
     dd = FakeDatadog()
-    m = DatadogMinter("sa-123", "api-xyz", "mgmt-abc", site="datadoghq.eu", http=dd,
-                      now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
+    m = DatadogMinter.from_env({"DD_SERVICE_ACCOUNT_ID": "sa-123", "DD_API_KEY": "api-xyz", "DD_MGMT_APP_KEY": "mgmt-abc",
+                                "DD_SITE": "datadoghq.eu"}, http=dd,
+                               now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
     perms = [cat.action("datadog_metrics_read"), cat.action("datadog_monitors_read"), cat.action("datadog_security_read")]
     assert dd_scopes(perms) == ["metrics_read", "monitors_read", "security_monitoring_rules_read",
                                 "security_monitoring_signals_read", "timeseries_query"]
@@ -117,27 +118,64 @@ def test_datadog_minter_mints_a_key_scoped_to_the_union_and_named_for_the_agent(
         m.probe("sa-999")
 
 
-def test_datadog_minter_reports_datadogs_sentence_never_the_keys(monkeypatch):
-    from bab.service.minters import DatadogMinter, MintError, default_minters
+def test_datadog_minter_reports_datadogs_sentence_never_the_keys():
+    from bab.service.minters import DatadogMinter, MintError
     from tests.conftest import FakeDatadog
 
     cat = catalogue.load("catalogues/room.yaml")
-    m = DatadogMinter("sa-123", "api-xyz", "mgmt-abc", http=FakeDatadog(refuse="service_account_write is required"))
+    m = DatadogMinter.from_env({"DD_SERVICE_ACCOUNT_ID": "sa-123", "DD_API_KEY": "api-xyz", "DD_MGMT_APP_KEY": "mgmt-abc"},
+                               http=FakeDatadog(refuse="service_account_write is required"))
     with pytest.raises(MintError) as exc:
         m.mint("sherlock", "datadog", {}, [cat.action("datadog_monitors_read")], 3600)
     assert "HTTP 403 Forbidden service_account_write is required" in str(exc.value)
     assert "api-xyz" not in str(exc.value) and "mgmt-abc" not in str(exc.value)
-    # Registered only when the pod names a service account; absent otherwise (datadog leases answer 501).
+    assert "api-xyz" not in repr(m.config()) and "mgmt-abc" not in repr(m.config())
+
+
+def test_datadog_minter_reads_the_mounted_secret_on_every_call(monkeypatch, tmp_path):
+    from bab.service.minters import DatadogMinter, MintError, NotConfigured, default_minters
+    from tests.conftest import FakeDatadog
+
     for k in ("DD_SERVICE_ACCOUNT_ID", "DD_API_KEY", "DD_MGMT_APP_KEY", "DD_SITE"):
         monkeypatch.delenv(k, raising=False)
-    assert set(default_minters()) == {"aws"}
-    monkeypatch.setenv("DD_SERVICE_ACCOUNT_ID", "sa-123")
-    with pytest.raises(SystemExit, match="DD_API_KEY and DD_MGMT_APP_KEY missing"):
-        default_minters()
-    monkeypatch.setenv("DD_API_KEY", "a")
-    monkeypatch.setenv("DD_MGMT_APP_KEY", "b")
+    # Always registered; nothing configured is the one sentence the room treats as "waiting".
+    monkeypatch.setenv("BAB_DATADOG_DIR", str(tmp_path / "missing"))
     dd = default_minters()["datadog"]
-    assert dd.name == "datadog" and dd.site == "datadoghq.com" and dd.service_account_id == "sa-123"
+    assert dd.name == "datadog" and dd.directory == str(tmp_path / "missing")
+    with pytest.raises(NotConfigured, match="Datadog is not configured on the permission service yet: connect it under Admin > Integrations"):
+        dd.identity()
+    with pytest.raises(MintError, match="connect it under Admin > Integrations"):
+        dd.probe()
+    # No directory, environment set: a single-process run; a service account id alone is a refusal, not a boot failure.
+    monkeypatch.setenv("DD_SERVICE_ACCOUNT_ID", "sa-env")
+    with pytest.raises(MintError, match="DD_API_KEY and DD_MGMT_APP_KEY missing"):
+        dd.identity()
+    monkeypatch.setenv("DD_API_KEY", "api-env")
+    monkeypatch.setenv("DD_MGMT_APP_KEY", "mgmt-env")
+    assert dd.identity() == {"subject": "sa-env", "site": "datadoghq.com", "kind": "datadog_service_account"}
+    # Files win over the environment, trailing newline and all (a Secret key mounted by Kubernetes).
+    secret = tmp_path / "datadog"
+    secret.mkdir()
+    (secret / "DD_SERVICE_ACCOUNT_ID").write_text("sa-file\n")
+    (secret / "DD_API_KEY").write_text("api-file\n")
+    (secret / "DD_MGMT_APP_KEY").write_text("mgmt-file\n")
+    (secret / "DD_SITE").write_text("datadoghq.eu\n")
+    fake = FakeDatadog()
+    m = DatadogMinter.from_dir(str(secret), env={"DD_SERVICE_ACCOUNT_ID": "sa-env", "DD_API_KEY": "api-env",
+                                                 "DD_MGMT_APP_KEY": "mgmt-env"}, http=fake)
+    assert m.identity() == {"subject": "sa-file", "site": "datadoghq.eu", "kind": "datadog_service_account"}
+    m.probe()
+    assert fake.calls[0][1] == "https://api.datadoghq.eu/api/v2/service_accounts/sa-file/application_keys"
+    assert fake.last_headers["DD-API-KEY"] == "api-file" and fake.last_headers["DD-APPLICATION-KEY"] == "mgmt-file"
+    # A rotated key is picked up on the next call, no restart; a removed Secret stops minting at once.
+    (secret / "DD_MGMT_APP_KEY").write_text("mgmt-rotated\n")
+    m.probe()
+    assert fake.last_headers["DD-APPLICATION-KEY"] == "mgmt-rotated"
+    for f in secret.iterdir():
+        f.unlink()
+    assert m.identity()["subject"] == "sa-env"  # the environment is the fallback behind an emptied directory
+    with pytest.raises(NotConfigured):
+        DatadogMinter.from_dir(str(secret), env={}, http=fake).identity()
 
 
 def test_every_datadog_permission_names_its_scopes():

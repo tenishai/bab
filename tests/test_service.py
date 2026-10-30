@@ -405,7 +405,8 @@ def gateway():
     cat = catalogue.load("catalogues/room.yaml")
     aws = StaticMinter(now=lambda: clock["now"].timestamp())
     dd = FakeDatadog()
-    datadog = DatadogMinter("sa-123", "api-xyz", "mgmt-abc", http=dd, now=lambda: clock["now"].timestamp())
+    datadog = DatadogMinter.from_env({"DD_SERVICE_ACCOUNT_ID": "sa-123", "DD_API_KEY": "api-xyz", "DD_MGMT_APP_KEY": "mgmt-abc"},
+                                     http=dd, now=lambda: clock["now"].timestamp())
     verifier = PodVerifier({"ledger-pod": ("agent-ledger", "ledger"), "gateway-pod": ("tool-gateway", "gateway"),
                             "stray-pod": ("default", "kube-system")})
     ledger = Ledger()

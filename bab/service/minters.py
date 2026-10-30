@@ -13,7 +13,8 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -25,6 +26,10 @@ log = logging.getLogger(__name__)
 
 class MintError(RuntimeError):
     """The vendor refused, or the integration is not set up for minting."""
+
+
+class NotConfigured(MintError):
+    """bab holds nothing for this vendor yet; connecting it is what is missing, not a retry."""
 
 
 @dataclass(frozen=True)
@@ -318,7 +323,9 @@ class AwsMinter:
 
 DD_SITE_ENV, DD_API_KEY_ENV = "DD_SITE", "DD_API_KEY"
 DD_MGMT_APP_KEY_ENV, DD_SERVICE_ACCOUNT_ID_ENV = "DD_MGMT_APP_KEY", "DD_SERVICE_ACCOUNT_ID"
+DD_DIR_ENV, DD_DEFAULT_DIR = "BAB_DATADOG_DIR", "/etc/bab/datadog"
 DD_DEFAULT_SITE = "datadoghq.com"
+DD_NOT_CONFIGURED = "Datadog is not configured on the permission service yet: connect it under Admin > Integrations"
 DD_MAX_SECONDS = 3600  # Datadog keys do not expire; bab deletes them, so a lease stays short
 # A Datadog key with no scopes carries everything its owner may do, so a probe key is
 # scoped to the narrowest read the owner's role holds anyway (the first thing the room grants).
@@ -331,34 +338,68 @@ def dd_scopes(permissions: list[Action]) -> list[str]:
     return sorted({s for p in permissions for s in (p.extra.get("scopes") or [])})
 
 
+@dataclass(frozen=True)
+class DatadogConfig:
+    service_account_id: str
+    site: str
+    api_key: str = field(repr=False)
+    mgmt_app_key: str = field(repr=False)
+
+
 class DatadogMinter:
     """Datadog has no short-lived tokens, but an application key on a service account can
     carry exactly the permissions a lease needs, is created and deleted by API, and names
     itself in Datadog's audit trail. A lease is one such key, `bab-<agent>-<minute>`, scoped
     to the granted permissions' scopes and deleted when the lease ends (expiry, revoke, sweep).
-    bab holds one management application key (`service_account_write`) to do that with."""
+    bab holds one management application key (`service_account_write`) to do that with.
+
+    Its configuration is read on every call, never at boot: the room writes the Secret the
+    moment an admin connects Datadog and probes at once, and a disconnect removes it again,
+    so a value cached at boot would be absent first and stale afterwards."""
 
     name = "datadog"
 
-    def __init__(self, service_account_id: str, api_key: str, mgmt_app_key: str, site: str = DD_DEFAULT_SITE,
-                 http=None, now=time.time):
-        if not (service_account_id and api_key and mgmt_app_key):
-            raise MintError("the Datadog minter needs a service account id, an API key and a management key")
-        self.service_account_id, self.site = service_account_id.strip(), (site or DD_DEFAULT_SITE).strip()
-        self._api_key, self._mgmt_app_key = api_key.strip(), mgmt_app_key.strip()
+    def __init__(self, directory: str | None = None, env: Mapping[str, str] | None = None, http=None, now=time.time):
+        self.directory = directory
+        self.env: Mapping[str, str] = {} if env is None else env
         self.http = http or self._http
         self.now = now
 
     @classmethod
-    def from_env(cls, env=os.environ) -> DatadogMinter | None:
-        """Configured when DD_SERVICE_ACCOUNT_ID is set; None (no Datadog minting) otherwise."""
-        sa = env.get(DD_SERVICE_ACCOUNT_ID_ENV, "").strip()
+    def from_env(cls, env: Mapping[str, str] = os.environ, **kwargs) -> DatadogMinter:
+        """Environment only (tests, single-process runs)."""
+        return cls(None, env, **kwargs)
+
+    @classmethod
+    def from_dir(cls, directory: str, env: Mapping[str, str] = os.environ, **kwargs) -> DatadogMinter:
+        """A mounted Secret: one file per key under `directory`, the environment behind it."""
+        return cls(directory, env, **kwargs)
+
+    def _read(self, key: str) -> str:
+        """The file named `key` in the directory (a Secret key mounted by Kubernetes, trailing
+        newline and all), else the environment variable of the same name, else empty."""
+        value = ""
+        if self.directory:
+            try:
+                with open(os.path.join(self.directory, key)) as fh:
+                    value = fh.read()
+            except OSError:  # no directory, or no such file: fall back
+                value = ""
+        return (value or self.env.get(key, "") or "").strip()
+
+    def config(self) -> DatadogConfig:
+        """Resolved per call so a connect, a rotation or a disconnect takes effect without a
+        restart. Nothing configured is NotConfigured (the room's probe treats it as waiting);
+        a service account id without both keys is a plain refusal, never a boot failure."""
+        sa, api, mgmt, site = (self._read(k) for k in (DD_SERVICE_ACCOUNT_ID_ENV, DD_API_KEY_ENV,
+                                                       DD_MGMT_APP_KEY_ENV, DD_SITE_ENV))
         if not sa:
-            return None
-        missing = [k for k in (DD_API_KEY_ENV, DD_MGMT_APP_KEY_ENV) if not env.get(k, "").strip()]
+            raise NotConfigured(DD_NOT_CONFIGURED)
+        missing = [k for k, v in ((DD_API_KEY_ENV, api), (DD_MGMT_APP_KEY_ENV, mgmt)) if not v]
         if missing:
-            raise SystemExit(f"{DD_SERVICE_ACCOUNT_ID_ENV} is set but {' and '.join(missing)} missing")
-        return cls(sa, env[DD_API_KEY_ENV], env[DD_MGMT_APP_KEY_ENV], env.get(DD_SITE_ENV) or DD_DEFAULT_SITE)
+            raise MintError(f"Datadog is half configured on the permission service: {DD_SERVICE_ACCOUNT_ID_ENV} "
+                            f"is set but {' and '.join(missing)} missing")
+        return DatadogConfig(sa, site or DD_DEFAULT_SITE, api, mgmt)
 
     @staticmethod
     def _http(method: str, url: str, headers: dict, body: dict | None) -> tuple[int, dict]:
@@ -372,9 +413,9 @@ class DatadogMinter:
             data = {}
         return resp.status_code, data if isinstance(data, dict) else {}
 
-    def _call(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
-        headers = {"DD-API-KEY": self._api_key, "DD-APPLICATION-KEY": self._mgmt_app_key, "Accept": "application/json"}
-        return self.http(method, f"https://api.{self.site}{path}", headers, body)
+    def _call(self, cfg: DatadogConfig, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        headers = {"DD-API-KEY": cfg.api_key, "DD-APPLICATION-KEY": cfg.mgmt_app_key, "Accept": "application/json"}
+        return self.http(method, f"https://api.{cfg.site}{path}", headers, body)
 
     @staticmethod
     def _error(status: int, data: dict) -> str:
@@ -384,12 +425,13 @@ class DatadogMinter:
             parts.append(e if isinstance(e, str) else " ".join(str(e.get(k)) for k in ("title", "detail") if e.get(k)))
         return f"HTTP {status}" + (f" {'; '.join(parts)}" if parts else "")
 
-    def _keys_path(self, key_id: str = "") -> str:
-        return f"/api/v2/service_accounts/{self.service_account_id}/application_keys" + (f"/{key_id}" if key_id else "")
+    @staticmethod
+    def _keys_path(cfg: DatadogConfig, key_id: str = "") -> str:
+        return f"/api/v2/service_accounts/{cfg.service_account_id}/application_keys" + (f"/{key_id}" if key_id else "")
 
-    def _create_key(self, name: str, scopes: list[str]) -> tuple[str, str]:
+    def _create_key(self, cfg: DatadogConfig, name: str, scopes: list[str]) -> tuple[str, str]:
         body = {"data": {"type": "application_keys", "attributes": {"name": name, "scopes": list(scopes)}}}
-        status, data = self._call("POST", self._keys_path(), body)
+        status, data = self._call(cfg, "POST", self._keys_path(cfg), body)
         if status not in (200, 201):
             raise MintError(f"Datadog refused creating an application key: {self._error(status, data)}")
         d = data.get("data") or {}
@@ -398,46 +440,48 @@ class DatadogMinter:
             raise MintError("Datadog answered without the application key")
         return key_id, key
 
-    def _delete_key(self, key_id: str) -> None:
-        status, data = self._call("DELETE", self._keys_path(key_id))
+    def _delete_key(self, cfg: DatadogConfig, key_id: str) -> None:
+        status, data = self._call(cfg, "DELETE", self._keys_path(cfg, key_id))
         if status not in (200, 204, 404):  # 404: already gone, which is what we wanted
             raise MintError(f"Datadog refused deleting application key {key_id}: {self._error(status, data)}")
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
+        cfg = self.config()
         scopes = dd_scopes(permissions)
         if not scopes:  # an unscoped key would be everything the service account may do
             raise MintError("none of the granted permissions names a Datadog scope; nothing to mint")
         now = self.now()
         name = _DD_KEY_NAME_BAD.sub("-", f"bab-{agent}-{time.strftime('%Y%m%d%H%M', time.gmtime(now))}")
-        key_id, key = self._create_key(name, scopes)
-        return Minted(credential={"dd_api_key": self._api_key, "dd_app_key": key, "dd_site": self.site},
+        key_id, key = self._create_key(cfg, name, scopes)
+        return Minted(credential={"dd_api_key": cfg.api_key, "dd_app_key": key, "dd_site": cfg.site},
                       expires_at=now + max(1, min(int(seconds), DD_MAX_SECONDS)), handle={"key_id": key_id},
                       note="application key scoped to the granted permissions")
 
     def end(self, handle):
         key_id = str((handle or {}).get("key_id") or "")
         if key_id:
-            self._delete_key(key_id)
+            self._delete_key(self.config(), key_id)
 
     def identity(self, audience: str | None = None) -> dict:
         """Who bab is to Datadog: the service account whose keys it mints."""
-        return {"subject": self.service_account_id, "site": self.site, "kind": "datadog_service_account"}
+        cfg = self.config()
+        return {"subject": cfg.service_account_id, "site": cfg.site, "kind": "datadog_service_account"}
 
     def probe(self, role_arn: str = "", audience: str | None = None, hub_role_arn: str | None = None,
               external_id: str | None = None) -> dict:
         """Create and delete a key named `bab-probe`: can the management key mint on the service
         account? The AWS-shaped first argument, when given, is the service account id a console
         was handed, and it must be the one bab is configured for; the rest is ignored."""
-        if role_arn and role_arn.strip() != self.service_account_id:
-            raise MintError(f"bab mints for Datadog service account {self.service_account_id}, not {role_arn.strip()}")
-        key_id, _ = self._create_key("bab-probe", list(DD_PROBE_SCOPES))
-        self._delete_key(key_id)
-        return {"subject": self.service_account_id, "site": self.site, "probe_key_id": key_id}
+        cfg = self.config()
+        if role_arn and role_arn.strip() != cfg.service_account_id:
+            raise MintError(f"bab mints for Datadog service account {cfg.service_account_id}, not {role_arn.strip()}")
+        key_id, _ = self._create_key(cfg, "bab-probe", list(DD_PROBE_SCOPES))
+        self._delete_key(cfg, key_id)
+        return {"subject": cfg.service_account_id, "site": cfg.site, "probe_key_id": key_id}
 
 
 def default_minters() -> dict[str, Minter]:
-    out: dict[str, Minter] = {"aws": AwsMinter()}
-    datadog = DatadogMinter.from_env()
-    if datadog is not None:
-        out["datadog"] = datadog
-    return out
+    """Datadog is always registered; whether it can mint is decided per call from the mounted
+    Secret (`BAB_DATADOG_DIR`, default /etc/bab/datadog) or, failing that, the environment."""
+    return {"aws": AwsMinter(),
+            "datadog": DatadogMinter.from_dir(os.environ.get(DD_DIR_ENV, "").strip() or DD_DEFAULT_DIR)}

@@ -22,7 +22,7 @@ from bab.catalogue import Catalogue
 from bab.door import Door, Verdict, rfc3339
 from bab.service.identity import Caller, ConsoleAuth, IdentityError
 from bab.service.ledger import AgentRow, GrantRow, Integration, Lease, Ledger, Request
-from bab.service.minters import Minter, MintError
+from bab.service.minters import Minter, MintError, NotConfigured
 from bab.store import Store, StoreError, Tuple
 from bab.sync import reconcile, topology
 
@@ -400,6 +400,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             raise HTTPException(501, f"bab cannot mint for {vendor!r} yet")
         try:
             return minter.identity()
+        except NotConfigured as exc:  # nothing to ask the vendor yet; the console shows the sentence
+            raise HTTPException(409, str(exc)) from exc
         except MintError as exc:
             raise HTTPException(502, str(exc)) from exc
 
