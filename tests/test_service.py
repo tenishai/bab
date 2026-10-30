@@ -376,3 +376,17 @@ def test_talking_to_another_agent_is_a_grant_the_switchboard_reads_never_a_lease
     gid = next(g["id"] for g in c.get("/agents/sherlock/grants", headers=OWNER).json()["grants"] if g["integration"] == "watson")
     assert c.delete(f"/grants/{gid}", headers=ADMIN).status_code == 200
     assert c.get("/agents/sherlock/talks-to", headers=OWNER).json()["talks_to"] == []
+
+
+
+def test_the_room_registers_agents_itself_but_every_other_vendor_takes_a_reviewer(world):
+    """Gate: an `agents` integration is the room's own fact, written and removed with the
+    console token by any actor (the room pushes it at boot as itself); an ordinary vendor
+    still takes an admin or security reviewer."""
+    c, _, _, _ = world
+    room = {**OWNER, "X-Bab-Actor": "room@console"}
+    r = c.put("/integrations/sage", json={"vendor": "agents", "spec": {"name": "sage"}, "ceiling": ["a2a_ask"]}, headers=room)
+    assert r.status_code == 200, r.text
+    assert c.put("/integrations/aws-x", json={"vendor": "aws", "spec": {"role_arn": "arn:aws:iam::111111111111:role/R"},
+                                           "ceiling": ["aws_inventory_read"]}, headers=room).status_code == 403
+    assert c.delete("/integrations/sage", headers=room).json()["removed"] == "sage"
