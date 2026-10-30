@@ -6,6 +6,12 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-10-30
+
+### Changed
+
+- **Every Datadog lease can be used through Datadog's MCP server.** The scoped application key a lease mints now carries `mcp_read` next to the granted permissions' scopes, and `mcp_write` as well when a granted permission is a mutate; Datadog's hosted MCP server admits a key only with those, on top of the resource permission each tool needs. The resource scopes still decide what the key may touch, so a read-only lease stays read-only there too. A lease whose permissions name no scope is still refused. The service account's own role must hold `mcp_read` (and `mcp_write`) for a key to carry them, and the organization must have MCP Access enabled; both are the console's connect instructions.
+
 ## [0.4.8] - 2026-10-30
 
 ### Fixed

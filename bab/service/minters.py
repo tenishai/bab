@@ -333,9 +333,23 @@ DD_PROBE_SCOPES = ("monitors_read",)
 _DD_KEY_NAME_BAD = re.compile(r"[^\w.-]")
 
 
+# Datadog's hosted MCP server admits a key only if it carries `mcp_read` (every tool) and
+# `mcp_write` (the tools that create or change something) on top of the resource
+# permissions, so every lease carries them: the resource scopes still decide what the key
+# may touch, and a read-only lease stays read-only there too.
+DD_MCP_READ = "mcp_read"
+DD_MCP_WRITE = "mcp_write"
+
+
 def dd_scopes(permissions: list[Action]) -> list[str]:
-    """The union of the granted permissions' `extra.scopes`: what the key may do."""
-    return sorted({s for p in permissions for s in (p.extra.get("scopes") or [])})
+    """The union of the granted permissions' `extra.scopes`, plus the MCP scope(s) that let
+    the key be used through Datadog's MCP server: what the key may do."""
+    scopes = {s for p in permissions for s in (p.extra.get("scopes") or [])}
+    if scopes:
+        scopes.add(DD_MCP_READ)
+        if any(p.tier == "mutate" for p in permissions):
+            scopes.add(DD_MCP_WRITE)
+    return sorted(scopes)
 
 
 @dataclass(frozen=True)
