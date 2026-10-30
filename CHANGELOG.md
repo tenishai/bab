@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Talking to another team's agent is a permission; a consulted agent never borrows a credential.** The room catalogue gains an `agents` vendor ("Other agents"): one integration per agent (id = the agent's name) with one read permission, `a2a_ask`, which the asker's owner requests and a reviewer approves like any other. `GET /agents/{agent}/talks-to` lists the agents it holds an active, ungated `a2a_ask` on, for the switchboard to build its dispatch pairs from grants. Nothing is ever minted for this vendor: a lease on an `agents` integration is a 409 ("talking is granted, not leased"). As a second wall behind the runtime's, `POST /leases` takes `on_behalf_of` (the agents whose task the lease would serve) and refuses any lease that names one with a 403 ("a credential is never borrowed for another agent's task"), recorded in the ledger as `lease.refused`.
+
 ## [0.4.4] - 2026-10-29
 
 ### Added

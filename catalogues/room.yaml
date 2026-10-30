@@ -26,6 +26,9 @@ vendors:
   datadog:   {kind: service, label: Datadog}
   atlassian: {kind: service, label: Atlassian}
   github:    {kind: service, label: GitHub}
+  # Another agent in the room, one integration per agent (id = the agent's name). Talking
+  # is a grant the switchboard reads, never a lease: nothing is minted for this vendor.
+  agents:    {kind: service, label: Other agents}
 
 actions:
   # ---- aws: one read permission per service ----
@@ -187,3 +190,6 @@ actions:
   - {name: github_repos_read,   tier: read,    vendor: github, group: Repositories,  description: "Read code, issues and pull requests"}
   - {name: github_pulls_write,  tier: mutate,  vendor: github, group: Pull requests, description: "Open, comment on and review pull requests"}
   - {name: github_repos_delete, tier: destroy, vendor: github, group: Repositories,  description: "Delete a repository"}
+
+  # ---- agents: talking to another team's agent is a permission its owner requests ----
+  - {name: a2a_ask, tier: read, vendor: agents, group: Colleagues, description: "Ask this agent for help; it answers from what it knows and never borrows a credential for the asker"}

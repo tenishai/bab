@@ -15,7 +15,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from bab import ceiling, grants
 from bab.catalogue import Catalogue
@@ -29,6 +29,11 @@ from bab.sync import reconcile, topology
 log = logging.getLogger(__name__)
 
 LEASE_REQUEST_HOURS = 1  # an approved gated lease request becomes a grant this long
+# The vendor whose integrations are other agents (one per agent, id = its name) and the one
+# permission on them. Talking is a grant the switchboard reads; nothing is ever minted for it.
+AGENTS_VENDOR = "agents"
+A2A_ASK = "a2a_ask"
+NO_BORROWING = "a credential is never borrowed for another agent's task"
 
 
 @dataclass
@@ -59,6 +64,9 @@ class LeaseBody(BaseModel):
     integration: str = Field(min_length=1, max_length=64)
     permissions: list[str] | None = Field(default=None, max_length=500)
     task: str | None = Field(default=None, max_length=500)
+    # The agents whose task this lease would serve. Naming any is refused: a consulted
+    # agent answers from what it knows and never borrows a credential for the asker.
+    on_behalf_of: list[str] | None = Field(default=None, max_length=100)
 
 
 class CheckBody(BaseModel):
@@ -536,6 +544,21 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             {**grant_summary(g), "state": "expired" if (g.expires_at and g.expires_at <= cutoff) else "active"}
             for g in rows]}
 
+    @app.get("/agents/{agent}/talks-to")
+    def agent_talks_to(agent: str, _: Console):
+        """The agents this one may ask for help: every active, ungated `a2a_ask` grant it holds
+        on an `agents` integration (one per target agent, id = its name). What the switchboard
+        reads to build its dispatch pairs; one query, no store round trip."""
+        cutoff = rfc3339(settings.now())
+        with ledger.session() as s:
+            names = s.scalars(
+                select(GrantRow.integration).join(Integration, Integration.id == GrantRow.integration)
+                .where(Integration.vendor == AGENTS_VENDOR, GrantRow.agent == agent, GrantRow.permission == A2A_ASK,
+                       GrantRow.gated.is_(False), GrantRow.revoked_at.is_(None),
+                       or_(GrantRow.expires_at.is_(None), GrantRow.expires_at > cutoff))
+                .distinct().order_by(GrantRow.integration))
+            return {"agent": agent, "talks_to": list(names)}
+
     @app.delete("/grants/{grant_id}")
     def revoke(grant_id: int, caller: Console):
         reviewer(caller)
@@ -562,7 +585,16 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         now = settings.now()
         context = {"current_time": rfc3339(now)}
         with ledger.session() as s:
+            if body.on_behalf_of:
+                # The second wall (the runtime is the first): whatever either side holds, a
+                # task that arrived from another agent gets no credential. Recorded, refused.
+                ledger.event(s, now, "lease.refused", caller.name, integration=body.integration,
+                             on_behalf_of=body.on_behalf_of, reason=NO_BORROWING)
+                s.commit()
+                raise HTTPException(403, NO_BORROWING)
             integ = integration_or_404(s, body.integration)
+            if integ.vendor == AGENTS_VENDOR:
+                raise HTTPException(409, "talking is granted, not leased: the switchboard reads the grant")
             if integ.kind == "org":
                 raise HTTPException(409, f"{body.integration!r} is an organization; a lease is for one of its accounts")
             minter = minters.get(integ.vendor)
