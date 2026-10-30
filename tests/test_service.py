@@ -484,7 +484,7 @@ def test_a_datadog_lease_is_a_scoped_key_that_a_revoke_or_expiry_deletes(gateway
     assert c.delete(f"/grants/{gid}", headers=ADMIN).json() == {"revoked": gid, "leases_ended": 1}
     assert "kid-2" not in dd.keys
     r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog"}, headers=GATEWAY).json()
-    assert r["reused"] is False and r["credential"]["dd_app_key"] == "secret-kid-3" and dd.keys["kid-3"]["scopes"] == ["monitors_read"]
+    assert r["reused"] is False and r["credential"]["dd_app_key"] == "secret-kid-3" and dd.keys["kid-3"]["scopes"] == ["mcp_read", "monitors_read"]
     # Expiry: the next lease request, from anyone, deletes keys whose hour is up.
     clock["now"] = T0 + timedelta(hours=2)
     c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog"}, headers=GATEWAY)
