@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-30
+
 ### Fixed
 
 - **The Datadog minter reads its configuration on every call, from a mounted Secret.** It read `DD_SITE`, `DD_API_KEY`, `DD_MGMT_APP_KEY` and `DD_SERVICE_ACCOUNT_ID` from the environment at boot, so before a restart Datadog was absent (`501`) and after one it held stale keys for good; a console that writes the Secret on connect and probes at once was refused and undid its own connect. Now the minter is always registered and resolves those four values per call from the files of the same names under `BAB_DATADOG_DIR` (default `/etc/bab/datadog`, one file per Secret key, trailing newline stripped), each falling back to the environment variable of the same name. Nothing configured answers `409` with `Datadog is not configured on the permission service yet: connect it under Admin > Integrations` on `POST /probe/datadog` and `GET /identity/datadog` (a lease keeps its lane: `502 no lease: <that sentence>`, recorded as `lease.failed`); a service account id without both keys is refused the same way at call time, no longer a boot failure. A connect, a key rotation or a disconnect takes effect on the next call, no restart.
