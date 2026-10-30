@@ -62,3 +62,32 @@ def cat():
             {"name": "pod_delete", "tier": "mutate"},
         ],
     })
+
+
+class FakeDatadog:
+    """Datadog's service-account application-key API, as the DatadogMinter's `http` function:
+    records every call, hands out key ids, forgets a key on DELETE, 404s one already gone."""
+
+    def __init__(self, refuse: str | None = None):
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.keys: dict[str, dict] = {}
+        self.refuse = refuse  # an error sentence Datadog answers every create with
+        self.last_headers: dict = {}
+        self.n = 0
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append((method, url, body))
+        self.last_headers = dict(headers)
+        _, _, key_id = url.rpartition("/application_keys/") if "/application_keys/" in url else (None, None, "")
+        if method == "POST":
+            if self.refuse:
+                return 403, {"errors": [{"title": "Forbidden", "detail": self.refuse}]}
+            self.n += 1
+            kid = f"kid-{self.n}"
+            attrs = body["data"]["attributes"]
+            self.keys[kid] = {"name": attrs["name"], "scopes": list(attrs["scopes"])}
+            return 201, {"data": {"type": "application_keys", "id": kid,
+                                  "attributes": {**self.keys[kid], "key": f"secret-{kid}"}}}
+        if method == "DELETE":
+            return (204, {}) if self.keys.pop(key_id, None) is not None else (404, {"errors": ["Not found"]})
+        return 405, {"errors": ["method"]}

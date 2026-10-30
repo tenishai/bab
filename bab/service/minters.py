@@ -314,5 +314,130 @@ class AwsMinter:
         return self.list_org_accounts(self._hub(hub_role_arn, audience, "discover"))
 
 
+# ---- Datadog: a scoped application key on bab's service account, per lease -------
+
+DD_SITE_ENV, DD_API_KEY_ENV = "DD_SITE", "DD_API_KEY"
+DD_MGMT_APP_KEY_ENV, DD_SERVICE_ACCOUNT_ID_ENV = "DD_MGMT_APP_KEY", "DD_SERVICE_ACCOUNT_ID"
+DD_DEFAULT_SITE = "datadoghq.com"
+DD_MAX_SECONDS = 3600  # Datadog keys do not expire; bab deletes them, so a lease stays short
+# A Datadog key with no scopes carries everything its owner may do, so a probe key is
+# scoped to the narrowest read the owner's role holds anyway (the first thing the room grants).
+DD_PROBE_SCOPES = ("monitors_read",)
+_DD_KEY_NAME_BAD = re.compile(r"[^\w.-]")
+
+
+def dd_scopes(permissions: list[Action]) -> list[str]:
+    """The union of the granted permissions' `extra.scopes`: what the key may do."""
+    return sorted({s for p in permissions for s in (p.extra.get("scopes") or [])})
+
+
+class DatadogMinter:
+    """Datadog has no short-lived tokens, but an application key on a service account can
+    carry exactly the permissions a lease needs, is created and deleted by API, and names
+    itself in Datadog's audit trail. A lease is one such key, `bab-<agent>-<minute>`, scoped
+    to the granted permissions' scopes and deleted when the lease ends (expiry, revoke, sweep).
+    bab holds one management application key (`service_account_write`) to do that with."""
+
+    name = "datadog"
+
+    def __init__(self, service_account_id: str, api_key: str, mgmt_app_key: str, site: str = DD_DEFAULT_SITE,
+                 http=None, now=time.time):
+        if not (service_account_id and api_key and mgmt_app_key):
+            raise MintError("the Datadog minter needs a service account id, an API key and a management key")
+        self.service_account_id, self.site = service_account_id.strip(), (site or DD_DEFAULT_SITE).strip()
+        self._api_key, self._mgmt_app_key = api_key.strip(), mgmt_app_key.strip()
+        self.http = http or self._http
+        self.now = now
+
+    @classmethod
+    def from_env(cls, env=os.environ) -> DatadogMinter | None:
+        """Configured when DD_SERVICE_ACCOUNT_ID is set; None (no Datadog minting) otherwise."""
+        sa = env.get(DD_SERVICE_ACCOUNT_ID_ENV, "").strip()
+        if not sa:
+            return None
+        missing = [k for k in (DD_API_KEY_ENV, DD_MGMT_APP_KEY_ENV) if not env.get(k, "").strip()]
+        if missing:
+            raise SystemExit(f"{DD_SERVICE_ACCOUNT_ID_ENV} is set but {' and '.join(missing)} missing")
+        return cls(sa, env[DD_API_KEY_ENV], env[DD_MGMT_APP_KEY_ENV], env.get(DD_SITE_ENV) or DD_DEFAULT_SITE)
+
+    @staticmethod
+    def _http(method: str, url: str, headers: dict, body: dict | None) -> tuple[int, dict]:
+        try:
+            resp = httpx.request(method, url, headers=headers, json=body, timeout=10.0)
+        except httpx.HTTPError as exc:
+            raise MintError(f"Datadog did not answer: {exc.__class__.__name__}") from exc
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {}
+        return resp.status_code, data if isinstance(data, dict) else {}
+
+    def _call(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        headers = {"DD-API-KEY": self._api_key, "DD-APPLICATION-KEY": self._mgmt_app_key, "Accept": "application/json"}
+        return self.http(method, f"https://api.{self.site}{path}", headers, body)
+
+    @staticmethod
+    def _error(status: int, data: dict) -> str:
+        """Datadog's own sentence (v1 `errors: [str]` or v2 `errors: [{title, detail}]`), never a key."""
+        parts = []
+        for e in data.get("errors") or []:
+            parts.append(e if isinstance(e, str) else " ".join(str(e.get(k)) for k in ("title", "detail") if e.get(k)))
+        return f"HTTP {status}" + (f" {'; '.join(parts)}" if parts else "")
+
+    def _keys_path(self, key_id: str = "") -> str:
+        return f"/api/v2/service_accounts/{self.service_account_id}/application_keys" + (f"/{key_id}" if key_id else "")
+
+    def _create_key(self, name: str, scopes: list[str]) -> tuple[str, str]:
+        body = {"data": {"type": "application_keys", "attributes": {"name": name, "scopes": list(scopes)}}}
+        status, data = self._call("POST", self._keys_path(), body)
+        if status not in (200, 201):
+            raise MintError(f"Datadog refused creating an application key: {self._error(status, data)}")
+        d = data.get("data") or {}
+        key_id, key = str(d.get("id") or ""), str((d.get("attributes") or {}).get("key") or "")
+        if not (key_id and key):
+            raise MintError("Datadog answered without the application key")
+        return key_id, key
+
+    def _delete_key(self, key_id: str) -> None:
+        status, data = self._call("DELETE", self._keys_path(key_id))
+        if status not in (200, 204, 404):  # 404: already gone, which is what we wanted
+            raise MintError(f"Datadog refused deleting application key {key_id}: {self._error(status, data)}")
+
+    def mint(self, agent, integration_id, spec, permissions, seconds):
+        scopes = dd_scopes(permissions)
+        if not scopes:  # an unscoped key would be everything the service account may do
+            raise MintError("none of the granted permissions names a Datadog scope; nothing to mint")
+        now = self.now()
+        name = _DD_KEY_NAME_BAD.sub("-", f"bab-{agent}-{time.strftime('%Y%m%d%H%M', time.gmtime(now))}")
+        key_id, key = self._create_key(name, scopes)
+        return Minted(credential={"dd_api_key": self._api_key, "dd_app_key": key, "dd_site": self.site},
+                      expires_at=now + max(1, min(int(seconds), DD_MAX_SECONDS)), handle={"key_id": key_id},
+                      note="application key scoped to the granted permissions")
+
+    def end(self, handle):
+        key_id = str((handle or {}).get("key_id") or "")
+        if key_id:
+            self._delete_key(key_id)
+
+    def identity(self, audience: str | None = None) -> dict:
+        """Who bab is to Datadog: the service account whose keys it mints."""
+        return {"subject": self.service_account_id, "site": self.site, "kind": "datadog_service_account"}
+
+    def probe(self, role_arn: str = "", audience: str | None = None, hub_role_arn: str | None = None,
+              external_id: str | None = None) -> dict:
+        """Create and delete a key named `bab-probe`: can the management key mint on the service
+        account? The AWS-shaped first argument, when given, is the service account id a console
+        was handed, and it must be the one bab is configured for; the rest is ignored."""
+        if role_arn and role_arn.strip() != self.service_account_id:
+            raise MintError(f"bab mints for Datadog service account {self.service_account_id}, not {role_arn.strip()}")
+        key_id, _ = self._create_key("bab-probe", list(DD_PROBE_SCOPES))
+        self._delete_key(key_id)
+        return {"subject": self.service_account_id, "site": self.site, "probe_key_id": key_id}
+
+
 def default_minters() -> dict[str, Minter]:
-    return {"aws": AwsMinter()}
+    out: dict[str, Minter] = {"aws": AwsMinter()}
+    datadog = DatadogMinter.from_env()
+    if datadog is not None:
+        out["datadog"] = datadog
+    return out

@@ -6,6 +6,15 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Datadog leases: a scoped application key per lease, deleted when the lease ends.** A `DatadogMinter` is registered when the bab pod names a service account (`DD_SERVICE_ACCOUNT_ID`, with `DD_API_KEY`, `DD_MGMT_APP_KEY` and `DD_SITE`, default `datadoghq.com`). A lease creates an application key on that service account named `bab-<agent>-<yyyymmddhhmm>`, scoped to the union of the granted permissions' `extra.scopes`, for at most an hour; the credential is `{dd_api_key, dd_app_key, dd_site}`, the handle the key id. Every Datadog permission in the room catalogue now carries its scopes (`monitors_read`, `metrics_read` + `timeseries_query`, `logs_read_data`, ..., `monitors_write` for the one mutate). A lease whose permissions name no scope is refused: an unscoped key would be the whole service account. `GET /identity/datadog` is the service account; `POST /probe/datadog` creates and deletes a key named `bab-probe` (the body's `role_arn` may be omitted, or carry the service account id for bab to confirm). Without `DD_SERVICE_ACCOUNT_ID` nothing changes: a Datadog lease still answers 501.
+- **The tool gateway may lease for the agent it is serving.** `POST /leases/for-agent` `{agent, integration, permissions?, task?}` takes the gateway's own pod identity (the same TokenReview path agents use; `BAB_GATEWAY_SERVICE_ACCOUNT` = `<namespace>/<service account>`, e.g. `liminal/liminal`), refuses every other identity with 403 (501 while no gateway is named), and then runs exactly the checks `POST /leases` runs for the named agent, sharing its live credential. The lease row and `GET /leases` carry `via: "gateway"`. On this lane a 403 is always one plain sentence naming the agent and the integration (nothing held, a permission not held, or an agent the topology does not know) and a 404 is only an integration that is not connected; `on_behalf_of` is refused here too.
+
+### Changed
+
+- **A lease that has run out is ended at the vendor, not only at the sweep.** Every lease request first ends the leases past their expiry whose minter can (Datadog deletes the key; AWS left no handle), and a revoke ends the leases the agent still holds on that integration (`DELETE /grants/{id}` answers `leases_ended`), so the next call mints afresh, narrower, or gets nothing. `POST /sweep` ends whatever is left; a vendor's refusal is recorded as `lease.end_failed` and retried next time.
+
 ## [0.4.6] - 2026-10-30
 
 ### Fixed

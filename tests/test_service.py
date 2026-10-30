@@ -112,13 +112,15 @@ def test_ask_decide_hold_lease_revoke_sweep(world):
     r = c.post("/leases", json={"integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=AGENT)
     assert r.status_code == 403 and r.json()["detail"]["refused"] == ["aws_inventory_read"]
 
-    # Time passes: the mutate grant expires on the dot; sweep tidies it and ends old leases.
+    # Time passes: the mutate grant expires on the dot. Any lease request ends the leases that
+    # have run out (their vendor-side keys go, where the vendor can); sweep tidies the tuples.
     clock["now"] = T0 + timedelta(days=30)
     r = c.post("/leases", json={"integration": "aws-prod", "permissions": ["aws_ecs_update_service"]}, headers=AGENT)
     assert r.status_code == 403
+    assert len(minter.ended) == 2
     assert c.get("/agents/sherlock/grants", headers=OWNER).json()["grants"][-1]["state"] == "expired"
     out = c.post("/sweep", headers=ADMIN).json()
-    assert out == {"expired_tuples_deleted": 1, "leases_ended": 2}
+    assert out == {"expired_tuples_deleted": 1, "leases_ended": 0}
     assert len(minter.ended) == 2
 
 
@@ -390,3 +392,107 @@ def test_the_room_registers_agents_itself_but_every_other_vendor_takes_a_reviewe
     assert c.put("/integrations/aws-x", json={"vendor": "aws", "spec": {"role_arn": "arn:aws:iam::111111111111:role/R"},
                                            "ceiling": ["aws_inventory_read"]}, headers=room).status_code == 403
     assert c.delete("/integrations/sage", headers=room).json()["removed"] == "sage"
+
+
+@pytest.fixture
+def gateway():
+    """A room with a tool gateway: pods for an agent, the gateway and a stranger; AWS and Datadog minters."""
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog
+
+    clock = {"now": T0}
+    store = FakeStore({Tuple("user:kyle@example.com", "member", "team:admins")})
+    cat = catalogue.load("catalogues/room.yaml")
+    aws = StaticMinter(now=lambda: clock["now"].timestamp())
+    dd = FakeDatadog()
+    datadog = DatadogMinter("sa-123", "api-xyz", "mgmt-abc", http=dd, now=lambda: clock["now"].timestamp())
+    verifier = PodVerifier({"ledger-pod": ("agent-ledger", "ledger"), "gateway-pod": ("tool-gateway", "gateway"),
+                            "stray-pod": ("default", "kube-system")})
+    ledger = Ledger()
+    app = create_app(store, cat, ledger, verifier, ConsoleAuth("console-secret"), {"aws": aws, "datadog": datadog},
+                     Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"],
+                              gateway_service_account="gateway/tool-gateway"))
+    app.state.ledger = ledger
+    c = TestClient(app)
+    c.put("/topology", json={"agents": [{"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"},
+                                        {"name": "watson", "team": "sre", "namespace": "watson", "service_account": "agent-watson"}]},
+          headers=ADMIN)
+    return c, clock, aws, dd
+
+
+GATEWAY = {"Authorization": "Bearer gateway-pod"}
+
+
+def grant(c, agent, integration, permissions):
+    rid = c.post("/requests", json={"agent": agent, "integration": integration, "permissions": permissions}, headers=OWNER).json()["id"]
+    out = c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN).json()["results"][0]
+    assert out["status"] == "approved", out
+
+
+def test_the_gateway_leases_for_a_granted_agent_and_nobody_else_may(gateway):
+    c, _, aws, _ = gateway
+    connect(c, ["aws_inventory_read"])
+    grant(c, "ledger", "aws-prod", ["aws_inventory_read"])
+    body = {"agent": "ledger", "integration": "aws-prod", "task": "count instances"}
+    # Only the gateway's own pod identity: an agent's pod and a stranger's are 403, no token 401.
+    assert c.post("/leases/for-agent", json=body, headers={"Authorization": "Bearer stray-pod"}).status_code == 403
+    assert c.post("/leases/for-agent", json=body, headers={"Authorization": "Bearer ledger-pod"}).status_code == 403
+    assert c.post("/leases/for-agent", json=body, headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert c.post("/leases/for-agent", json=body, headers=ADMIN).status_code == 401
+    # The gateway, for a granted agent: the agent's grants, the agent's row, marked via gateway.
+    r = c.post("/leases/for-agent", json=body, headers=GATEWAY)
+    assert r.status_code == 200, r.text
+    assert r.json()["granted"] == ["aws_inventory_read"] and r.json()["reused"] is False
+    assert aws.minted[-1]["agent"] == "ledger"
+    (row,) = c.get("/leases", headers=OWNER).json()["leases"]
+    assert (row["agent"], row["via"], row["task"]) == ("ledger", "gateway", "count instances")
+    # The agent's own path shares the live credential, and its own rows say via nothing.
+    again = c.post("/leases", json={"integration": "aws-prod"}, headers={"Authorization": "Bearer ledger-pod"}).json()
+    assert again["reused"] is True and again["lease_id"] == r.json()["lease_id"]
+    # An ungranted agent gets nothing; an agent the room does not know is a 404; borrowing is refused.
+    r = c.post("/leases/for-agent", json={"agent": "watson", "integration": "aws-prod"}, headers=GATEWAY)
+    assert r.status_code == 403 and "holds nothing" in r.text
+    r = c.post("/leases/for-agent", json={"agent": "moriarty", "integration": "aws-prod"}, headers=GATEWAY)
+    assert r.status_code == 403 and r.json()["detail"] == "moriarty is not an agent this room knows"
+    # Named permissions nobody granted: still one plain sentence (the agent's own path gets the list).
+    r = c.post("/leases/for-agent", json={"agent": "watson", "integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=GATEWAY)
+    assert r.status_code == 403 and r.json()["detail"] == "watson does not hold aws_inventory_read on aws-prod"
+    assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "nope"}, headers=GATEWAY).status_code == 404
+    r = c.post("/leases/for-agent", json={**body, "on_behalf_of": ["watson"]}, headers=GATEWAY)
+    assert r.status_code == 403 and r.json()["detail"] == "a credential is never borrowed for another agent's task"
+
+
+def test_a_datadog_lease_is_a_scoped_key_that_a_revoke_or_expiry_deletes(gateway):
+    c, clock, _, dd = gateway
+    r = c.put("/integrations/datadog", json={"vendor": "datadog", "spec": {"service_account_id": "sa-123"},
+                                            "ceiling": ["datadog_monitors_read", "datadog_metrics_read"]}, headers=ADMIN)
+    assert r.status_code == 200 and r.json()["kind"] == "connection"
+    assert c.get("/identity/datadog", headers=OWNER).json() == {"subject": "sa-123", "site": "datadoghq.com", "kind": "datadog_service_account"}
+    assert c.post("/probe/datadog", json={}, headers=ADMIN).json()["subject"] == "sa-123"
+    assert c.post("/probe/datadog", json={"role_arn": "sa-999"}, headers=ADMIN).status_code == 409
+    grant(c, "ledger", "datadog", ["datadog_monitors_read", "datadog_metrics_read"])
+    r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog", "task": "which monitor fired"}, headers=GATEWAY)
+    assert r.status_code == 200, r.text
+    lease = r.json()
+    assert lease["credential"] == {"dd_api_key": "api-xyz", "dd_app_key": "secret-kid-2", "dd_site": "datadoghq.com"}
+    assert lease["expires_at"] == "2026-10-27T13:00:00Z" and lease["note"] == "application key scoped to the granted permissions"
+    key = dd.keys["kid-2"]
+    assert key["name"].startswith("bab-ledger-") and key["scopes"] == ["metrics_read", "monitors_read", "timeseries_query"]
+    # Revoking one permission deletes the key the agent holds: the next lease is narrower and new.
+    gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"] if g["permission"] == "datadog_metrics_read")
+    assert c.delete(f"/grants/{gid}", headers=ADMIN).json() == {"revoked": gid, "leases_ended": 1}
+    assert "kid-2" not in dd.keys
+    r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog"}, headers=GATEWAY).json()
+    assert r["reused"] is False and r["credential"]["dd_app_key"] == "secret-kid-3" and dd.keys["kid-3"]["scopes"] == ["monitors_read"]
+    # Expiry: the next lease request, from anyone, deletes keys whose hour is up.
+    clock["now"] = T0 + timedelta(hours=2)
+    c.post("/leases/for-agent", json={"agent": "ledger", "integration": "datadog"}, headers=GATEWAY)
+    assert set(dd.keys) == {"kid-4"}
+    rows = c.get("/leases?agent=ledger", headers=OWNER).json()["leases"]  # newest first; the revoked one ended at 12:00
+    assert [(x["via"], x["expires_at"][:16]) for x in rows] == [("gateway", "2026-10-27T15:00"), ("gateway", "2026-10-27T13:00"), ("gateway", "2026-10-27T12:00")]
+
+
+def test_the_gateway_lane_is_closed_until_a_gateway_is_named(pods):
+    c, _ = pods
+    r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "aws-prod"}, headers={"Authorization": "Bearer ledger-pod"})
+    assert r.status_code == 501 and "BAB_GATEWAY_SERVICE_ACCOUNT" in r.text

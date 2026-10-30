@@ -161,19 +161,34 @@ actions:
   - {name: azure_cost_read, tier: read, vendor: azure, group: Billing, description: "Cost Management data and budgets (Cost Management Reader)", extra: {roles: ["Cost Management Reader"]}}
 
   # ---- datadog: the read capabilities its API and MCP server expose ----
-  - {name: datadog_monitors_read,   tier: read,   vendor: datadog, group: Monitors,     description: "List and read monitors and their status"}
-  - {name: datadog_monitors_write,  tier: mutate, vendor: datadog, group: Monitors,     description: "Create, edit and mute monitors"}
-  - {name: datadog_dashboards_read, tier: read,   vendor: datadog, group: Dashboards,   description: "Read dashboards and notebooks"}
-  - {name: datadog_logs_read,       tier: read,   vendor: datadog, group: Logs,         description: "Search and read log events"}
-  - {name: datadog_metrics_read,    tier: read,   vendor: datadog, group: Metrics,      description: "Query metrics and read metric metadata"}
-  - {name: datadog_events_read,     tier: read,   vendor: datadog, group: Events,       description: "Search the event stream"}
-  - {name: datadog_incidents_read,  tier: read,   vendor: datadog, group: Incidents,    description: "Read incidents, their timelines and attachments"}
-  - {name: datadog_hosts_read,      tier: read,   vendor: datadog, group: Infrastructure, description: "List hosts, containers and processes"}
-  - {name: datadog_apm_read,        tier: read,   vendor: datadog, group: APM,          description: "Read services, traces and spans"}
-  - {name: datadog_slos_read,       tier: read,   vendor: datadog, group: SLOs,         description: "Read SLOs and their history"}
-  - {name: datadog_synthetics_read, tier: read,   vendor: datadog, group: Synthetics,   description: "Read synthetic tests and results"}
-  - {name: datadog_rum_read,        tier: read,   vendor: datadog, group: RUM,          description: "Search RUM events and read applications"}
-  - {name: datadog_security_read,   tier: read,   vendor: datadog, group: Security,     description: "Read security signals and rules"}
+  # `extra.scopes` are Datadog permission names; a lease is an application key on bab's
+  # service account scoped to the union of the granted permissions' scopes.
+  - {name: datadog_monitors_read,   tier: read,   vendor: datadog, group: Monitors,     description: "List and read monitors and their status",
+     extra: {scopes: [monitors_read]}}
+  - {name: datadog_monitors_write,  tier: mutate, vendor: datadog, group: Monitors,     description: "Create, edit and mute monitors",
+     extra: {scopes: [monitors_write]}}
+  - {name: datadog_dashboards_read, tier: read,   vendor: datadog, group: Dashboards,   description: "Read dashboards and notebooks",
+     extra: {scopes: [dashboards_read]}}
+  - {name: datadog_logs_read,       tier: read,   vendor: datadog, group: Logs,         description: "Search and read log events",
+     extra: {scopes: [logs_read_data]}}
+  - {name: datadog_metrics_read,    tier: read,   vendor: datadog, group: Metrics,      description: "Query metrics and read metric metadata",
+     extra: {scopes: [metrics_read, timeseries_query]}}
+  - {name: datadog_events_read,     tier: read,   vendor: datadog, group: Events,       description: "Search the event stream",
+     extra: {scopes: [events_read]}}
+  - {name: datadog_incidents_read,  tier: read,   vendor: datadog, group: Incidents,    description: "Read incidents, their timelines and attachments",
+     extra: {scopes: [incident_read]}}
+  - {name: datadog_hosts_read,      tier: read,   vendor: datadog, group: Infrastructure, description: "List hosts, containers and processes",
+     extra: {scopes: [hosts_read]}}
+  - {name: datadog_apm_read,        tier: read,   vendor: datadog, group: APM,          description: "Read services, traces and spans",
+     extra: {scopes: [apm_read]}}
+  - {name: datadog_slos_read,       tier: read,   vendor: datadog, group: SLOs,         description: "Read SLOs and their history",
+     extra: {scopes: [slos_read]}}
+  - {name: datadog_synthetics_read, tier: read,   vendor: datadog, group: Synthetics,   description: "Read synthetic tests and results",
+     extra: {scopes: [synthetics_read]}}
+  - {name: datadog_rum_read,        tier: read,   vendor: datadog, group: RUM,          description: "Search RUM events and read applications",
+     extra: {scopes: [rum_apps_read]}}
+  - {name: datadog_security_read,   tier: read,   vendor: datadog, group: Security,     description: "Read security signals and rules",
+     extra: {scopes: [security_monitoring_signals_read, security_monitoring_rules_read]}}
 
   # ---- atlassian: the read capabilities its MCP server exposes ----
   - {name: atlassian_jira_issues_read,     tier: read, vendor: atlassian, group: Jira,       description: "Read issues and search with JQL"}

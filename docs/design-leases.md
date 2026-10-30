@@ -188,6 +188,34 @@ no per-session narrowing (Google Cloud, Azure), the granted set is enforced
 by bab's verdict before minting, not by the vendor during the hour. The
 console says which of the two applies to each integration.
 
+### Datadog: a lease is an application key
+
+Datadog has no short-lived tokens, but a *service account* can own *scoped
+application keys*: a key carries any subset of the owner's permissions, is
+created and deleted by API, and names itself in Datadog's audit log. So a
+Datadog lease is a fresh application key on bab's service account, named
+`bab-<agent>-<minute>`, scoped to the union of the granted permissions'
+`extra.scopes` (the catalogue pins one or two Datadog permission names per
+entry), handed to the agent as `{dd_api_key, dd_app_key, dd_site}` and
+deleted when the lease ends. The hour is bab's, not Datadog's: a key never
+expires on its own, so every lease request first deletes the keys of leases
+that have run out, a revoke deletes the key the agent still holds, and the
+sweep catches whatever is left.
+
+bab holds three things for this, from the pod's environment: the service
+account id (`DD_SERVICE_ACCOUNT_ID`), one organization API key
+(`DD_API_KEY`), and one management application key owned by that service
+account and scoped to `service_account_write` (`DD_MGMT_APP_KEY`). A key with
+no scopes would carry everything the service account may do, so a lease whose
+permissions name no scope is refused rather than minted wide. This is the
+first service vendor where the vendor itself enforces the granted set during
+the hour, as AWS does with the session policy.
+
+The tool gateway, not the agent, is what reaches Datadog today; it leases
+through `POST /leases/for-agent` with its own pod identity, naming the agent
+whose call it is serving. The checks are the agent's; the row says `via:
+gateway`.
+
 ## Runtime
 
 The agent runtime's integration tools stop reading a mounted secret and ask

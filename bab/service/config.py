@@ -54,6 +54,7 @@ def build_app():
                          "(set BAB_ALLOW_SQLITE=1 for a laptop run)")
     ledger = Ledger(db)
     settings = Settings(room=_required("BAB_ROOM"), admin_team=_required("BAB_ADMIN_TEAM"),
-                        security_team=_required("BAB_SECURITY_TEAM"))
+                        security_team=_required("BAB_SECURITY_TEAM"),
+                        gateway_service_account=os.environ.get("BAB_GATEWAY_SERVICE_ACCOUNT", "").strip() or None)
     return create_app(store, cat, ledger, agent_verifier(), ConsoleAuth(_required("BAB_CONSOLE_TOKEN")),
                       default_minters(), settings)

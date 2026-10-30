@@ -42,6 +42,9 @@ class Settings:
     admin_team: str  # team:<name> whose members decide
     security_team: str  # team:<name> required for the destroy tier
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    # The tool gateway's pod identity, `<namespace>/<service account>` (e.g. `liminal/liminal`): the one caller that
+    # may lease for a named agent (POST /leases/for-agent). None: that lane is closed.
+    gateway_service_account: str | None = None
 
     def team(self, name: str) -> str:
         return name if ":" in name else f"team:{name}"
@@ -69,6 +72,12 @@ class LeaseBody(BaseModel):
     on_behalf_of: list[str] | None = Field(default=None, max_length=100)
 
 
+class ForAgentLeaseBody(LeaseBody):
+    """The gateway's lease: the same request, naming the agent whose call it is serving."""
+
+    agent: str = Field(min_length=1, max_length=100)
+
+
 class CheckBody(BaseModel):
     agent: str
     action: str
@@ -84,7 +93,9 @@ class IntegrationBody(BaseModel):
 
 
 class ProbeBody(BaseModel):
-    role_arn: str = Field(min_length=20, max_length=2048)
+    # AWS: the role to try. A service vendor (datadog) is configured on bab itself; the field
+    # may then be omitted, or carry the account id a console was handed for bab to confirm.
+    role_arn: str | None = Field(default=None, min_length=1, max_length=2048)
     audience: str | None = Field(default=None, max_length=256)
     # Given: `role_arn` is a spoke, reached from this hub (with this external id).
     hub_role_arn: str | None = Field(default=None, max_length=2048)
@@ -149,8 +160,25 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         except IdentityError as exc:
             raise HTTPException(401, str(exc)) from exc
 
+    def gateway_caller(authorization: str = Header(default="")) -> Caller:
+        """The tool gateway, by its own pod identity: the same TokenReview path an agent takes,
+        then the service account must be the one Settings names. Nothing else is admitted."""
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(401, "the gateway proves itself with its service account token")
+        if not settings.gateway_service_account:
+            raise HTTPException(501, "no tool gateway is configured to lease for agents (BAB_GATEWAY_SERVICE_ACCOUNT)")
+        try:
+            caller = agent_verifier.verify(token)
+        except IdentityError as exc:
+            raise HTTPException(401, str(exc)) from exc
+        if f"{caller.namespace}/{caller.name}" != settings.gateway_service_account:
+            raise HTTPException(403, f"{caller.namespace}/{caller.name} is not the tool gateway")
+        return Caller("gateway", caller.name, namespace=caller.namespace)
+
     Console = Annotated[Caller, Depends(console_caller)]
     Agent = Annotated[Caller, Depends(agent_caller)]
+    Gateway = Annotated[Caller, Depends(gateway_caller)]
 
     # A credential still good for the same agent, integration and permissions: handed back
     # instead of minted again, so a runtime may ask on every call (and a revoke bites on
@@ -228,6 +256,28 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                            expires_at=t.expires_at, granted_by=actor, created_at=now))
             outcome[p] = "granted"
         return outcome
+
+    def end_leases(s, rows, now: datetime) -> int:
+        """Delete the vendor-side credential of each lease whose minter can (Datadog deletes
+        the key; AWS cannot recall a session and left no handle). A refusal is recorded and
+        the handle kept, so the next pass tries again."""
+        ended = 0
+        for lease in rows:
+            m = minters.get(lease.minter)
+            if not lease.handle or m is None:  # a JSON column compares badly; filter here
+                continue
+            try:
+                m.end(lease.handle)
+            except MintError as exc:
+                ledger.event(s, now, "lease.end_failed", None, lease=lease.id, error=str(exc))
+                continue
+            lease.handle = {}
+            lease.expires_at = min(lease.expires_at, now.replace(tzinfo=None))  # ended now, if early
+            ended += 1
+        return ended
+
+    def end_expired(s, now: datetime) -> int:
+        return end_leases(s, s.scalars(select(Lease).where(Lease.expires_at <= now.replace(tzinfo=None))), now)
 
     # ---- routes ------------------------------------------------------------
 
@@ -361,7 +411,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         if minter is None or not hasattr(minter, "probe"):
             raise HTTPException(501, f"bab cannot mint for {vendor!r} yet")
         try:
-            out = minter.probe(body.role_arn, body.audience or "sts.amazonaws.com",
+            out = minter.probe(body.role_arn or "", body.audience or "sts.amazonaws.com",
                                hub_role_arn=body.hub_role_arn, external_id=body.external_id)
         except MintError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -579,23 +629,31 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             except StoreError as exc:
                 raise HTTPException(503, f"the store cannot answer: {exc}") from exc
             g.revoked_at, g.revoked_by = now, caller.actor
+            # A credential the agent still holds there is ended where the vendor allows it:
+            # the next call mints afresh, narrower, or gets nothing.
+            ended = end_leases(s, s.scalars(select(Lease).where(
+                Lease.agent == g.agent, Lease.integration == g.integration,
+                Lease.expires_at > now.replace(tzinfo=None))), now)
             ledger.event(s, now, "grant.revoked", caller.actor, grant=grant_id, agent=g.agent,
-                         permission=g.permission)
+                         permission=g.permission, leases_ended=ended)
             s.commit()
         for key in [k for k in live if k[0] == g.agent and k[1] == g.integration]:
             live.pop(key, None)
-        return {"revoked": grant_id}
+        return {"revoked": grant_id, "leases_ended": ended}
 
-    @app.post("/leases")
-    def post_lease(body: LeaseBody, caller: Agent):
+    def lease_for(agent: str, body: LeaseBody, via: str | None) -> dict:
+        """One lease, for `agent`: the grant checks, the live-credential cache, the mint and the
+        ledger row are the same whether the agent asked with its own token (via None) or the
+        tool gateway asked for it (via "gateway"). The caller is settled before this runs."""
         now = settings.now()
         context = {"current_time": rfc3339(now)}
         with ledger.session() as s:
+            end_expired(s, now)
             if body.on_behalf_of:
                 # The second wall (the runtime is the first): whatever either side holds, a
                 # task that arrived from another agent gets no credential. Recorded, refused.
-                ledger.event(s, now, "lease.refused", caller.name, integration=body.integration,
-                             on_behalf_of=body.on_behalf_of, reason=NO_BORROWING)
+                ledger.event(s, now, "lease.refused", agent, integration=body.integration,
+                             on_behalf_of=body.on_behalf_of, reason=NO_BORROWING, via=via)
                 s.commit()
                 raise HTTPException(403, NO_BORROWING)
             integ = integration_or_404(s, body.integration)
@@ -616,16 +674,16 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                  "external_id": parent.spec.get("external_id"),
                                  **{k: v for k, v in mint_spec.items() if v is not None}}
             wanted = permissions_or_422(body.permissions, integ.vendor) if body.permissions else [
-                cat.action(g.permission) for g in ledger.active_grants(s, caller.name, body.integration)
+                cat.action(g.permission) for g in ledger.active_grants(s, agent, body.integration)
                 if cat.action(g.permission) and not g.gated]
             if not wanted:
-                raise HTTPException(403, f"{caller.name} holds nothing on {body.integration}")
+                raise HTTPException(403, f"{agent} holds nothing on {body.integration}")
             granted, gated, refused = [], [], []
             try:
                 for a in wanted:
-                    if store.check(f"agent:{caller.name}", a.name, obj(body.integration), context):
+                    if store.check(f"agent:{agent}", a.name, obj(body.integration), context):
                         granted.append(a)
-                    elif store.check(f"agent:{caller.name}", a.gated, obj(body.integration), context):
+                    elif store.check(f"agent:{agent}", a.gated, obj(body.integration), context):
                         gated.append(a)
                     else:
                         refused.append(a.name)
@@ -633,8 +691,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 raise HTTPException(503, f"no lease: the store cannot answer ({exc})") from exc
             pending = None
             if gated:
-                pending = Request(agent=caller.name, integration=body.integration, permissions=[a.name for a in gated],
-                                  requested_by=f"agent:{caller.name}", note=body.task, kind="lease", created_at=now)
+                pending = Request(agent=agent, integration=body.integration, permissions=[a.name for a in gated],
+                                  requested_by=f"agent:{agent}", note=body.task, kind="lease", created_at=now)
                 s.add(pending)
             if not granted:
                 s.commit()
@@ -642,7 +700,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                           "request_id": pending.id if pending else None}
                 raise HTTPException(202 if gated else 403, detail)
             seconds = min(cat.tier(a.tier).lease_seconds for a in granted)
-            key = (caller.name, body.integration, tuple(sorted(a.name for a in granted)))
+            key = (agent, body.integration, tuple(sorted(a.name for a in granted)))
             held = live.get(key)
             if held and held[2] - now.timestamp() > LIVE_MARGIN_S:
                 lease_id, credential, expires_ts, note = held
@@ -654,23 +712,47 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                         "credential": credential, "expires_at": rfc3339(datetime.fromtimestamp(expires_ts, tz=UTC)),
                         "note": note, "reused": True}
             try:
-                minted = minter.mint(caller.name, body.integration, mint_spec, granted, seconds)
+                minted = minter.mint(agent, body.integration, mint_spec, granted, seconds)
             except MintError as exc:
-                ledger.event(s, now, "lease.failed", caller.name, integration=body.integration, error=str(exc))
+                ledger.event(s, now, "lease.failed", agent, integration=body.integration, error=str(exc), via=via)
                 s.commit()
                 raise HTTPException(502, f"no lease: {exc}") from exc
             expires = datetime.fromtimestamp(minted.expires_at, tz=UTC)
-            lease = Lease(agent=caller.name, integration=body.integration, permissions=[a.name for a in granted],
-                          task=body.task, minter=integ.vendor, issued_at=now, expires_at=expires, handle=minted.handle)
+            lease = Lease(agent=agent, integration=body.integration, permissions=[a.name for a in granted],
+                          task=body.task, minter=integ.vendor, issued_at=now, expires_at=expires, handle=minted.handle,
+                          via=via)
             s.add(lease)
             s.commit()
             live[key] = (lease.id, minted.credential, minted.expires_at, minted.note)
-            log.info("lease %s -> %s on %s (%d permissions, %ds)", lease.id, caller.name, body.integration,
-                     len(granted), seconds)
+            log.info("lease %s -> %s on %s (%d permissions, %ds%s)", lease.id, agent, body.integration,
+                     len(granted), seconds, f", via {via}" if via else "")
             return {"lease_id": lease.id, "integration": body.integration, "vendor": integ.vendor,
                     "granted": [a.name for a in granted], "refused": refused,
                     "waiting_for_approval": [a.name for a in gated], "request_id": pending.id if pending else None,
                     "credential": minted.credential, "expires_at": rfc3339(expires), "note": minted.note, "reused": False}
+
+    @app.post("/leases")
+    def post_lease(body: LeaseBody, caller: Agent):
+        return lease_for(caller.name, body, None)
+
+    @app.post("/leases/for-agent")
+    def post_lease_for_agent(body: ForAgentLeaseBody, caller: Gateway):
+        """The tool gateway leases for the agent whose call it is serving. The gateway is its
+        own pod identity (Settings.gateway_service_account); the named agent must be one the
+        room's topology knows; then the grant checks, cache and ledger are the agent's own,
+        with the row marked `via: gateway`. `on_behalf_of` is refused here as everywhere."""
+        with ledger.session() as s:
+            if s.scalar(select(AgentRow.name).limit(1)) is not None and s.get(AgentRow, body.agent) is None:
+                raise HTTPException(403, f"{body.agent} is not an agent this room knows")
+        try:
+            return lease_for(body.agent, LeaseBody(**body.model_dump(exclude={"agent"})), "gateway")
+        except HTTPException as exc:
+            # The gateway shows a 403's detail to the model as one sentence; 404 stays "not connected".
+            if exc.status_code == 403 and isinstance(exc.detail, dict):
+                refused = ", ".join(exc.detail.get("refused") or [])
+                raise HTTPException(403, f"{body.agent} does not hold {refused} on {body.integration}" if refused
+                                    else f"{body.agent} holds nothing on {body.integration}") from exc
+            raise
 
     @app.get("/leases")
     def list_leases(_: Console, agent: str | None = None, integration: str | None = None,
@@ -685,7 +767,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 q = q.where(Lease.issued_at >= since.replace(tzinfo=None))
             rows = s.scalars(q.order_by(Lease.id.desc()).limit(limit))
             return {"leases": [{"id": r.id, "agent": r.agent, "integration": r.integration,
-                                "permissions": r.permissions, "task": r.task, "minter": r.minter,
+                                "permissions": r.permissions, "task": r.task, "minter": r.minter, "via": r.via,
                                 "issued_at": r.issued_at.isoformat(), "expires_at": r.expires_at.isoformat()}
                                for r in rows]}
 
@@ -702,14 +784,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             dead = grants.sweep(store, now)
         except StoreError as exc:
             raise HTTPException(503, f"the store cannot answer: {exc}") from exc
-        ended = 0
         with ledger.session() as s:
-            for lease in s.scalars(select(Lease).where(Lease.expires_at <= now.replace(tzinfo=None))):
-                m = minters.get(lease.minter)
-                if lease.handle and m is not None:  # a JSON column compares badly; filter here
-                    m.end(lease.handle)
-                    lease.handle = {}
-                    ended += 1
+            ended = end_expired(s, now)
             ledger.event(s, now, "sweep", caller.actor, tuples=len(dead), leases_ended=ended)
             s.commit()
         return {"expired_tuples_deleted": len(dead), "leases_ended": ended}
