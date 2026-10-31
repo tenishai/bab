@@ -8,6 +8,7 @@ bab is the only principal the vendor trusts; agents never hold anything standing
 from __future__ import annotations
 
 import base64
+import calendar
 import json
 import logging
 import os
@@ -494,8 +495,205 @@ class DatadogMinter:
         return {"subject": cfg.service_account_id, "site": cfg.site, "probe_key_id": key_id}
 
 
+# ---- github -----------------------------------------------------------------
+
+GH_DIR_ENV = "BAB_GITHUB_DIR"
+GH_DEFAULT_DIR = "/etc/bab/github"
+GH_APP_ID_ENV = "GITHUB_APP_ID"
+GH_INSTALLATION_ID_ENV = "GITHUB_APP_INSTALLATION_ID"
+GH_PRIVATE_KEY_ENV = "GITHUB_APP_PRIVATE_KEY"
+GH_API_URL_ENV = "GITHUB_API_URL"
+GH_DEFAULT_API_URL = "https://api.github.com"
+GH_NOT_CONFIGURED = "GitHub is not configured on the permission service yet: connect it under Admin > Integrations"
+GH_MAX_SECONDS = 3600  # an installation token lives an hour on GitHub's clock and cannot be shortened
+GH_PROBE_PERMISSIONS = {"metadata": "read"}
+_GH_RANK = {"read": 1, "write": 2, "admin": 3}
+
+
+def gh_permissions(permissions: list[Action]) -> dict[str, str]:
+    """The union of the granted permissions' `extra.permissions` (GitHub App fine-grained
+    permission -> read|write|admin), the stronger access winning per permission: what the
+    installation token may do."""
+    out: dict[str, str] = {}
+    for p in permissions:
+        for name, access in (p.extra.get("permissions") or {}).items():
+            access = str(access).lower()
+            if _GH_RANK.get(access, 0) > _GH_RANK.get(out.get(str(name), ""), 0):
+                out[str(name)] = access
+    return dict(sorted(out.items()))
+
+
+@dataclass(frozen=True)
+class GitHubConfig:
+    app_id: str
+    installation_id: str
+    api_url: str
+    private_key: str = field(repr=False)
+
+
+class GitHubMinter:
+    """A GitHub App installation token is the vendor's own short-lived credential: an hour,
+    narrowed at creation to a subset of the app's permissions and, when asked, to named
+    repositories, and attributed to the app in GitHub's audit log. A lease is one such token,
+    narrowed to the granted permissions' union (and to the integration's `repositories` when
+    the connection names some); it ends on GitHub's clock, so bab keeps no handle. bab holds
+    the app's id, one installation id and its private key, read on every call from the
+    mounted Secret the room writes on connect (never cached at boot, as for Datadog)."""
+
+    name = "github"
+
+    def __init__(self, directory: str | None = None, env: Mapping[str, str] | None = None, http=None, now=time.time):
+        self.directory = directory
+        self.env: Mapping[str, str] = {} if env is None else env
+        self.http = http or self._http
+        self.now = now
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] = os.environ, **kwargs) -> GitHubMinter:
+        return cls(None, env, **kwargs)
+
+    @classmethod
+    def from_dir(cls, directory: str, env: Mapping[str, str] = os.environ, **kwargs) -> GitHubMinter:
+        return cls(directory, env, **kwargs)
+
+    def _read(self, key: str) -> str:
+        value = ""
+        if self.directory:
+            try:
+                with open(os.path.join(self.directory, key)) as fh:
+                    value = fh.read()
+            except OSError:
+                value = ""
+        return (value or self.env.get(key, "") or "").strip()
+
+    def config(self) -> GitHubConfig:
+        app_id, inst, key, api = (self._read(k) for k in (GH_APP_ID_ENV, GH_INSTALLATION_ID_ENV,
+                                                          GH_PRIVATE_KEY_ENV, GH_API_URL_ENV))
+        if not app_id:
+            raise NotConfigured(GH_NOT_CONFIGURED)
+        missing = [k for k, v in ((GH_INSTALLATION_ID_ENV, inst), (GH_PRIVATE_KEY_ENV, key)) if not v]
+        if missing:
+            raise MintError(f"GitHub is half configured on the permission service: {GH_APP_ID_ENV} is set "
+                            f"but {' and '.join(missing)} missing")
+        # A PEM that travelled through an environment variable carries literal backslash-n.
+        key = key.replace("\\n", "\n")
+        return GitHubConfig(app_id, inst, (api or GH_DEFAULT_API_URL).rstrip("/"), key)
+
+    @staticmethod
+    def _http(method: str, url: str, headers: dict, body: dict | None) -> tuple[int, dict]:
+        try:
+            resp = httpx.request(method, url, headers=headers, json=body, timeout=10.0)
+        except httpx.HTTPError as exc:
+            raise MintError(f"GitHub did not answer: {exc.__class__.__name__}") from exc
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {}
+        return resp.status_code, data if isinstance(data, dict) else {}
+
+    def _jwt(self, cfg: GitHubConfig) -> str:
+        """The app's own short JWT (RS256, ten minutes): what mints installation tokens."""
+        import jwt  # PyJWT[crypto], in the service extra
+
+        now = int(self.now())
+        try:
+            return jwt.encode({"iat": now - 60, "exp": now + 540, "iss": cfg.app_id}, cfg.private_key, algorithm="RS256")
+        except (ValueError, TypeError) as exc:
+            raise MintError(f"the GitHub App private key did not sign: {exc.__class__.__name__}") from exc
+
+    def _call(self, cfg: GitHubConfig, method: str, path: str, token: str, body: dict | None = None) -> tuple[int, dict]:
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28"}
+        return self.http(method, f"{cfg.api_url}{path}", headers, body)
+
+    @staticmethod
+    def _error(status: int, data: dict) -> str:
+        """GitHub's own sentence (`message`, plus any `errors`), never a token."""
+        parts = [str(data["message"])] if data.get("message") else []
+        for e in data.get("errors") or []:
+            parts.append(e if isinstance(e, str) else str(e.get("message") or e.get("code") or ""))
+        return f"HTTP {status}" + (f" {'; '.join(p for p in parts if p)}" if parts else "")
+
+    def _token(self, cfg: GitHubConfig, permissions: dict[str, str], repositories: list[str]) -> tuple[str, float]:
+        body: dict[str, Any] = {"permissions": dict(permissions)}
+        if repositories:
+            body["repositories"] = list(repositories)
+        status, data = self._call(cfg, "POST", f"/app/installations/{cfg.installation_id}/access_tokens",
+                                  self._jwt(cfg), body)
+        if status != 201:
+            raise MintError(f"GitHub refused an installation token: {self._error(status, data)}")
+        token = str(data.get("token") or "")
+        if not token:
+            raise MintError("GitHub answered without the token")
+        return token, _gh_epoch(str(data.get("expires_at") or ""))
+
+    def mint(self, agent, integration_id, spec, permissions, seconds):
+        cfg = self.config()
+        perms = gh_permissions(permissions)
+        if not perms:  # a token with no permissions named would be the app's whole set
+            raise MintError("none of the granted permissions names a GitHub App permission; nothing to mint")
+        repos = [str(r) for r in ((spec or {}).get("repositories") or []) if str(r).strip()]
+        now = self.now()
+        token, github_ends = self._token(cfg, perms, repos)
+        ends = now + max(1, min(int(seconds), GH_MAX_SECONDS))
+        if github_ends:
+            ends = min(ends, github_ends)
+        note = "installation token narrowed to the granted permissions"
+        if repos:
+            note += f" and {len(repos)} repositor{'y' if len(repos) == 1 else 'ies'}"
+        return Minted(credential={"github_token": token, "github_api_url": cfg.api_url},
+                      expires_at=ends, handle={}, note=note)
+
+    def end(self, handle):
+        """Nothing to end: an installation token cannot be revoked without holding it, and bab
+        keeps no copy. It dies on GitHub's clock within the hour; the lease's end stops the
+        hand-out at once."""
+        return
+
+    def identity(self, audience: str | None = None) -> dict:
+        """Who bab is to GitHub: the app whose installation it mints from."""
+        cfg = self.config()
+        status, data = self._call(cfg, "GET", "/app", self._jwt(cfg))
+        if status != 200:
+            raise MintError(f"GitHub did not recognise the app: {self._error(status, data)}")
+        return {"subject": str(data.get("slug") or cfg.app_id), "app_id": cfg.app_id,
+                "installation_id": cfg.installation_id, "kind": "github_app"}
+
+    def probe(self, role_arn: str = "", audience: str | None = None, hub_role_arn: str | None = None,
+              external_id: str | None = None) -> dict:
+        """Can the app mint on its installation? Reads the installation with the app's JWT,
+        then mints a metadata-only token and counts the repositories it can see. The
+        AWS-shaped first argument, when given, is the installation id a console was handed,
+        and it must be the one bab is configured for."""
+        cfg = self.config()
+        if role_arn and role_arn.strip() != cfg.installation_id:
+            raise MintError(f"bab mints for GitHub App installation {cfg.installation_id}, not {role_arn.strip()}")
+        status, inst = self._call(cfg, "GET", f"/app/installations/{cfg.installation_id}", self._jwt(cfg))
+        if status != 200:
+            raise MintError(f"GitHub did not show installation {cfg.installation_id} to the app: {self._error(status, inst)}")
+        token, _ = self._token(cfg, dict(GH_PROBE_PERMISSIONS), [])
+        status, repos = self._call(cfg, "GET", "/installation/repositories?per_page=1", token)
+        if status != 200:
+            raise MintError(f"the probe token could not list repositories: {self._error(status, repos)}")
+        return {"subject": str(inst.get("app_slug") or cfg.app_id), "installation_id": cfg.installation_id,
+                "account": str(((inst.get("account") or {}).get("login")) or ""),
+                "repositories": int(repos.get("total_count") or 0)}
+
+
+def _gh_epoch(iso: str) -> float:
+    """GitHub's `expires_at` (`2026-10-31T17:00:00Z`) as an epoch, 0 when absent or odd."""
+    if not iso:
+        return 0.0
+    try:
+        return float(calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return 0.0
+
+
 def default_minters() -> dict[str, Minter]:
-    """Datadog is always registered; whether it can mint is decided per call from the mounted
-    Secret (`BAB_DATADOG_DIR`, default /etc/bab/datadog) or, failing that, the environment."""
+    """Datadog and GitHub are always registered; whether each can mint is decided per call
+    from its mounted Secret (`BAB_DATADOG_DIR` /etc/bab/datadog, `BAB_GITHUB_DIR`
+    /etc/bab/github) or, failing that, the environment."""
     return {"aws": AwsMinter(),
-            "datadog": DatadogMinter.from_dir(os.environ.get(DD_DIR_ENV, "").strip() or DD_DEFAULT_DIR)}
+            "datadog": DatadogMinter.from_dir(os.environ.get(DD_DIR_ENV, "").strip() or DD_DEFAULT_DIR),
+            "github": GitHubMinter.from_dir(os.environ.get(GH_DIR_ENV, "").strip() or GH_DEFAULT_DIR)}

@@ -6,6 +6,20 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **GitHub minter** (#49, kobo#338 vendor 1). A lease on a `github` integration is a GitHub App
+  installation token narrowed to the union of the granted permissions' `extra.permissions`
+  (write wins over read per permission) and, when the connection's spec names
+  `repositories`, to those repositories; it lives at most an hour on GitHub's clock, so bab
+  keeps no handle and `end` is a no-op. bab reads the app id, one installation id, the
+  private key and an optional API URL on every call from the mounted Secret
+  (`BAB_GITHUB_DIR`, default `/etc/bab/github`) or the environment, as the Datadog minter
+  does. `GET /identity/github` names the app; `POST /probe/github` reads the installation,
+  mints a metadata-only token and counts the repositories it can see. The catalogue's GitHub
+  rows now carry the app permissions each needs, plus a new `github_actions_read`.
+
+
 ## [0.4.9] - 2026-10-30
 
 ### Changed
