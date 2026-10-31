@@ -91,3 +91,37 @@ class FakeDatadog:
         if method == "DELETE":
             return (204, {}) if self.keys.pop(key_id, None) is not None else (404, {"errors": ["Not found"]})
         return 405, {"errors": ["method"]}
+
+
+class FakeGitHub:
+    """GitHub's App API as the GitHubMinter's `http` function: the app, one installation,
+    installation tokens that echo what they were narrowed to, a repository count."""
+
+    def __init__(self, refuse: str | None = None, installation: str = "777"):
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.headers: list[dict] = []
+        self.refuse = refuse
+        self.installation = installation
+        self.n = 0
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append((method, url, body))
+        self.headers.append(dict(headers))
+        path = url.split("/", 3)[3] if url.count("/") >= 3 else ""
+        if method == "GET" and path == "app":
+            return 200, {"id": 4242, "slug": "acme-room"}
+        if method == "GET" and path == f"app/installations/{self.installation}":
+            return 200, {"id": int(self.installation), "app_slug": "acme-room", "account": {"login": "acme"}}
+        if method == "GET" and path.startswith("app/installations/"):
+            return 404, {"message": "Not Found"}
+        if method == "POST" and path == f"app/installations/{self.installation}/access_tokens":
+            if self.refuse:
+                return 422, {"message": self.refuse}
+            self.n += 1
+            out = {"token": f"ghs-{self.n}", "expires_at": "2026-10-30T15:05:00Z", "permissions": body["permissions"]}
+            if body.get("repositories"):
+                out["repositories"] = [{"name": r} for r in body["repositories"]]
+            return 201, out
+        if method == "GET" and path.startswith("installation/repositories"):
+            return 200, {"total_count": 3}
+        return 405, {"message": "method"}

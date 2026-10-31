@@ -191,3 +191,116 @@ def test_every_datadog_permission_names_its_scopes():
     assert scopes["datadog_incidents_read"] == ["incident_read"]
     assert scopes["datadog_rum_read"] == ["rum_apps_read"]
     assert not any("write" in s for a, ss in scopes.items() if a != "datadog_monitors_write" for s in ss)
+
+
+def test_github_minter_narrows_an_installation_token_to_the_union(monkeypatch):
+    from bab.service import minters as m_
+    from bab.service.minters import GitHubMinter, MintError, gh_permissions
+    from tests.conftest import FakeGitHub
+
+    monkeypatch.setattr(GitHubMinter, "_jwt", lambda self, cfg: "app-jwt")
+    cat = catalogue.load("catalogues/room.yaml")
+    gh = FakeGitHub()
+    now = datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp()
+    m = GitHubMinter.from_env({"GITHUB_APP_ID": "4242", "GITHUB_APP_INSTALLATION_ID": "777",
+                               "GITHUB_APP_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\\nabc\\n-----END RSA PRIVATE KEY-----"},
+                              http=gh, now=lambda: now)
+    assert "\\n" not in m.config().private_key and m.config().private_key.count("\n") == 2
+    assert "abc" not in repr(m.config())
+    # Union with write winning per permission; nothing named is nothing.
+    perms = [cat.action("github_repos_read"), cat.action("github_pulls_write")]
+    assert gh_permissions(perms) == {"contents": "write", "issues": "read", "metadata": "read", "pull_requests": "write"}
+    assert gh_permissions([cat.action("github_actions_read")]) == {"actions": "read", "checks": "read", "metadata": "read"}
+    assert gh_permissions([]) == {}
+    out = m.mint("sherlock", "github", {"repositories": ["infra", "web"]}, perms, 7200)
+    method, url, body = gh.calls[0]
+    assert (method, url) == ("POST", "https://api.github.com/app/installations/777/access_tokens")
+    assert gh.headers[0]["Authorization"] == "Bearer app-jwt" and gh.headers[0]["X-GitHub-Api-Version"] == "2022-11-28"
+    assert body == {"permissions": gh_permissions(perms), "repositories": ["infra", "web"]}
+    assert out.credential == {"github_token": "ghs-1", "github_api_url": "https://api.github.com"}
+    assert out.handle == {} and out.note == "installation token narrowed to the granted permissions and 2 repositories"
+    assert out.expires_at == now + 3600  # the lease asked for two hours; an installation token is an hour
+    # No repositories on the connection: the token sees what the installation sees, and says so.
+    out = m.mint("sherlock", "github", {}, [cat.action("github_repos_read")], 600)
+    assert "repositories" not in gh.calls[-1][2] and out.expires_at == now + 600
+    assert out.note == "installation token narrowed to the granted permissions"
+    m.end(out.handle)  # nothing to end, nothing called
+    assert len(gh.calls) == 2
+    with pytest.raises(MintError, match="names a GitHub App permission"):
+        m.mint("sherlock", "github", {}, [cat.action("aws_logs_read")], 3600)
+    # Identity is the app; the probe reads the installation, mints metadata-only, counts repositories.
+    assert m.identity() == {"subject": "acme-room", "app_id": "4242", "installation_id": "777", "kind": "github_app"}
+    out = m.probe()
+    assert out == {"subject": "acme-room", "installation_id": "777", "account": "acme", "repositories": 3}
+    assert gh.calls[-2][2] == {"permissions": {"metadata": "read"}}
+    assert gh.headers[-1]["Authorization"] == "Bearer ghs-3"
+    assert m.probe("777")["account"] == "acme"
+    with pytest.raises(MintError, match="not 778"):
+        m.probe("778")
+    assert m_.default_minters()["github"].name == "github"
+
+
+def test_github_minter_reports_githubs_sentence_never_the_key_or_token(monkeypatch):
+    from bab.service.minters import GitHubMinter, MintError, NotConfigured
+    from tests.conftest import FakeGitHub
+
+    monkeypatch.setattr(GitHubMinter, "_jwt", lambda self, cfg: "app-jwt")
+    cat = catalogue.load("catalogues/room.yaml")
+    m = GitHubMinter.from_env({"GITHUB_APP_ID": "4242", "GITHUB_APP_INSTALLATION_ID": "777", "GITHUB_APP_PRIVATE_KEY": "pem-secret"},
+                              http=FakeGitHub(refuse="The permissions requested are not granted to this installation."))
+    with pytest.raises(MintError) as exc:
+        m.mint("sherlock", "github", {}, [cat.action("github_repos_delete")], 3600)
+    assert "HTTP 422 The permissions requested are not granted to this installation." in str(exc.value)
+    assert "pem-secret" not in str(exc.value) and "app-jwt" not in str(exc.value)
+    with pytest.raises(NotConfigured, match="not configured"):
+        GitHubMinter.from_env({}).config()
+    with pytest.raises(MintError, match="half configured.*GITHUB_APP_PRIVATE_KEY missing"):
+        GitHubMinter.from_env({"GITHUB_APP_ID": "4242", "GITHUB_APP_INSTALLATION_ID": "777"}).config()
+
+
+def test_github_minter_reads_the_mounted_secret_on_every_call(tmp_path, monkeypatch):
+    from bab.service.minters import GitHubMinter
+    from tests.conftest import FakeGitHub
+
+    monkeypatch.setattr(GitHubMinter, "_jwt", lambda self, cfg: "app-jwt")
+    secret = tmp_path / "github"
+    secret.mkdir()
+    (secret / "GITHUB_APP_ID").write_text("4242\n")
+    (secret / "GITHUB_APP_INSTALLATION_ID").write_text("777\n")
+    (secret / "GITHUB_APP_PRIVATE_KEY").write_text("pem-file\n")
+    (secret / "GITHUB_API_URL").write_text("https://github.acme.example/api/v3/\n")
+    m = GitHubMinter.from_dir(str(secret), env={"GITHUB_APP_ID": "1", "GITHUB_APP_PRIVATE_KEY": "pem-env"}, http=FakeGitHub())
+    cfg = m.config()
+    assert (cfg.app_id, cfg.installation_id, cfg.private_key, cfg.api_url) == ("4242", "777", "pem-file", "https://github.acme.example/api/v3")
+    (secret / "GITHUB_APP_INSTALLATION_ID").unlink()
+    with pytest.raises(Exception, match="half configured"):
+        m.config()
+
+
+def test_github_minter_signs_a_real_app_jwt():
+    """The one place the key is used for real: RS256 over iss/iat/exp, PyJWT[crypto]."""
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from bab.service.minters import GitHubMinter
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_key().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                                          serialization.NoEncryption()).decode() if hasattr(key, "private_key") else \
+        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                          serialization.NoEncryption()).decode()
+    m = GitHubMinter.from_env({"GITHUB_APP_ID": "4242", "GITHUB_APP_INSTALLATION_ID": "777", "GITHUB_APP_PRIVATE_KEY": pem},
+                              now=lambda: 1_800_000_000.0)
+    token = m._jwt(m.config())
+    claims = jwt.decode(token, key.public_key(), algorithms=["RS256"], options={"verify_exp": False, "verify_iat": False})
+    assert claims == {"iat": 1_800_000_000 - 60, "exp": 1_800_000_000 + 540, "iss": "4242"}
+
+
+def test_every_github_permission_names_its_app_permissions():
+    cat = catalogue.load("catalogues/room.yaml")
+    perms = {a.name: a.extra.get("permissions") for a in cat.for_vendor("github")}
+    assert all(perms.values()), perms
+    assert all("metadata" in p for p in perms.values()), "every token must be able to read repository metadata"
+    writes = {n for n, p in perms.items() if any(v != "read" for v in p.values())}
+    assert writes == {"github_pulls_write", "github_repos_delete"}
