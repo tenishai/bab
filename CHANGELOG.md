@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-10-31
+
 ### Added
 
 - **GitHub minter** (#49, kobo#338 vendor 1). A lease on a `github` integration is a GitHub App
