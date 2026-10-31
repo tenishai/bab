@@ -6,6 +6,13 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-10-31
+
+The release of the GitHub minter. 0.4.10 was tagged on a commit that still declared
+0.4.9, so the tag guard refused it and no image was published; 0.4.11 is the same code
+with the version declared.
+
+
 ## [0.4.10] - 2026-10-31
 
 ### Added
