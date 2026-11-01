@@ -15,6 +15,7 @@ from bab.store import Tuple
 from tests.conftest import FakeStore
 
 T0 = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+NO_BORROWING_SENTENCE = "a credential is never borrowed for another agent's task"
 ADMIN = {"X-Bab-Console-Token": "console-secret", "X-Bab-Actor": "kyle@example.com"}
 SEC = {"X-Bab-Console-Token": "console-secret", "X-Bab-Actor": "sam@example.com"}
 OWNER = {"X-Bab-Console-Token": "console-secret", "X-Bab-Actor": "owner@example.com"}
@@ -610,3 +611,56 @@ def test_a_lease_on_the_connection_lands_on_the_one_child_the_agent_holds(repos)
         if g["integration"] == "github-ledger-web":
             c.delete(f"/grants/{g['id']}", headers=ADMIN)
     assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github"}, headers=GATEWAY).json()["integration"] == "github-ledger"
+
+
+def test_events_read_newest_first_and_every_refusal_names_the_agent_and_integration(world):
+    """`GET /events` (kobo#371, the Agents audit): console auth, newest first, `kind` repeats or takes a
+    comma list, `agent` reads `detail.agent`, `since`/`until` bound `at`. A lease the agent holds nothing
+    for, one it holds only in part, one borrowed for another agent's task and one the minter could not
+    mint each leave a row whose detail carries the agent, the integration, the permissions and a reason."""
+    from bab.service.minters import MintError
+
+    c, _, clock, minter = world
+    connect(c, ["aws_inventory_read", "aws_cost_read"])
+    # Holds nothing: refused and recorded.
+    assert c.post("/leases", json={"integration": "aws-prod"}, headers=AGENT).status_code == 403
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "aws-prod", "permissions": ["aws_inventory_read"]}, headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    clock["now"] = T0 + timedelta(minutes=1)
+    # Asks for what it does not hold: refused with the permission named.
+    assert c.post("/leases", json={"integration": "aws-prod", "permissions": ["aws_cost_read"]}, headers=AGENT).status_code == 403
+    clock["now"] = T0 + timedelta(minutes=2)
+    # Another agent's task: the borrowing wall.
+    assert c.post("/leases", json={"integration": "aws-prod", "on_behalf_of": ["watson"]}, headers=AGENT).status_code == 403
+    clock["now"] = T0 + timedelta(minutes=3)
+    # The minter says no.
+    real = minter.mint
+    minter.mint = lambda *a, **k: (_ for _ in ()).throw(MintError("the vendor is away"))
+    assert c.post("/leases", json={"integration": "aws-prod", "task": "count instances"}, headers=AGENT).status_code == 502
+    minter.mint = real
+    clock["now"] = T0 + timedelta(minutes=4)
+    assert c.post("/leases", json={"integration": "aws-prod"}, headers=AGENT).status_code == 200
+
+    assert c.get("/events", headers=AGENT).status_code == 401
+    rows = c.get("/events", headers=OWNER).json()["events"]
+    assert [r["kind"] for r in rows if r["kind"].startswith("lease.")] == ["lease.failed", "lease.refused", "lease.refused", "lease.refused"]
+    assert set(rows[0]) == {"id", "at", "kind", "actor", "detail"} and rows[0]["at"] > rows[-1]["at"]
+    failed, borrowed, partial, nothing = [r for r in rows if r["kind"].startswith("lease.")]
+    for r in (failed, borrowed, partial, nothing):
+        assert r["actor"] == "sherlock" and r["detail"]["agent"] == "sherlock" and r["detail"]["integration"] == "aws-prod"
+    assert nothing["detail"]["reason"] == "not granted" and nothing["detail"]["permissions"] == []
+    assert partial["detail"]["reason"] == "not granted" and partial["detail"]["permissions"] == ["aws_cost_read"]
+    assert borrowed["detail"]["reason"] == NO_BORROWING_SENTENCE and borrowed["detail"]["on_behalf_of"] == ["watson"]
+    assert failed["detail"]["reason"] == "the vendor is away" and failed["detail"]["permissions"] == ["aws_inventory_read"]
+
+    # The filters the room's Agents audit sends.
+    both = c.get("/events?kind=lease.refused,lease.failed", headers=OWNER).json()["events"]
+    assert [r["kind"] for r in both] == ["lease.failed", "lease.refused", "lease.refused", "lease.refused"]
+    assert [r["kind"] for r in c.get("/events?kind=lease.refused&kind=lease.failed", headers=OWNER).json()["events"]] == [r["kind"] for r in both]
+    assert len(c.get("/events?kind=lease.failed&agent=sherlock", headers=OWNER).json()["events"]) == 1
+    assert c.get("/events?agent=watson", headers=OWNER).json()["events"] == []
+    window = c.get("/events", params={"kind": "lease.refused", "since": (T0 + timedelta(minutes=1)).isoformat(),
+                                      "until": (T0 + timedelta(minutes=2)).isoformat()}, headers=OWNER).json()["events"]
+    assert [r["detail"]["permissions"] for r in window] == [["aws_cost_read"]]
+    assert len(c.get("/events?limit=2", headers=OWNER).json()["events"]) == 2
+    assert c.get("/events?limit=5000", headers=OWNER).status_code == 422
