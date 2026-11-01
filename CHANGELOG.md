@@ -6,6 +6,38 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.12] — 2026-11-01
+
+GitHub as three levels, a repository set per agent under the one connection, and a lease
+that finds it (tenishai/kobo#365, section "bab").
+
+### Changed
+
+- **The GitHub catalogue is three nested levels.** `github_repos_read` ("Read": code, issues,
+  pull requests, checks and workflow runs), `github_pulls_review` ("Review pull requests":
+  Read plus `pull_requests: write`) and `github_pulls_write` ("Open pull requests": Review plus
+  `contents: write`). Each level's app permissions are a superset of the one before.
+  `github_actions_read` is folded into Read; `github_repos_delete` is gone. A catalogue row
+  may now carry a `label`, and `GET /catalogue/{vendor}` returns it on every permission
+  (`null` where a row has none) so a console can show a name instead of the identifier.
+- **A child may hang under a service connection.** `PUT /integrations/{id}` accepts a
+  `parent` that is an organization (as before) or a service connection with no parent of its
+  own, one level deep; a parent that itself has a parent is a 422, and the vendor must still
+  match. Children keep kind `account`, so `GET /integrations` lists a repository set
+  (`github-<agent>`, spec `repositories`) under the `github` connection the way a spoke lists
+  under its hub; the listing now carries `repositories` too. Disconnecting a parent with
+  children stays a 409.
+
+### Added
+
+- **A lease asked for by the parent's name lands on the agent's own child.** `POST
+  /leases/for-agent` (and the agent's own `POST /leases`) with an integration the agent holds
+  no active grant on, which is the parent of exactly one child the agent does hold a grant on,
+  leases that child: the minter narrows the token to the child's `repositories`, the row and
+  the live cache are the child's, and the response says `resolved_from`. Two or more such
+  children are a 409 that names them; no grant anywhere is the existing 403. The gateway asks
+  for `github`; the agent's repository set is `github-<agent>`.
+
 ## [0.4.11] - 2026-10-31
 
 The release of the GitHub minter. 0.4.10 was tagged on a commit that still declared

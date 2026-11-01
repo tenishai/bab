@@ -201,16 +201,19 @@ actions:
   - {name: atlassian_confluence_spaces_read, tier: read, vendor: atlassian, group: Confluence, description: "List spaces and page trees"}
   - {name: atlassian_confluence_comments_read, tier: read, vendor: atlassian, group: Confluence, description: "Read comments on pages"}
 
-  # ---- github: each row names the GitHub App permissions it needs; the minter narrows an
-  # installation token to their union (write wins over read per permission) ----
-  - {name: github_repos_read,   tier: read,    vendor: github, group: Repositories,  description: "Read code, issues and pull requests",
-     extra: {permissions: {metadata: read, contents: read, issues: read, pull_requests: read}}}
-  - {name: github_actions_read, tier: read,    vendor: github, group: Actions,       description: "Read workflow runs, jobs, logs and checks",
-     extra: {permissions: {metadata: read, actions: read, checks: read}}}
-  - {name: github_pulls_write,  tier: mutate,  vendor: github, group: Pull requests, description: "Open, comment on and review pull requests",
-     extra: {permissions: {metadata: read, contents: write, pull_requests: write}}}
-  - {name: github_repos_delete, tier: destroy, vendor: github, group: Repositories,  description: "Delete a repository",
-     extra: {permissions: {metadata: read, administration: write}}}
+  # ---- github: three levels, each a superset of the one before (Read < Review < Open). Each row
+  # names the GitHub App permissions it needs; the minter narrows an installation token to their
+  # union (write wins over read per permission) and to the leased integration's `repositories`.
+  # `label` is what a console shows; the names stay because grants carry them. ----
+  - {name: github_repos_read,    tier: read,   vendor: github, group: Repositories,  label: "Read",
+     description: "Read code, issues, pull requests, checks and workflow runs",
+     extra: {permissions: {metadata: read, contents: read, issues: read, pull_requests: read, checks: read, actions: read}}}
+  - {name: github_pulls_review,  tier: mutate, vendor: github, group: Pull requests, label: "Review pull requests",
+     description: "Comment on, approve or request changes to pull requests",
+     extra: {permissions: {metadata: read, contents: read, issues: read, pull_requests: write, checks: read, actions: read}}}
+  - {name: github_pulls_write,   tier: mutate, vendor: github, group: Pull requests, label: "Open pull requests",
+     description: "Create branches and commits and open pull requests",
+     extra: {permissions: {metadata: read, contents: write, issues: read, pull_requests: write, checks: read, actions: read}}}
 
   # ---- agents: talking to another team's agent is a permission its owner requests ----
   - {name: a2a_ask, tier: read, vendor: agents, group: Colleagues, description: "Ask this agent for help; it answers from what it knows and never borrows a credential for the asker"}

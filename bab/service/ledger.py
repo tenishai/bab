@@ -28,14 +28,17 @@ class Integration(Base):
     spec: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # role_arn, audience, ...
     ceiling: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # permissions the connection can honour
     # A cloud account under its organization's row (hub-and-spoke): the parent holds the hub
-    # role bab assumes with its own identity, this row the spoke role the hub assumes next.
+    # role bab assumes with its own identity, this row the spoke role the hub assumes next. Or a
+    # repository set under a service connection (github-<agent> under github): the parent is the
+    # connection, this row's spec names the `repositories` a lease is narrowed to. One level deep.
     parent: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
     @property
     def kind(self) -> str:
-        """`org` (holds a hub role), `account` (a cloud account, under an org or flat), or `connection`."""
+        """`org` (holds a hub role), `account` (a cloud account under an org or flat, or any child of a
+        connection), or `connection` (a service connected once, with no parent)."""
         if self.parent:
             return "account"
         spec = self.spec or {}
