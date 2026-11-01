@@ -6,6 +6,13 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A GitHub lease narrowed to a repository set works when the console stores full names.**
+  GitHub's installation-token API narrows by bare repository name; a set stored as
+  `owner/name` (the room's picker) was sent through as is and GitHub answered 422
+  "repository does not exist" on every lease. The minter now drops the owner.
+
 ## [0.4.13] - 2026-11-01
 
 The room's audit reads what agents did with their connections (tenishai/kobo#371, section 3).

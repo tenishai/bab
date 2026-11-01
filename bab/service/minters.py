@@ -632,7 +632,11 @@ class GitHubMinter:
         perms = gh_permissions(permissions)
         if not perms:  # a token with no permissions named would be the app's whole set
             raise MintError("none of the granted permissions names a GitHub App permission; nothing to mint")
-        repos = [str(r) for r in ((spec or {}).get("repositories") or []) if str(r).strip()]
+        # GitHub's installation-token API narrows by repository NAME, never
+        # `owner/name`: the owner is the installation's. A console that stores
+        # the full name (the room's picker does) would get a 422 "repository
+        # does not exist" for every lease, so the owner is dropped here.
+        repos = [str(r).strip().rsplit("/", 1)[-1] for r in ((spec or {}).get("repositories") or []) if str(r).strip()]
         now = self.now()
         token, github_ends = self._token(cfg, perms, repos)
         ends = now + max(1, min(int(seconds), GH_MAX_SECONDS))
