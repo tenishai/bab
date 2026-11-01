@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-11-01
+
 The room's audit reads what agents did with their connections (tenishai/kobo#371, section 3).
 
 ### Added
