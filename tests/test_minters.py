@@ -222,12 +222,17 @@ def test_github_minter_narrows_an_installation_token_to_the_union(monkeypatch):
     assert out.credential == {"github_token": "ghs-1", "github_api_url": "https://api.github.com"}
     assert out.handle == {} and out.note == "installation token narrowed to the granted permissions and 2 repositories"
     assert out.expires_at == now + 3600  # the lease asked for two hours; an installation token is an hour
+    # A console that stores the full name (owner/name) gets the same token: GitHub's
+    # token API narrows by bare repository name, so the owner is dropped (a full name
+    # sent through was a 422 "repository does not exist" for every lease, 2026-11-01).
+    m.mint("sherlock", "github", {"repositories": ["acme/infra", "web"]}, perms, 7200)
+    assert gh.calls[-1][2]["repositories"] == ["infra", "web"]
     # No repositories on the connection: the token sees what the installation sees, and says so.
     out = m.mint("sherlock", "github", {}, [cat.action("github_repos_read")], 600)
     assert "repositories" not in gh.calls[-1][2] and out.expires_at == now + 600
     assert out.note == "installation token narrowed to the granted permissions"
     m.end(out.handle)  # nothing to end, nothing called
-    assert len(gh.calls) == 2
+    assert len(gh.calls) == 3  # the two narrowed mints and the whole-installation one
     with pytest.raises(MintError, match="names a GitHub App permission"):
         m.mint("sherlock", "github", {}, [cat.action("aws_logs_read")], 3600)
     # Identity is the app; the probe reads the installation, mints metadata-only, counts repositories.
@@ -235,7 +240,7 @@ def test_github_minter_narrows_an_installation_token_to_the_union(monkeypatch):
     out = m.probe()
     assert out == {"subject": "acme-room", "installation_id": "777", "account": "acme", "repositories": 3}
     assert gh.calls[-2][2] == {"permissions": {"metadata": "read"}}
-    assert gh.headers[-1]["Authorization"] == "Bearer ghs-3"
+    assert gh.headers[-1]["Authorization"] == "Bearer ghs-4"  # the fourth token the fake minted in this test
     assert m.probe("777")["account"] == "acme"
     with pytest.raises(MintError, match="not 778"):
         m.probe("778")
