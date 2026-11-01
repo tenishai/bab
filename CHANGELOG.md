@@ -6,6 +6,23 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+The room's audit reads what agents did with their connections (tenishai/kobo#371, section 3).
+
+### Added
+
+- **`GET /events`** (console auth): the ledger's events, newest first, with `since`, `until`
+  (exclusive), `kind` (repeatable or a comma list), `agent` (reads `detail.agent`) and `limit`
+  (default 200, at most 1000). A row is `{"id", "at", "kind", "actor", "detail"}`. A mint
+  still writes no event; a console reads mints from `GET /leases`.
+
+### Changed
+
+- **Every `lease.refused` and `lease.failed` row names the agent and the integration in
+  `detail`**, with the `permissions` asked for and a `reason` (`not granted`, the borrowing
+  sentence, or the minter's). A lease the agent holds nothing for, and one asked for
+  permissions it does not hold, are now recorded as `lease.refused` too (they were a bare 403);
+  a 202 with permissions waiting for approval is not a refusal and writes nothing.
+
 ## [0.4.12] — 2026-11-01
 
 GitHub as three levels, a repository set per agent under the one connection, and a lease

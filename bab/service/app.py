@@ -21,7 +21,7 @@ from bab import ceiling, grants
 from bab.catalogue import Catalogue
 from bab.door import Door, Verdict, rfc3339
 from bab.service.identity import Caller, ConsoleAuth, IdentityError
-from bab.service.ledger import AgentRow, GrantRow, Integration, Lease, Ledger, Request
+from bab.service.ledger import AgentRow, Event, GrantRow, Integration, Lease, Ledger, Request
 from bab.service.minters import Minter, MintError, NotConfigured
 from bab.store import Store, StoreError, Tuple
 from bab.sync import reconcile, topology
@@ -34,6 +34,7 @@ LEASE_REQUEST_HOURS = 1  # an approved gated lease request becomes a grant this 
 AGENTS_VENDOR = "agents"
 A2A_ASK = "a2a_ask"
 NO_BORROWING = "a credential is never borrowed for another agent's task"
+NOT_GRANTED = "not granted"
 
 
 @dataclass
@@ -664,8 +665,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             if body.on_behalf_of:
                 # The second wall (the runtime is the first): whatever either side holds, a
                 # task that arrived from another agent gets no credential. Recorded, refused.
-                ledger.event(s, now, "lease.refused", agent, integration=body.integration,
-                             on_behalf_of=body.on_behalf_of, reason=NO_BORROWING, via=via)
+                ledger.event(s, now, "lease.refused", agent, agent=agent, integration=body.integration,
+                             permissions=list(body.permissions or []), on_behalf_of=body.on_behalf_of,
+                             reason=NO_BORROWING, via=via)
                 s.commit()
                 raise HTTPException(403, NO_BORROWING)
             integ = integration_or_404(s, body.integration)
@@ -695,6 +697,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 cat.action(g.permission) for g in ledger.active_grants(s, agent, iid)
                 if cat.action(g.permission) and not g.gated]
             if not wanted:
+                ledger.event(s, now, "lease.refused", agent, agent=agent, integration=iid, permissions=[],
+                             reason=NOT_GRANTED, via=via)
+                s.commit()
                 raise HTTPException(403, f"{agent} holds nothing on {iid}")
             granted, gated, refused = [], [], []
             try:
@@ -713,6 +718,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                   requested_by=f"agent:{agent}", note=body.task, kind="lease", created_at=now)
                 s.add(pending)
             if not granted:
+                if not gated:
+                    # Nothing held and nothing waiting: a refusal, recorded like the borrowing one so
+                    # the room's Agents audit can show it next to the leases that did mint.
+                    ledger.event(s, now, "lease.refused", agent, agent=agent, integration=iid, permissions=refused,
+                                 reason=NOT_GRANTED, via=via)
                 s.commit()
                 detail = {"granted": [], "refused": refused, "waiting_for_approval": [a.name for a in gated],
                           "request_id": pending.id if pending else None}
@@ -733,7 +743,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             try:
                 minted = minter.mint(agent, iid, mint_spec, granted, seconds)
             except MintError as exc:
-                ledger.event(s, now, "lease.failed", agent, integration=iid, error=str(exc), via=via)
+                ledger.event(s, now, "lease.failed", agent, agent=agent, integration=iid,
+                             permissions=[a.name for a in granted], reason=str(exc), error=str(exc), via=via)
                 s.commit()
                 raise HTTPException(502, f"no lease: {exc}") from exc
             expires = datetime.fromtimestamp(minted.expires_at, tz=UTC)
@@ -808,6 +819,28 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                 "permissions": r.permissions, "task": r.task, "minter": r.minter, "via": r.via,
                                 "issued_at": r.issued_at.isoformat(), "expires_at": r.expires_at.isoformat()}
                                for r in rows]}
+
+    @app.get("/events")
+    def list_events(_: Console, since: datetime | None = None, until: datetime | None = None,
+                    kind: Annotated[list[str] | None, Query()] = None, agent: str | None = None,
+                    limit: int = Query(default=200, ge=1, le=1000)):
+        """The ledger's events, newest first, for the room's audit: `kind` repeats or takes a
+        comma list; `agent` reads `detail.agent`, which every lease.refused and lease.failed
+        row carries; `until` is exclusive. A row is id, at, kind, actor, detail."""
+        kinds = [k for raw in (kind or []) for k in raw.split(",") if k.strip()]
+        with ledger.session() as s:
+            q = select(Event)
+            if kinds:
+                q = q.where(Event.kind.in_([k.strip() for k in kinds]))
+            if agent:
+                q = q.where(Event.detail["agent"].as_string() == agent)
+            if since:
+                q = q.where(Event.at >= since.replace(tzinfo=None))
+            if until:
+                q = q.where(Event.at < until.replace(tzinfo=None))
+            rows = s.scalars(q.order_by(Event.id.desc()).limit(limit))
+            return {"events": [{"id": r.id, "at": r.at.isoformat(), "kind": r.kind, "actor": r.actor,
+                                "detail": r.detail or {}} for r in rows]}
 
     @app.post("/check")
     def check(body: CheckBody, _: Console):
