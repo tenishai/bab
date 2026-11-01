@@ -240,7 +240,7 @@ def test_github_minter_narrows_an_installation_token_to_the_union(monkeypatch):
     out = m.probe()
     assert out == {"subject": "acme-room", "installation_id": "777", "account": "acme", "repositories": 3}
     assert gh.calls[-2][2] == {"permissions": {"metadata": "read"}}
-    assert gh.headers[-1]["Authorization"] == "Bearer ghs-3"
+    assert gh.headers[-1]["Authorization"] == "Bearer ghs-4"  # the fourth token the fake minted in this test
     assert m.probe("777")["account"] == "acme"
     with pytest.raises(MintError, match="not 778"):
         m.probe("778")
