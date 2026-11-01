@@ -8,7 +8,16 @@ def test_loads_example_profile():
     assert cat.resources == ("project", "cluster", "namespace")
     assert cat.action("pod_delete").tier == "mutate"
     assert cat.action("log_read").global_ is True
+    assert cat.action("log_read").label == ""  # no label: a console shows the name
     assert cat.action("nope") is None
+
+
+def test_an_action_may_carry_a_label():
+    cat = Catalogue.from_dict({"resources": ["room"], "actions": [
+        {"name": "github_pulls_review", "tier": "mutate", "vendor": "github", "label": "Review pull requests"},
+        {"name": "github_repos_read", "tier": "read", "vendor": "github", "label": None}]})
+    assert cat.action("github_pulls_review").label == "Review pull requests"
+    assert cat.action("github_repos_read").label == ""
 
 
 @pytest.mark.parametrize("raw,msg", [

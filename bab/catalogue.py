@@ -39,6 +39,7 @@ class Action:
     group: str = ""  # display grouping in a console (the vendor's own section), never a relation
     vendor: str = ""  # which integration family this permission belongs to (aws, datadog, github)
     extra: dict = field(default_factory=dict)  # minter data (e.g. aws: {"iam": ["ec2:Describe*"]})
+    label: str = ""  # a short display name for a console ("Review pull requests"); "" = show the name
 
     @property
     def gated(self) -> str:
@@ -125,7 +126,7 @@ class Catalogue:
                 raise CatalogueError(f"action {name!r}: extra must be a mapping")
             actions.append(Action(name, tier, entry.get("description", ""), bool(entry.get("global")),
                                   str(entry.get("group", "") or ""), str(entry.get("vendor", "") or ""),
-                                  dict(extra)))
+                                  dict(extra), str(entry.get("label", "") or "")))
         names = [a.name for a in actions]
         if len(set(names)) != len(names):
             raise CatalogueError("duplicate action name")

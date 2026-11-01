@@ -209,8 +209,10 @@ def test_github_minter_narrows_an_installation_token_to_the_union(monkeypatch):
     assert "abc" not in repr(m.config())
     # Union with write winning per permission; nothing named is nothing.
     perms = [cat.action("github_repos_read"), cat.action("github_pulls_write")]
-    assert gh_permissions(perms) == {"contents": "write", "issues": "read", "metadata": "read", "pull_requests": "write"}
-    assert gh_permissions([cat.action("github_actions_read")]) == {"actions": "read", "checks": "read", "metadata": "read"}
+    assert gh_permissions(perms) == {"actions": "read", "checks": "read", "contents": "write", "issues": "read",
+                                     "metadata": "read", "pull_requests": "write"}
+    assert gh_permissions([cat.action("github_pulls_review")])["pull_requests"] == "write"
+    assert gh_permissions([cat.action("github_pulls_review")])["contents"] == "read"
     assert gh_permissions([]) == {}
     out = m.mint("sherlock", "github", {"repositories": ["infra", "web"]}, perms, 7200)
     method, url, body = gh.calls[0]
@@ -249,7 +251,7 @@ def test_github_minter_reports_githubs_sentence_never_the_key_or_token(monkeypat
     m = GitHubMinter.from_env({"GITHUB_APP_ID": "4242", "GITHUB_APP_INSTALLATION_ID": "777", "GITHUB_APP_PRIVATE_KEY": "pem-secret"},
                               http=FakeGitHub(refuse="The permissions requested are not granted to this installation."))
     with pytest.raises(MintError) as exc:
-        m.mint("sherlock", "github", {}, [cat.action("github_repos_delete")], 3600)
+        m.mint("sherlock", "github", {}, [cat.action("github_pulls_write")], 3600)
     assert "HTTP 422 The permissions requested are not granted to this installation." in str(exc.value)
     assert "pem-secret" not in str(exc.value) and "app-jwt" not in str(exc.value)
     with pytest.raises(NotConfigured, match="not configured"):
@@ -297,10 +299,21 @@ def test_github_minter_signs_a_real_app_jwt():
     assert claims == {"iat": 1_800_000_000 - 60, "exp": 1_800_000_000 + 540, "iss": "4242"}
 
 
-def test_every_github_permission_names_its_app_permissions():
+def test_github_is_three_nested_levels_with_labels():
+    """Read < Review < Open: each level's app permissions are a superset of the one before, the
+    two mutate rows are the only writes, and every row carries a label for the console."""
     cat = catalogue.load("catalogues/room.yaml")
-    perms = {a.name: a.extra.get("permissions") for a in cat.for_vendor("github")}
+    rows = {a.name: a for a in cat.for_vendor("github")}
+    assert list(rows) == ["github_repos_read", "github_pulls_review", "github_pulls_write"]
+    perms = {n: a.extra.get("permissions") for n, a in rows.items()}
     assert all(perms.values()), perms
     assert all("metadata" in p for p in perms.values()), "every token must be able to read repository metadata"
     writes = {n for n, p in perms.items() if any(v != "read" for v in p.values())}
-    assert writes == {"github_pulls_write", "github_repos_delete"}
+    assert writes == {"github_pulls_review", "github_pulls_write"}
+    assert perms["github_repos_read"] == {"metadata": "read", "contents": "read", "issues": "read", "pull_requests": "read",
+                                          "checks": "read", "actions": "read"}
+    assert perms["github_pulls_review"] == {**perms["github_repos_read"], "pull_requests": "write"}
+    assert perms["github_pulls_write"] == {**perms["github_pulls_review"], "contents": "write"}
+    assert [(a.tier, a.group, a.label) for a in rows.values()] == [
+        ("read", "Repositories", "Read"), ("mutate", "Pull requests", "Review pull requests"),
+        ("mutate", "Pull requests", "Open pull requests")]

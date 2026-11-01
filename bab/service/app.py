@@ -304,7 +304,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         groups: dict[str, list] = {}
         for a in cat.for_vendor(vendor):
             groups.setdefault(a.group or "General", []).append(
-                {"name": a.name, "tier": a.tier, "description": a.description})
+                {"name": a.name, "tier": a.tier, "label": a.label or None, "description": a.description})
         if not groups:
             raise HTTPException(404, f"the catalogue has no permissions for {vendor!r}")
         v = cat.vendor(vendor)
@@ -317,18 +317,23 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def put_integration(integration: str, body: IntegrationBody, caller: Console):
         """Connect (or re-describe) an integration and set its ceiling: the most any agent may hold there.
         An `agents` integration is the room's own fact (which agents exist), like the topology: the console
-        token is the authority and any actor may write it; every other vendor takes a reviewer."""
+        token is the authority and any actor may write it; every other vendor takes a reviewer.
+        A `parent` hangs this row under an organization (a cloud account under its hub) or under a
+        service connection (a repository set under the GitHub connection), one level deep: the parent
+        must be the same vendor and must not have a parent of its own."""
         if body.vendor != AGENTS_VENDOR:
             reviewer(caller)
         acts = permissions_or_422(body.ceiling, body.vendor)
         now = settings.now()
         with ledger.session() as s:
             if body.parent:
-                parent = s.get(Integration, body.parent)
-                if parent is None or parent.vendor != body.vendor or parent.kind != "org":
-                    raise HTTPException(422, f"{body.parent!r} is not a connected {body.vendor} organization")
                 if body.parent == integration:
                     raise HTTPException(422, "an integration cannot be its own parent")
+                parent = s.get(Integration, body.parent)
+                if parent is not None and parent.parent:
+                    raise HTTPException(422, f"{body.parent!r} is itself under {parent.parent!r}; an integration hangs one level deep")
+                if parent is None or parent.vendor != body.vendor or parent.kind not in ("org", "connection"):
+                    raise HTTPException(422, f"{body.parent!r} is not a connected {body.vendor} organization or service connection")
             row = s.get(Integration, integration)
             if row is None:
                 row = Integration(id=integration, vendor=body.vendor, created_at=now)
@@ -500,7 +505,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             row = integration_or_404(s, integration)
             children = list(s.scalars(select(Integration.id).where(Integration.parent == integration)))
             if children:
-                raise HTTPException(409, f"{integration!r} still has accounts under it: {', '.join(children)}; disconnect those first")
+                what = "accounts" if row.kind == "org" else "integrations"
+                raise HTTPException(409, f"{integration!r} still has {what} under it: {', '.join(children)}; disconnect those first")
             revoked = 0
             for g in ledger.active_grants_on(s, integration):
                 g.revoked_at, g.revoked_by = now, caller.actor
@@ -518,13 +524,17 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
     @app.get("/integrations")
     def list_integrations(caller: Console):
-        """Every connected integration and its ceiling: what a picker may offer."""
+        """Every connected integration and its ceiling: what a picker may offer. A child row (an
+        account under its organization, a repository set under its connection) names its `parent`
+        and is kind `account`; a console lists it under that parent."""
         with ledger.session() as s:
             rows = list(s.scalars(select(Integration).order_by(Integration.id)))
         return {"integrations": [{"integration": r.id, "vendor": r.vendor, "ceiling": list(r.ceiling),
                                   "kind": r.kind, "parent": r.parent,
                                   "name": str((r.spec or {}).get("name") or r.id),
                                   "account_id": (r.spec or {}).get("account_id"),
+                                  # A service child's repository set, so a console can show what it narrows to.
+                                  "repositories": list((r.spec or {}).get("repositories") or []) or None,
                                   # An organization's hub ARN is not a secret; a console needs it to
                                   # render the trust a member account's role must carry.
                                   "hub_role_arn": (r.spec or {}).get("hub_role_arn") if r.kind == "org" else None,
@@ -663,29 +673,35 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 raise HTTPException(409, "talking is granted, not leased: the switchboard reads the grant")
             if integ.kind == "org":
                 raise HTTPException(409, f"{body.integration!r} is an organization; a lease is for one of its accounts")
+            integ = resolve_child(s, agent, integ)
+            iid = integ.id
             minter = minters.get(integ.vendor)
             if minter is None:
                 raise HTTPException(501, f"bab cannot mint for {integ.vendor!r} yet")
             mint_spec = dict(integ.spec or {})
             if integ.parent:
                 parent = s.get(Integration, integ.parent)
-                if parent is not None:
+                if parent is not None and parent.kind == "org":
                     # The organization's external id is every spoke's unless the account was
                     # connected with one of its own (the per-account shape, kept working).
                     mint_spec = {"hub_role_arn": parent.spec.get("hub_role_arn"), "audience": parent.spec.get("audience"),
                                  "external_id": parent.spec.get("external_id"),
                                  **{k: v for k, v in mint_spec.items() if v is not None}}
+                elif parent is not None:
+                    # A child of a service connection: the connection's spec, narrowed by the child's own
+                    # (its `repositories`); the minter's credentials come from bab's mounted Secret either way.
+                    mint_spec = {**dict(parent.spec or {}), **{k: v for k, v in mint_spec.items() if v is not None}}
             wanted = permissions_or_422(body.permissions, integ.vendor) if body.permissions else [
-                cat.action(g.permission) for g in ledger.active_grants(s, agent, body.integration)
+                cat.action(g.permission) for g in ledger.active_grants(s, agent, iid)
                 if cat.action(g.permission) and not g.gated]
             if not wanted:
-                raise HTTPException(403, f"{agent} holds nothing on {body.integration}")
+                raise HTTPException(403, f"{agent} holds nothing on {iid}")
             granted, gated, refused = [], [], []
             try:
                 for a in wanted:
-                    if store.check(f"agent:{agent}", a.name, obj(body.integration), context):
+                    if store.check(f"agent:{agent}", a.name, obj(iid), context):
                         granted.append(a)
-                    elif store.check(f"agent:{agent}", a.gated, obj(body.integration), context):
+                    elif store.check(f"agent:{agent}", a.gated, obj(iid), context):
                         gated.append(a)
                     else:
                         refused.append(a.name)
@@ -693,7 +709,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 raise HTTPException(503, f"no lease: the store cannot answer ({exc})") from exc
             pending = None
             if gated:
-                pending = Request(agent=agent, integration=body.integration, permissions=[a.name for a in gated],
+                pending = Request(agent=agent, integration=iid, permissions=[a.name for a in gated],
                                   requested_by=f"agent:{agent}", note=body.task, kind="lease", created_at=now)
                 s.add(pending)
             if not granted:
@@ -702,36 +718,56 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                           "request_id": pending.id if pending else None}
                 raise HTTPException(202 if gated else 403, detail)
             seconds = min(cat.tier(a.tier).lease_seconds for a in granted)
-            key = (agent, body.integration, tuple(sorted(a.name for a in granted)))
+            key = (agent, iid, tuple(sorted(a.name for a in granted)))
+            resolved = {"resolved_from": body.integration} if iid != body.integration else {}
             held = live.get(key)
             if held and held[2] - now.timestamp() > LIVE_MARGIN_S:
                 lease_id, credential, expires_ts, note = held
                 if pending is not None:
                     s.commit()
-                return {"lease_id": lease_id, "integration": body.integration, "vendor": integ.vendor,
+                return {"lease_id": lease_id, "integration": iid, "vendor": integ.vendor, **resolved,
                         "granted": list(key[2]), "refused": refused,
                         "waiting_for_approval": [a.name for a in gated], "request_id": pending.id if pending else None,
                         "credential": credential, "expires_at": rfc3339(datetime.fromtimestamp(expires_ts, tz=UTC)),
                         "note": note, "reused": True}
             try:
-                minted = minter.mint(agent, body.integration, mint_spec, granted, seconds)
+                minted = minter.mint(agent, iid, mint_spec, granted, seconds)
             except MintError as exc:
-                ledger.event(s, now, "lease.failed", agent, integration=body.integration, error=str(exc), via=via)
+                ledger.event(s, now, "lease.failed", agent, integration=iid, error=str(exc), via=via)
                 s.commit()
                 raise HTTPException(502, f"no lease: {exc}") from exc
             expires = datetime.fromtimestamp(minted.expires_at, tz=UTC)
-            lease = Lease(agent=agent, integration=body.integration, permissions=[a.name for a in granted],
+            lease = Lease(agent=agent, integration=iid, permissions=[a.name for a in granted],
                           task=body.task, minter=integ.vendor, issued_at=now, expires_at=expires, handle=minted.handle,
                           via=via)
             s.add(lease)
             s.commit()
             live[key] = (lease.id, minted.credential, minted.expires_at, minted.note)
-            log.info("lease %s -> %s on %s (%d permissions, %ds%s)", lease.id, agent, body.integration,
-                     len(granted), seconds, f", via {via}" if via else "")
-            return {"lease_id": lease.id, "integration": body.integration, "vendor": integ.vendor,
+            log.info("lease %s -> %s on %s (%d permissions, %ds%s%s)", lease.id, agent, iid,
+                     len(granted), seconds, f", via {via}" if via else "",
+                     f", asked for {body.integration}" if resolved else "")
+            return {"lease_id": lease.id, "integration": iid, "vendor": integ.vendor, **resolved,
                     "granted": [a.name for a in granted], "refused": refused,
                     "waiting_for_approval": [a.name for a in gated], "request_id": pending.id if pending else None,
                     "credential": minted.credential, "expires_at": rfc3339(expires), "note": minted.note, "reused": False}
+
+    def resolve_child(s, agent: str, integ: Integration) -> Integration:
+        """A lease asked for by the parent's name (the gateway asks for "github") lands on the one
+        child the agent holds a grant on (its repository set, "github-<agent>"), when the agent holds
+        nothing on the parent itself. Two or more such children: the agent must name one. None: the
+        parent is leased as asked, and the grant check says what it says. Organizations never reach
+        here (a lease on one is refused above); this is the service-connection shape."""
+        if integ.kind != "connection" or ledger.active_grants(s, agent, integ.id):
+            return integ
+        children = list(s.scalars(select(Integration).where(Integration.parent == integ.id).order_by(Integration.id)))
+        held = [c for c in children if ledger.active_grants(s, agent, c.id)]
+        if not held:
+            return integ
+        if len(held) > 1:
+            names = ", ".join(c.id for c in held)
+            raise HTTPException(409, f"{agent} holds {integ.id} on more than one of its integrations ({names}); ask for one by name")
+        log.info("lease for %s on %s resolved to %s (the one child %s holds a grant on)", agent, integ.id, held[0].id, agent)
+        return held[0]
 
     @app.post("/leases")
     def post_lease(body: LeaseBody, caller: Agent):

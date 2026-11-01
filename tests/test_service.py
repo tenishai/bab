@@ -497,3 +497,116 @@ def test_the_gateway_lane_is_closed_until_a_gateway_is_named(pods):
     c, _ = pods
     r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "aws-prod"}, headers={"Authorization": "Bearer ledger-pod"})
     assert r.status_code == 501 and "BAB_GATEWAY_SERVICE_ACCOUNT" in r.text
+
+
+def test_the_github_catalogue_is_three_labelled_levels(world):
+    """GET /catalogue/github carries a `label` on every permission; a vendor without labels gets null."""
+    c, _, _, _ = world
+    tree = c.get("/catalogue/github", headers=OWNER).json()
+    assert [g["name"] for g in tree["groups"]] == ["Repositories", "Pull requests"]
+    assert tree["groups"][0]["permissions"] == [
+        {"name": "github_repos_read", "tier": "read", "label": "Read",
+         "description": "Read code, issues, pull requests, checks and workflow runs"}]
+    assert [(p["name"], p["label"]) for p in tree["groups"][1]["permissions"]] == [
+        ("github_pulls_review", "Review pull requests"), ("github_pulls_write", "Open pull requests")]
+    aws = c.get("/catalogue/aws", headers=OWNER).json()
+    assert all(p["label"] is None for g in aws["groups"] for p in g["permissions"])
+    assert c.get("/catalogue", headers=OWNER).json()["vendors"][5]["permissions"] == {"read": 1, "mutate": 2}
+
+
+def test_a_child_may_hang_under_a_service_connection_one_level_deep(world):
+    c, _, _, _ = world
+    r = c.put("/integrations/github", json={"vendor": "github", "spec": {"name": "github", "installation_id": "777"},
+                                           "ceiling": ["github_repos_read", "github_pulls_write"]}, headers=ADMIN)
+    assert r.status_code == 200 and r.json()["kind"] == "connection"
+    # A repository set under the connection: kind account, parent the connection.
+    r = c.put("/integrations/github-ledger", json={"vendor": "github", "parent": "github", "ceiling": ["github_pulls_write"],
+                                                  "spec": {"name": "github-ledger", "repositories": ["acme-infra"]}}, headers=ADMIN)
+    assert r.status_code == 200, r.text
+    assert (r.json()["kind"], r.json()["parent"]) == ("account", "github")
+    rows = {r["integration"]: r for r in c.get("/integrations", headers=OWNER).json()["integrations"]}
+    assert rows["github"]["kind"] == "connection" and rows["github"]["parent"] is None and rows["github"]["repositories"] is None
+    assert rows["github-ledger"]["parent"] == "github" and rows["github-ledger"]["repositories"] == ["acme-infra"]
+    # One level deep: a parent that itself has a parent is refused; so is a parent of another vendor.
+    r = c.put("/integrations/github-deeper", json={"vendor": "github", "parent": "github-ledger", "spec": {}}, headers=ADMIN)
+    assert r.status_code == 422 and "one level deep" in r.json()["detail"]
+    connect(c, ["aws_inventory_read"])
+    r = c.put("/integrations/github-x", json={"vendor": "github", "parent": "aws-prod", "spec": {}}, headers=ADMIN)
+    assert r.status_code == 422 and "not a connected github" in r.json()["detail"]
+    # The connection cannot go while a child hangs under it.
+    r = c.delete("/integrations/github", headers=ADMIN)
+    assert r.status_code == 409 and "github-ledger" in r.json()["detail"]
+    assert c.delete("/integrations/github-ledger", headers=ADMIN).json()["removed"] == "github-ledger"
+    assert c.delete("/integrations/github", headers=ADMIN).json()["removed"] == "github"
+
+
+@pytest.fixture
+def repos():
+    """A room with a GitHub connection and a tool gateway: the gateway asks for "github", an
+    agent's grant lives on its own repository set under it."""
+    clock = {"now": T0}
+    store = FakeStore({Tuple("user:kyle@example.com", "member", "team:admins")})
+    cat = catalogue.load("catalogues/room.yaml")
+    gh = StaticMinter(now=lambda: clock["now"].timestamp())
+    verifier = PodVerifier({"ledger-pod": ("agent-ledger", "ledger"), "gateway-pod": ("tool-gateway", "gateway")})
+    ledger = Ledger()
+    app = create_app(store, cat, ledger, verifier, ConsoleAuth("console-secret"), {"github": gh},
+                     Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"],
+                              gateway_service_account="gateway/tool-gateway"))
+    c = TestClient(app)
+    c.put("/topology", json={"agents": [{"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"},
+                                        {"name": "watson", "team": "sre", "namespace": "watson", "service_account": "agent-watson"}]},
+          headers=ADMIN)
+    assert c.put("/integrations/github", json={"vendor": "github", "spec": {"name": "github", "installation_id": "777"},
+                                              "ceiling": ["github_repos_read", "github_pulls_review", "github_pulls_write"]},
+                 headers=ADMIN).status_code == 200
+    for child, repo in (("github-ledger", "acme-infra"), ("github-ledger-web", "acme-web")):
+        assert c.put(f"/integrations/{child}", json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read", "github_pulls_review"],
+                                                    "spec": {"name": child, "repositories": [repo]}}, headers=ADMIN).status_code == 200
+    return c, gh
+
+
+def test_a_lease_on_the_connection_lands_on_the_one_child_the_agent_holds(repos):
+    c, gh = repos
+    # No grant anywhere: the existing 403, one sentence for the gateway.
+    r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github"}, headers=GATEWAY)
+    assert r.status_code == 403 and r.json()["detail"] == "ledger holds nothing on github"
+    assert c.post("/leases", json={"integration": "github"}, headers={"Authorization": "Bearer ledger-pod"}).status_code == 403
+    # One child granted: the gateway asks for "github" and leases github-ledger, narrowed to its repositories.
+    grant(c, "ledger", "github-ledger", ["github_repos_read", "github_pulls_review"])
+    r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github", "task": "review #12"}, headers=GATEWAY)
+    assert r.status_code == 200, r.text
+    lease = r.json()
+    assert (lease["integration"], lease["resolved_from"], lease["vendor"]) == ("github-ledger", "github", "github")
+    assert sorted(lease["granted"]) == ["github_pulls_review", "github_repos_read"]
+    assert gh.minted[-1] == {"agent": "ledger", "integration": "github-ledger",
+                             "spec": {"name": "github-ledger", "installation_id": "777", "repositories": ["acme-infra"]}}
+    (row,) = c.get("/leases", headers=OWNER).json()["leases"]
+    assert (row["integration"], row["via"]) == ("github-ledger", "gateway")
+    # The agent's own path resolves the same way and shares the live credential.
+    again = c.post("/leases", json={"integration": "github"}, headers={"Authorization": "Bearer ledger-pod"}).json()
+    assert again["reused"] is True and again["integration"] == "github-ledger" and again["resolved_from"] == "github"
+    # Named permissions are checked against the child; one it does not hold there is refused by name.
+    r = c.post("/leases", json={"integration": "github", "permissions": ["github_repos_read", "github_pulls_write"]},
+               headers={"Authorization": "Bearer ledger-pod"})
+    assert r.status_code == 200 and r.json()["refused"] == ["github_pulls_write"] and "resolved_from" in r.json()
+    # Asked for by its own name, the child leases as always, with no resolution to report.
+    direct = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github-ledger"}, headers=GATEWAY).json()
+    assert direct["integration"] == "github-ledger" and "resolved_from" not in direct
+    # Two children granted: the agent must say which; the sentence names them.
+    grant(c, "ledger", "github-ledger-web", ["github_repos_read"])
+    r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github"}, headers=GATEWAY)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == ("ledger holds github on more than one of its integrations (github-ledger, github-ledger-web); "
+                                  "ask for one by name")
+    assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github-ledger-web"}, headers=GATEWAY).json()["granted"] == ["github_repos_read"]
+    assert gh.minted[-1]["spec"]["repositories"] == ["acme-web"]
+    # A grant on the connection itself wins: no resolution, the connection's own spec (no repositories).
+    grant(c, "watson", "github", ["github_repos_read"])
+    r = c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY).json()
+    assert r["integration"] == "github" and "resolved_from" not in r and "repositories" not in gh.minted[-1]["spec"]
+    # Revoking the one child's grants takes the resolution with it.
+    for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"]:
+        if g["integration"] == "github-ledger-web":
+            c.delete(f"/grants/{g['id']}", headers=ADMIN)
+    assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github"}, headers=GATEWAY).json()["integration"] == "github-ledger"
