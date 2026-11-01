@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-11-01
+
 Google Cloud, the way the room's cloud-access design describes it: bab's own identity is
 granted, a lease is a token for it (kobo `docs/superpowers/specs/2026-10-25-cloud-access-design.md`,
 "GCP, the way Wiz does it").
