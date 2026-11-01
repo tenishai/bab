@@ -149,6 +149,8 @@ actions:
   - {name: gcp_dataflow_read, tier: read, vendor: gcp, group: Analytics, description: "Dataflow jobs", extra: {roles: ["roles/dataflow.viewer"]}}
   - {name: gcp_resourcemanager_read, tier: read, vendor: gcp, group: Management, description: "Projects, folders and enabled services", extra: {roles: ["roles/browser", "roles/serviceusage.serviceUsageViewer"]}}
   - {name: gcp_billing_read, tier: read, vendor: gcp, group: Billing, description: "Billing accounts and budgets", extra: {roles: ["roles/billing.viewer"]}}
+  # A project that also serves models: the one non-viewer role in the pack, so an agent may call them.
+  - {name: gcp_vertex_ai_user, tier: read, vendor: gcp, group: AI, label: "Use Vertex AI models", description: "Vertex AI: call the models and endpoints the project serves", extra: {roles: ["roles/aiplatform.user"]}}
 
   # ---- azure: one read permission per area (a built-in role the minter assigns for the lease) ----
   - {name: azure_resources_read, tier: read, vendor: azure, group: Management, description: "Everything in the subscription, read-only (Reader)", extra: {roles: ["Reader"]}}

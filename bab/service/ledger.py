@@ -37,14 +37,15 @@ class Integration(Base):
 
     @property
     def kind(self) -> str:
-        """`org` (holds a hub role), `account` (a cloud account under an org or flat, or any child of a
-        connection), or `connection` (a service connected once, with no parent)."""
+        """`org` (holds an AWS hub role, or names a Google Cloud folder or organization as
+        `parent_resource`), `account` (a cloud account or project under an org or flat, or any
+        child of a connection), or `connection` (a service connected once, with no parent)."""
         if self.parent:
             return "account"
         spec = self.spec or {}
-        if spec.get("hub_role_arn"):
+        if spec.get("hub_role_arn") or spec.get("parent_resource"):
             return "org"
-        if spec.get("role_arn") or spec.get("spoke_role_arn"):
+        if spec.get("role_arn") or spec.get("spoke_role_arn") or spec.get("project"):
             return "account"
         return "connection"
 

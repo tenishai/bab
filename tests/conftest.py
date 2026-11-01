@@ -125,3 +125,72 @@ class FakeGitHub:
         if method == "GET" and path.startswith("installation/repositories"):
             return 200, {"total_count": 3}
         return 405, {"message": "method"}
+
+
+def fake_jwt(claims: dict) -> str:
+    """An unsigned JWT with these claims: what the metadata server's identity endpoint answers."""
+    import base64
+    import json
+
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+    return f"{b64({'alg': 'RS256', 'typ': 'JWT'})}.{b64(claims)}.sig"
+
+
+BAB_EMAIL = "bab-access@example-project.iam.gserviceaccount.com"
+
+
+class FakeGoogle:
+    """The metadata server, the IAM Credentials API and Resource Manager as the GcpMinter's
+    `http` function: bab's own token and identity, impersonation that echoes the account it
+    was asked for, projects bab may or may not read, a folder's projects over two pages."""
+
+    def __init__(self, forbidden: tuple[str, ...] = ("locked-project",), refuse_impersonation: str | None = None,
+                 vertex_forbidden: tuple[str, ...] = ("europe-west9",)):
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.headers: list[dict] = []
+        self.forbidden = set(forbidden)
+        self.vertex_forbidden = set(vertex_forbidden)
+        self.refuse_impersonation = refuse_impersonation
+        self.n = 0
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append((method, url, body))
+        self.headers.append(dict(headers))
+        if url.startswith("http://metadata.google.internal/"):
+            if headers.get("Metadata-Flavor") != "Google":
+                return 403, {}
+            path = url.split("/service-accounts/default/", 1)[1]
+            if path.startswith("token"):
+                self.n += 1
+                return 200, {"access_token": f"own-{self.n}", "expires_in": 1800, "token_type": "Bearer"}
+            if path.startswith("identity"):
+                aud = url.split("audience=")[1].split("&")[0]
+                return 200, {"text": fake_jwt({"sub": "1122334455", "email": BAB_EMAIL, "aud": aud, "iss": "https://accounts.google.com"})}
+            if path.startswith("?recursive=true"):
+                return 200, {"aliases": ["default"], "email": BAB_EMAIL, "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}
+            return 404, {}
+        if ":generateAccessToken" in url:
+            if self.refuse_impersonation:
+                return 403, {"error": {"code": 403, "message": self.refuse_impersonation, "status": "PERMISSION_DENIED"}}
+            sa = url.rsplit("/serviceAccounts/", 1)[1].split(":")[0]
+            self.n += 1
+            return 200, {"accessToken": f"imp-{self.n}-{sa}", "expireTime": "2026-11-01T13:00:00.123456Z"}
+        if "aiplatform.googleapis.com/v1/projects/" in url and "/publishers/google/models" in url:
+            location = url.split("/locations/")[1].split("/")[0]
+            if location in self.vertex_forbidden:
+                return 403, {"error": {"code": 403, "message": "Permission 'aiplatform.endpoints.predict' denied", "status": "PERMISSION_DENIED"}}
+            return 200, {"publisherModels": [{"name": f"publishers/google/models/gemini@{location}"}]}
+        if "/v1/projects/" in url:
+            pid = url.rsplit("/", 1)[1]
+            if pid in self.forbidden:
+                return 403, {"error": {"code": 403, "message": "The caller does not have permission", "status": "PERMISSION_DENIED"}}
+            return 200, {"projectId": pid, "projectNumber": "123456789012", "name": pid, "lifecycleState": "ACTIVE"}
+        if "/v3/projects?parent=" in url:
+            parent = url.split("parent=")[1].split("&")[0]
+            if "pageToken=" in url:
+                return 200, {"projects": [{"projectId": "old-project", "displayName": "Old", "state": "DELETE_REQUESTED", "parent": parent},
+                                          {"projectId": "locked-project", "displayName": "Locked", "state": "ACTIVE", "parent": parent}]}
+            return 200, {"projects": [{"projectId": "example-project", "displayName": "Example", "state": "ACTIVE", "parent": parent}],
+                         "nextPageToken": "page-2"}
+        return 405, {}

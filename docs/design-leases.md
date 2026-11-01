@@ -169,7 +169,7 @@ principal the vendor trusts.
 | family | how bab mints | scoped to the granted set by | max life |
 |---|---|---|---|
 | AWS | `AssumeRoleWithWebIdentity` into the account's `KoboAccess-Role`, trust = bab's own cloud identity, `RoleSessionName=bab-<agent>` (that API takes no SourceIdentity) | a session policy built from the granted permissions | 1 h (role max) |
-| Google Cloud | `generateAccessToken` on the connection's service account | bab's check only; the token carries the connection's role (no session policy on this cloud) | 1 h |
+| Google Cloud (built, 0.4.15) | an access token for bab's own service account from the metadata server (the admin grants it the role pack on the project, folder or organization: no federation step), or `generateAccessToken` on the connection's `service_account` when one is named | bab's check only; the token carries the identity's roles (no session policy on this cloud), and the lease note says so | 1 h, or the metadata token's own expiry when shorter |
 | Azure | workload identity federation client assertion | bab's check only | about 1 h |
 | GitHub | App installation token | `permissions` and `repositories` narrowing on the token request | 1 h |
 | Datadog | create a **scoped application key** per lease, delete it at expiry | the key's own `scopes` | bab deletes it |
@@ -186,7 +186,8 @@ expires; the lease length is the revocation, with AWS's issue-time deny as
 the emergency lever (`Revoke now` in the console). And where the cloud has
 no per-session narrowing (Google Cloud, Azure), the granted set is enforced
 by bab's verdict before minting, not by the vendor during the hour. The
-console says which of the two applies to each integration.
+console says which of the two applies to each integration; the Google Cloud
+minter puts it in every lease's `note` so the console need not know.
 
 ### Datadog: a lease is an application key
 

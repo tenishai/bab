@@ -6,6 +6,7 @@ person) asks, decides, revokes and reads. bab decides; nothing here trusts the
 caller's claim about what it holds.
 """
 
+import inspect
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +23,7 @@ from bab.catalogue import Catalogue
 from bab.door import Door, Verdict, rfc3339
 from bab.service.identity import Caller, ConsoleAuth, IdentityError
 from bab.service.ledger import AgentRow, Event, GrantRow, Integration, Lease, Ledger, Request
-from bab.service.minters import Minter, MintError, NotConfigured
+from bab.service.minters import Minter, MintError, NotConfigured, Unreachable
 from bab.store import Store, StoreError, Tuple
 from bab.sync import reconcile, topology
 
@@ -35,6 +36,35 @@ AGENTS_VENDOR = "agents"
 A2A_ASK = "a2a_ask"
 NO_BORROWING = "a credential is never borrowed for another agent's task"
 NOT_GRANTED = "not granted"
+
+
+def accepted(fn: Callable, given: dict, what: str) -> dict:
+    """The keyword arguments `fn` accepts, taken from `given` with the Nones dropped: how one
+    route hands every vendor's minter its own fields. A required one that is missing is a 422
+    naming it; a minter taking `**kwargs` gets everything."""
+    params = inspect.signature(fn).parameters
+    present = {k: v for k, v in given.items() if v is not None}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return present
+    out = {k: v for k, v in present.items() if k in params}
+    missing = [n for n, p in params.items() if p.default is inspect.Parameter.empty and n not in out
+               and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)]
+    if missing:
+        raise HTTPException(422, f"{what} needs {', '.join(missing)}")
+    return out
+
+
+def org_scope(spec: dict) -> dict:
+    """What an organization row hands its minter to list the accounts under it: AWS's hub role
+    (and audience), Google Cloud's folder or organization. The minter takes the ones it knows."""
+    return {"hub_role_arn": spec.get("hub_role_arn"), "audience": spec.get("audience"),
+            "parent": spec.get("parent_resource")}
+
+
+def child_key(spec: dict) -> str:
+    """What names a cloud account row among its organization's accounts: the AWS account id,
+    the Google Cloud project id."""
+    return str(spec.get("account_id") or spec.get("project") or "")
 
 
 @dataclass
@@ -94,6 +124,8 @@ class IntegrationBody(BaseModel):
 
 
 class ProbeBody(BaseModel):
+    """Every vendor's probe fields together; the route hands each minter the ones its `probe` accepts."""
+
     # AWS: the role to try. A service vendor (datadog) is configured on bab itself; the field
     # may then be omitted, or carry the account id a console was handed for bab to confirm.
     role_arn: str | None = Field(default=None, min_length=1, max_length=2048)
@@ -101,10 +133,24 @@ class ProbeBody(BaseModel):
     # Given: `role_arn` is a spoke, reached from this hub (with this external id).
     hub_role_arn: str | None = Field(default=None, max_length=2048)
     external_id: str | None = Field(default=None, max_length=1224)
+    # Google Cloud: the project to read with bab's own identity, or with `service_account`
+    # impersonated; `parent` (folders/<n> or organizations/<n>) instead asks whether bab can
+    # list its projects.
+    project: str | None = Field(default=None, min_length=1, max_length=64)
+    service_account: str | None = Field(default=None, min_length=1, max_length=256)
+    parent: str | None = Field(default=None, min_length=1, max_length=64)
+    # Google Cloud, a project that serves models: after the project answers, list Vertex AI's
+    # publisher models in this location with the same token. `vertex_url` is accepted so a
+    # console that sends it validates, and never fetched: the probe presents a token for bab's
+    # identity, so the URL is built by bab from the location and the project, not taken from a caller.
+    vertex_location: str | None = Field(default=None, min_length=1, max_length=32)
+    vertex_url: str | None = Field(default=None, max_length=512)
 
 
 class DiscoverBody(BaseModel):
-    # The spoke role's name, the same in every member account (one template, one StackSet).
+    # AWS: the spoke role's name, the same in every member account (one template, one StackSet).
+    # A Google Cloud organization has no role to look for; a project is connected when bab's
+    # own identity can read it, and this field is ignored.
     role_name: str = Field(default="KoboAccess-Role", min_length=1, max_length=64, pattern=r"^[\w+=,.@-]+$")
 
 
@@ -413,22 +459,27 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
     @app.post("/probe/{vendor}")
     def probe(vendor: str, body: ProbeBody, caller: Console):
-        """Try a connection before saving it: does the role's trust admit bab?"""
+        """Try a connection before saving it, the vendor's way: AWS assumes the role (does its
+        trust admit bab?), Google Cloud reads the project with bab's identity (is it granted
+        there?), a service vendor confirms its own configuration. The body carries every vendor's
+        fields; the minter is handed the ones its probe accepts."""
         reviewer(caller)
         minter = minters.get(vendor)
         if minter is None or not hasattr(minter, "probe"):
             raise HTTPException(501, f"bab cannot mint for {vendor!r} yet")
         try:
-            out = minter.probe(body.role_arn or "", body.audience or "sts.amazonaws.com",
-                               hub_role_arn=body.hub_role_arn, external_id=body.external_id)
+            out = minter.probe(**accepted(minter.probe, body.model_dump(), f"a probe for {vendor!r}"))
+        except Unreachable as exc:  # the connection admits bab; a surface behind it did not answer
+            raise HTTPException(502, str(exc)) from exc
         except MintError as exc:
             raise HTTPException(409, str(exc)) from exc
         return out
 
     @app.get("/integrations/{integration}/accounts")
     def org_accounts(integration: str, caller: Console):
-        """An organization's accounts as its hub sees them, each marked connected when a row
-        under this organization names it. What a console offers to connect next."""
+        """An organization's accounts as the vendor shows them to bab (AWS: through the hub
+        role; Google Cloud: the projects under the folder or organization), each marked
+        connected when a row under this organization names it. What a console offers next."""
         with ledger.session() as s:
             row = integration_or_404(s, integration)
             if row.kind != "org":
@@ -436,10 +487,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             minter = minters.get(row.vendor)
             if minter is None or not hasattr(minter, "list_accounts"):
                 raise HTTPException(501, f"bab cannot list accounts for {row.vendor!r}")
-            children = {str((c.spec or {}).get("account_id", "")): c.id
+            children = {child_key(c.spec or {}): c.id
                         for c in s.scalars(select(Integration).where(Integration.parent == integration))}
             try:
-                accounts = minter.list_accounts(str(row.spec.get("hub_role_arn")), str(row.spec.get("audience") or "sts.amazonaws.com"))
+                accounts = minter.list_accounts(**accepted(minter.list_accounts, org_scope(row.spec or {}),
+                                                           f"listing accounts for {row.vendor!r}"))
             except MintError as exc:
                 raise HTTPException(502, str(exc)) from exc
         return {"organization": integration,
@@ -447,42 +499,53 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
     @app.post("/integrations/{integration}/discover")
     def org_discover(integration: str, body: DiscoverBody, caller: Console):
-        """Which of an organization's accounts already carry the spoke role: every active
-        account the hub can see is probed through the hub with the organization's external
-        id (one id per organization, so one template deploys the role everywhere). What a
-        console registers next, without a person adding accounts one at a time."""
+        """Which of an organization's accounts bab can already reach, probed the vendor's way.
+        AWS: every active account the hub can see is probed through the hub for the spoke role
+        with the organization's external id (one id per organization, so one template deploys
+        the role everywhere). Google Cloud: every active project under the folder or organization
+        is read with bab's own identity; the ones granted the role pack answer. What a console
+        registers next, without a person adding accounts one at a time."""
         reviewer(caller)
         with ledger.session() as s:
             row = integration_or_404(s, integration)
             if row.kind != "org":
                 raise HTTPException(409, f"{integration!r} is not an organization")
-            spec = row.spec or {}
-            external_id = str(spec.get("external_id") or "")
-            if not external_id:
-                raise HTTPException(409, f"{integration!r} has no external id; connect it again from a console that sets one")
+            spec = dict(row.spec or {})
             minter = minters.get(row.vendor)
             if minter is None or not hasattr(minter, "list_accounts") or not hasattr(minter, "probe"):
                 raise HTTPException(501, f"bab cannot discover accounts for {row.vendor!r}")
-            hub = str(spec.get("hub_role_arn")); audience = str(spec.get("audience") or "sts.amazonaws.com")
-            children = {str((c.spec or {}).get("account_id", "")): c.id
+            hub = str(spec.get("hub_role_arn") or "")
+            external_id = str(spec.get("external_id") or "")
+            if hub and not external_id:
+                raise HTTPException(409, f"{integration!r} has no external id; connect it again from a console that sets one")
+            children = {child_key(c.spec or {}): c.id
                         for c in s.scalars(select(Integration).where(Integration.parent == integration))}
             try:
-                accounts = minter.list_accounts(hub, audience)
+                accounts = minter.list_accounts(**accepted(minter.list_accounts, org_scope(spec),
+                                                           f"listing accounts for {row.vendor!r}"))
             except MintError as exc:
                 raise HTTPException(502, str(exc)) from exc
             now = settings.now()
             ledger.event(s, now, "integration.discover", caller.actor, integration=integration, accounts=len(accounts))
             s.commit()
+        # The catalogue's noun for this cloud's unit (account, project, subscription) is the
+        # probe's keyword on every lane but AWS's hub-and-spoke one.
+        noun = cat.vendor(row.vendor).account or "account"
 
         def look(a: dict) -> dict:
-            arn = f"arn:aws:iam::{a['id']}:role/{body.role_name}"
-            out = {**a, "role_arn": arn, "integration": children.get(a["id"]), "connected": a["id"] in children,
+            out = {**a, "integration": children.get(a["id"]), "connected": a["id"] in children,
                    "reachable": None, "reason": None}
+            if hub:
+                out["role_arn"] = f"arn:aws:iam::{a['id']}:role/{body.role_name}"
+                ask = {"role_arn": out["role_arn"], "audience": spec.get("audience"), "hub_role_arn": hub,
+                       "external_id": external_id}
+            else:
+                ask = {noun: a["id"]}
             if a.get("status") not in (None, "ACTIVE"):
-                out["reason"] = f"account is {a.get('status')}"
+                out["reason"] = f"{noun} is {a.get('status')}"
                 return out
             try:
-                minter.probe(arn, audience, hub_role_arn=hub, external_id=external_id)
+                minter.probe(**accepted(minter.probe, ask, f"a probe for {row.vendor!r}"))
                 out["reachable"] = True
             except MintError as exc:
                 out["reachable"], out["reason"] = False, str(exc)
@@ -490,8 +553,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             looked = list(pool.map(look, accounts))
-        return {"organization": integration, "external_id": external_id, "role_name": body.role_name,
-                "accounts": looked}
+        lane = ({"external_id": external_id, "role_name": body.role_name} if hub
+                else {"parent": spec.get("parent_resource")})
+        return {"organization": integration, **lane, "accounts": looked}
 
     @app.delete("/integrations/{integration}")
     def delete_integration(integration: str, caller: Console):
@@ -534,6 +598,10 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                   "kind": r.kind, "parent": r.parent,
                                   "name": str((r.spec or {}).get("name") or r.id),
                                   "account_id": (r.spec or {}).get("account_id"),
+                                  # A Google Cloud project row names its project; an organization row its
+                                  # folder or organization, which a console shows next to the grant to make.
+                                  "project": (r.spec or {}).get("project"),
+                                  "parent_resource": (r.spec or {}).get("parent_resource") if r.kind == "org" else None,
                                   # A service child's repository set, so a console can show what it narrows to.
                                   "repositories": list((r.spec or {}).get("repositories") or []) or None,
                                   # An organization's hub ARN is not a secret; a console needs it to

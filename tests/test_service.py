@@ -240,6 +240,9 @@ def test_identity_probe_and_disconnect(world):
     arn = "arn:aws:iam::123456789012:role/KoboAccess-Role"
     assert c.post("/probe/aws", json={"role_arn": arn}, headers=OWNER).status_code == 403
     assert c.post("/probe/aws", json={"role_arn": arn}, headers=ADMIN).json()["account"] == "123456789012"
+    # The route hands the minter the fields its probe accepts; one it requires and did not get is a 422 naming it.
+    r = c.post("/probe/aws", json={"project": "example-project"}, headers=ADMIN)
+    assert r.status_code == 422 and r.json()["detail"] == "a probe for 'aws' needs role_arn"
     r = c.post("/probe/aws", json={"role_arn": "arn:aws:iam::123456789012:role/refuse-me"}, headers=ADMIN)
     assert r.status_code == 409 and "AccessDenied" in r.text
 
@@ -664,3 +667,85 @@ def test_events_read_newest_first_and_every_refusal_names_the_agent_and_integrat
     assert [r["detail"]["permissions"] for r in window] == [["aws_cost_read"]]
     assert len(c.get("/events?limit=2", headers=OWNER).json()["events"]) == 2
     assert c.get("/events?limit=5000", headers=OWNER).status_code == 422
+
+
+@pytest.fixture
+def google():
+    """The room with Google Cloud minting against a fake Google: AWS stays the static minter."""
+    from bab.service.minters import GcpMinter
+    from tests.conftest import FakeGoogle
+
+    clock = {"now": T0}
+    store = FakeStore({
+        Tuple("user:kyle@example.com", "member", "team:admins"),
+        Tuple("team:sre", "team", "agent:sherlock"),
+    })
+    cat = catalogue.load("catalogues/room.yaml")
+    fake = FakeGoogle()
+    app = create_app(store, cat, Ledger(), StaticVerifier({"sherlock-token": "sherlock"}), ConsoleAuth("console-secret"),
+                     {"aws": StaticMinter(now=lambda: clock["now"].timestamp()),
+                      "gcp": GcpMinter(http=fake, now=lambda: clock["now"].timestamp())},
+                     Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"]))
+    return TestClient(app), fake, clock
+
+
+def test_a_google_cloud_project_is_probed_connected_discovered_and_leased(google):
+    from tests.conftest import BAB_EMAIL
+
+    c, fake, clock = google
+    # Identity: the service account an admin grants the role pack to.
+    assert c.get("/identity/gcp", headers=OWNER).json() == {"subject": "1122334455", "email": BAB_EMAIL, "kind": "google_service_account"}
+    # Probe, the Google way: the project id, with bab's own identity or through a service account.
+    assert c.post("/probe/gcp", json={"project": "example-project"}, headers=OWNER).status_code == 403
+    out = c.post("/probe/gcp", json={"project": "example-project"}, headers=ADMIN).json()
+    assert out == {"project": "example-project", "project_number": "123456789012", "subject": BAB_EMAIL, "hops": 1}
+    sa = "reader@example-project.iam.gserviceaccount.com"
+    assert c.post("/probe/gcp", json={"project": "example-project", "service_account": sa}, headers=ADMIN).json()["hops"] == 2
+    r = c.post("/probe/gcp", json={"project": "locked-project"}, headers=ADMIN)
+    assert r.status_code == 409 and r.json()["detail"].startswith(f"{BAB_EMAIL} has no access on project locked-project")
+    assert c.post("/probe/gcp", json={"parent": "folders/123"}, headers=ADMIN).json()["projects"] == 2
+    # A project that serves models: `vertex_location` adds a Vertex check; a `vertex_url` the room sends is
+    # accepted and never fetched (the token goes only to the URL bab builds). Vertex refusing is a 502.
+    out = c.post("/probe/gcp", json={"project": "example-project", "vertex_location": "us-east5",
+                                     "vertex_url": "https://attacker.example/collect"}, headers=ADMIN).json()
+    assert out["vertex"] == {"location": "us-east5", "ok": True}
+    assert not any("attacker.example" in u for _, u, _ in fake.calls)
+    r = c.post("/probe/gcp", json={"project": "example-project", "vertex_location": "europe-west9"}, headers=ADMIN)
+    assert r.status_code == 502 and "cannot reach Vertex AI in europe-west9" in r.json()["detail"]
+    assert c.post("/probe/gcp", json={"role_arn": "arn:aws:iam::123456789012:role/x"}, headers=ADMIN).status_code == 409  # not a GCP field: ignored, nothing named
+    # An organization row names a folder or organization; its accounts are the active projects under it.
+    out = c.put("/integrations/example-org", json={"vendor": "gcp", "spec": {"parent_resource": "folders/123", "name": "example-org"}}, headers=ADMIN).json()
+    assert out["kind"] == "org"
+    accts = c.get("/integrations/example-org/accounts", headers=OWNER).json()
+    assert [(a["id"], a["status"], a["connected"]) for a in accts["accounts"]] == [("example-project", "ACTIVE", False), ("locked-project", "ACTIVE", False)]
+    # A project under it: kind account, no role to look for; discover marks the one bab can read.
+    out = c.put("/integrations/example-project", json={"vendor": "gcp", "parent": "example-org", "ceiling": ["gcp_compute_read", "gcp_vertex_ai_user"],
+                                                       "spec": {"project": "example-project", "name": "example-project"}}, headers=ADMIN).json()
+    assert out["kind"] == "account" and out["parent"] == "example-org"
+    rows = {r["integration"]: r for r in c.get("/integrations", headers=OWNER).json()["integrations"]}
+    assert rows["example-org"]["parent_resource"] == "folders/123" and rows["example-project"]["project"] == "example-project"
+    assert rows["example-project"]["parent_resource"] is None and rows["example-org"]["hub_role_arn"] is None
+    found = c.post("/integrations/example-org/discover", json={}, headers=ADMIN).json()
+    assert found["organization"] == "example-org" and found["parent"] == "folders/123" and "external_id" not in found
+    by_id = {a["id"]: a for a in found["accounts"]}
+    assert by_id["example-project"]["connected"] is True and by_id["example-project"]["reachable"] is True
+    assert by_id["locked-project"]["connected"] is False and by_id["locked-project"]["reachable"] is False
+    assert "has no access on project locked-project" in by_id["locked-project"]["reason"]
+    assert "role_arn" not in by_id["example-project"]
+    # A lease on the project is an access token for bab's own identity, capped at the token's own end.
+    rid = c.post("/requests", json={"agent": "sherlock", "integration": "example-project", "permissions": ["gcp_compute_read"]}, headers=OWNER).json()["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)
+    r = c.post("/leases", json={"integration": "example-project"}, headers=AGENT)
+    assert r.status_code == 200, r.text
+    lease = r.json()
+    assert lease["credential"]["gcp_project"] == "example-project" and lease["credential"]["gcp_access_token"].startswith("own-")
+    assert lease["note"] == "access token for bab's own identity; narrowing is bab's check only, the token carries the role pack"
+    assert lease["expires_at"] == "2026-10-27T12:30:00Z"  # the metadata token's 30 minutes, not the tier's hour
+    # A lease on the organization is refused, as for AWS; a project that names a service account impersonates it.
+    assert c.post("/leases", json={"integration": "example-org", "permissions": ["gcp_compute_read"]}, headers=AGENT).status_code == 409
+    c.put("/integrations/example-project", json={"vendor": "gcp", "parent": "example-org", "ceiling": ["gcp_compute_read"],
+                                                 "spec": {"project": "example-project", "service_account": sa, "name": "example-project"}}, headers=ADMIN)
+    clock["now"] = T0 + timedelta(hours=2)
+    lease = c.post("/leases", json={"integration": "example-project"}, headers=AGENT).json()
+    assert lease["credential"]["gcp_access_token"].startswith("imp-") and lease["note"].startswith(f"access token for {sa};")
+    assert fake.calls[-1][2] == {"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "3600s"}

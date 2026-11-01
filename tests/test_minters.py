@@ -322,3 +322,132 @@ def test_github_is_three_nested_levels_with_labels():
     assert [(a.tier, a.group, a.label) for a in rows.values()] == [
         ("read", "Repositories", "Read"), ("mutate", "Pull requests", "Review pull requests"),
         ("mutate", "Pull requests", "Open pull requests")]
+
+
+def test_gcp_minter_impersonates_the_connections_service_account():
+    from bab.service.minters import GcpMinter, MintError
+    from tests.conftest import FakeGoogle
+
+    cat = catalogue.load("catalogues/room.yaml")
+    g = FakeGoogle()
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=UTC).timestamp()
+    m = GcpMinter(http=g, now=lambda: now)
+    sa = "reader@example-project.iam.gserviceaccount.com"
+    out = m.mint("sherlock", "example-project", {"project": "example-project", "service_account": sa},
+                 [cat.action("gcp_compute_read"), cat.action("gcp_vertex_ai_user")], 7200)
+    # bab's own token first, from the metadata server; then generateAccessToken with it as bearer.
+    assert g.calls[0] == ("GET", "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", None)
+    assert g.headers[0] == {"Metadata-Flavor": "Google"}
+    method, url, body = g.calls[1]
+    assert (method, url) == ("POST", f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{sa}:generateAccessToken")
+    assert body == {"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "3600s"}  # two hours asked, an hour is the cap
+    assert g.headers[1]["Authorization"] == "Bearer own-1"
+    assert out.credential == {"gcp_access_token": f"imp-2-{sa}", "gcp_project": "example-project"}
+    assert out.expires_at == datetime(2026, 11, 1, 13, 0, tzinfo=UTC).timestamp()  # Google's expireTime, fraction and all
+    assert out.handle == {}
+    assert out.note == f"access token for {sa}; narrowing is bab's check only, the token carries the role pack"
+    m.end(out.handle)
+    assert len(g.calls) == 2  # nothing to end: Google cannot recall a token
+    # Google's refusal is its sentence, never a token.
+    refused = GcpMinter(http=FakeGoogle(refuse_impersonation="Permission 'iam.serviceAccounts.getAccessToken' denied"), now=lambda: now)
+    with pytest.raises(MintError) as exc:
+        refused.mint("sherlock", "example-project", {"project": "example-project", "service_account": sa}, [], 3600)
+    assert f"Google refused a token for {sa}: HTTP 403 Permission 'iam.serviceAccounts.getAccessToken' denied" == str(exc.value)
+    assert "own-" not in str(exc.value)
+    with pytest.raises(MintError, match="is not a service account email"):
+        m.mint("sherlock", "example-project", {"project": "example-project", "service_account": "not-an-email"}, [], 3600)
+
+
+def test_gcp_minter_mints_babs_own_token_when_no_service_account_is_named():
+    from bab.service.minters import GcpMinter, MintError
+    from tests.conftest import FakeGoogle
+
+    g = FakeGoogle()
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=UTC).timestamp()
+    m = GcpMinter(http=g, now=lambda: now)
+    out = m.mint("sherlock", "example-project", {"project": "example-project", "service_account": None}, [], 3600)
+    assert len(g.calls) == 1 and g.calls[0][1].endswith("/service-accounts/default/token")
+    assert out.credential == {"gcp_access_token": "own-1", "gcp_project": "example-project"}
+    assert out.expires_at == now + 1800  # the metadata token ends in 30 minutes; the lease ends with it
+    assert out.note == "access token for bab's own identity; narrowing is bab's check only, the token carries the role pack"
+    assert m.mint("sherlock", "example-project", {"project": "example-project"}, [], 600).expires_at == now + 600
+    with pytest.raises(MintError, match="names no Google Cloud project"):
+        m.mint("sherlock", "example-project", {}, [], 3600)
+
+
+def test_gcp_minter_identity_and_probe_name_the_identity_to_grant():
+    from bab.service.minters import GcpMinter, MintError, Unreachable
+    from tests.conftest import BAB_EMAIL, FakeGoogle
+
+    g = FakeGoogle()
+    m = GcpMinter(http=g, now=lambda: 1_800_000_000.0)
+    assert m.identity() == {"subject": "1122334455", "email": BAB_EMAIL, "kind": "google_service_account"}
+    assert g.calls[-1][1].endswith("/service-accounts/default/identity?audience=bab&format=full")
+    # Probe with bab's own identity: one hop, the token it minted reads the project.
+    out = m.probe(project="example-project")
+    assert out == {"project": "example-project", "project_number": "123456789012", "subject": BAB_EMAIL, "hops": 1}
+    assert g.calls[-1][1] == "https://cloudresourcemanager.googleapis.com/v1/projects/example-project"
+    assert g.headers[-1]["Authorization"].startswith("Bearer own-")
+    # Through a service account: two hops, and the impersonated token is what reads the project.
+    sa = "reader@example-project.iam.gserviceaccount.com"
+    out = m.probe(project="example-project", service_account=sa)
+    assert out["hops"] == 2 and out["subject"] == sa
+    assert g.headers[-1]["Authorization"].startswith("Bearer imp-")
+    assert g.calls[-2][2]["lifetime"] == "600s"
+    # 403 (Google's answer for "no such project" too) is one sentence naming the identity and the project, no token.
+    with pytest.raises(MintError) as exc:
+        m.probe(project="locked-project")
+    assert str(exc.value) == (f"{BAB_EMAIL} has no access on project locked-project (or there is no such project): "
+                              "grant it the role pack there, or on a folder or organization above it")
+    assert "own-" not in str(exc.value)
+    with pytest.raises(MintError, match="is not a Google Cloud project id"):
+        m.probe(project="Not A Project")
+    with pytest.raises(MintError, match="names a project, or a folder or organization"):
+        m.probe()
+    # A folder or organization probes as "can bab list its projects".
+    assert m.probe(parent="folders/123") == {"parent": "folders/123", "projects": 2, "subject": BAB_EMAIL, "hops": 1}
+    # A project that serves models: the same token then lists Vertex AI's publisher models in the
+    # location, at a URL bab builds (regional host; the plain host for `global`), never one a caller sends.
+    out = m.probe(project="example-project", vertex_location="us-east5")
+    assert out["vertex"] == {"location": "us-east5", "ok": True} and out["hops"] == 1
+    assert g.calls[-1][1] == "https://us-east5-aiplatform.googleapis.com/v1/projects/example-project/locations/us-east5/publishers/google/models?pageSize=1"
+    assert g.headers[-1]["Authorization"] == g.headers[-2]["Authorization"]  # the token that read the project
+    m.probe(project="example-project", vertex_location="global")
+    assert g.calls[-1][1].startswith("https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/")
+    with pytest.raises(Unreachable) as exc:
+        m.probe(project="example-project", vertex_location="europe-west9")
+    assert str(exc.value) == (f"{BAB_EMAIL} cannot reach Vertex AI in europe-west9 for project example-project: "
+                              "HTTP 403 Permission 'aiplatform.endpoints.predict' denied")
+    with pytest.raises(MintError, match="is not a Vertex AI location"):
+        m.probe(project="example-project", vertex_location="https://evil.example/")
+
+
+def test_gcp_minter_lists_the_active_projects_under_a_folder_or_organization():
+    from bab.service.minters import GcpMinter, MintError, default_minters
+    from tests.conftest import FakeGoogle
+
+    g = FakeGoogle()
+    m = GcpMinter(http=g)
+    assert m.list_accounts("organizations/456") == [{"id": "example-project", "name": "Example", "status": "ACTIVE"},
+                                                     {"id": "locked-project", "name": "Locked", "status": "ACTIVE"}]
+    urls = [u for _, u, _ in g.calls if "/v3/projects" in u]
+    assert urls == ["https://cloudresourcemanager.googleapis.com/v3/projects?parent=organizations/456&pageSize=500",
+                    "https://cloudresourcemanager.googleapis.com/v3/projects?parent=organizations/456&pageSize=500&pageToken=page-2"]
+    assert all(h["Authorization"] == "Bearer own-1" for h in g.headers[1:])
+    with pytest.raises(MintError, match="is not a folder or organization"):
+        m.list_accounts("example-project")
+    assert default_minters()["gcp"].name == "gcp"
+
+
+def test_every_gcp_permission_names_its_roles_and_vertex_ai_is_the_one_user_role():
+    cat = catalogue.load("catalogues/room.yaml")
+    rows = {a.name: a for a in cat.for_vendor("gcp")}
+    roles = {n: a.extra.get("roles") for n, a in rows.items()}
+    assert all(roles.values()), roles
+    assert len(rows) == 24
+    vertex = rows["gcp_vertex_ai_user"]
+    assert (vertex.tier, vertex.group, vertex.label) == ("read", "AI", "Use Vertex AI models")
+    assert roles["gcp_vertex_ai_user"] == ["roles/aiplatform.user"]
+    assert all(r.startswith("roles/") for rs in roles.values() for r in rs)
+    not_viewer = {n for n, rs in roles.items() if any(not r.endswith(("viewer", "Viewer", "reader", "Reader", "browser")) for r in rs)}
+    assert not_viewer == {"gcp_vertex_ai_user"}

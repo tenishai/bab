@@ -33,6 +33,11 @@ class NotConfigured(MintError):
     """bab holds nothing for this vendor yet; connecting it is what is missing, not a retry."""
 
 
+class Unreachable(MintError):
+    """The identity is granted on the connection but a vendor surface it should reach did not answer
+    (a probe's second step); the console shows it as the vendor's failure, not the connection's."""
+
+
 @dataclass(frozen=True)
 class Minted:
     credential: dict[str, Any]  # vendor shape, handed to the agent
@@ -106,6 +111,15 @@ MIN_SECONDS, MAX_SECONDS = 900, 43200
 
 def session_name(prefix: str, agent: str) -> str:
     return _SESSION_NAME_BAD.sub("-", f"{prefix}{agent}")[:64].ljust(2, "x")
+
+
+def jwt_claims(token: str) -> dict:
+    """The claims of an unverified JWT bab was handed by its own metadata server."""
+    try:
+        payload = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (IndexError, ValueError) as exc:
+        raise MintError("bab's identity token is not a JWT") from exc
 
 
 def web_identity_token(audience: str) -> str:
@@ -289,12 +303,7 @@ class AwsMinter:
     def identity(self, audience: str = DEFAULT_AUDIENCE) -> dict:
         """Who bab is to AWS: the claims of its own identity token (the `sub` an account
         owner writes into a role's trust policy, with `oaud` = the audience)."""
-        token = self.token_source(audience)
-        try:
-            payload = token.split(".")[1]
-            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        except (IndexError, ValueError) as exc:
-            raise MintError("bab's identity token is not a JWT") from exc
+        claims = jwt_claims(self.token_source(audience))
         return {"subject": str(claims.get("sub", "")), "email": claims.get("email"), "audience": audience,
                 "issuer": claims.get("iss")}
 
@@ -625,7 +634,7 @@ class GitHubMinter:
         token = str(data.get("token") or "")
         if not token:
             raise MintError("GitHub answered without the token")
-        return token, _gh_epoch(str(data.get("expires_at") or ""))
+        return token, _iso_epoch(str(data.get("expires_at") or ""))
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
         cfg = self.config()
@@ -684,12 +693,205 @@ class GitHubMinter:
                 "repositories": int(repos.get("total_count") or 0)}
 
 
-def _gh_epoch(iso: str) -> float:
-    """GitHub's `expires_at` (`2026-10-31T17:00:00Z`) as an epoch, 0 when absent or odd."""
+
+# ---- Google Cloud: an access token for bab's own identity, or for a narrower one -------
+
+GCP_METADATA_SA_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default"
+GCP_CREDENTIALS_URL = "https://iamcredentials.googleapis.com/v1"
+GCP_RESOURCE_MANAGER_URL = "https://cloudresourcemanager.googleapis.com"
+GCP_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+GCP_MAX_SECONDS = 3600  # generateAccessToken's ceiling without an org policy change; the lease is an hour anyway
+GCP_PROBE_SECONDS = 600
+GCP_IDENTITY_AUDIENCE = "bab"  # the identity token is read for its claims, never presented anywhere
+GCP_OWN = "bab's own identity"
+_GCP_PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+_GCP_PARENT = re.compile(r"^(folders|organizations)/\d+$")
+_GCP_SA = re.compile(r"^[\w.+-]+@[\w.-]+\.gserviceaccount\.com$")
+_GCP_LOCATION = re.compile(r"^(global|[a-z]+-[a-z]+\d+)$")
+
+
+def vertex_models_url(project: str, location: str) -> str:
+    """Vertex AI's publisher-models listing for a project and location: the regional host, or
+    the plain host for `global`. Built here, never taken from a caller: a probe presents a token
+    for bab's identity to this URL, so the host is bab's choice."""
+    host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+    return f"https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models?pageSize=1"
+
+
+class GcpMinter:
+    """Google Cloud has no session policy: a token carries whatever roles its identity holds.
+    So an admin grants bab's own service account the role pack on the project (or on a folder
+    or organization above it), and a lease is an access token for that identity, narrowed by
+    bab's verdict before minting rather than by Google during the hour. When a connection names
+    a `service_account`, bab impersonates it instead (`generateAccessToken`, which needs
+    roles/iam.serviceAccountTokenCreator on that account) and the lease carries that narrower
+    identity's roles. bab's own token comes from the metadata server (workload identity), the
+    same source as its AWS web identity token; nothing is stored. Cloud Audit Logs record the
+    identity, not the agent: the ledger is the attribution."""
+
+    name = "gcp"
+
+    def __init__(self, http=None, now=time.time):
+        self.http = http or self._http
+        self.now = now
+
+    @staticmethod
+    def _http(method: str, url: str, headers: dict, body: dict | None) -> tuple[int, dict]:
+        try:
+            resp = httpx.request(method, url, headers=headers, json=body, timeout=10.0)
+        except httpx.HTTPError as exc:
+            raise MintError(f"Google did not answer: {exc.__class__.__name__}") from exc
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:  # the metadata server's identity endpoint answers a bare JWT
+            data = {"text": resp.text}
+        return resp.status_code, data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _error(status: int, data: dict) -> str:
+        """Google's own sentence (`error.message`), never a token."""
+        err = data.get("error") or {}
+        msg = str(err.get("message") or "") if isinstance(err, dict) else str(err)
+        return f"HTTP {status}" + (f" {msg}" if msg else "")
+
+    @staticmethod
+    def _bearer(token: str) -> dict:
+        return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    def _metadata(self, path: str) -> tuple[int, dict]:
+        return self.http("GET", f"{GCP_METADATA_SA_URL}{path}", {"Metadata-Flavor": "Google"}, None)
+
+    def _own_token(self) -> tuple[str, float]:
+        """bab's own access token from the metadata server, and when Google ends it."""
+        status, data = self._metadata("/token")
+        token = str(data.get("access_token") or "")
+        if status != 200 or not token:
+            raise MintError("no access token: the metadata server did not hand one to bab's service account")
+        return token, self.now() + float(data.get("expires_in") or GCP_MAX_SECONDS)
+
+    def _email(self) -> str:
+        """bab's own service account email, from the metadata server."""
+        status, data = self._metadata("/?recursive=true")
+        if status != 200 or not data.get("email"):
+            raise MintError("the metadata server did not name bab's service account")
+        return str(data["email"])
+
+    def _impersonate(self, bearer: str, service_account: str, seconds: int) -> tuple[str, float]:
+        """`generateAccessToken` on the connection's service account, with bab's own token."""
+        if not _GCP_SA.match(service_account):
+            raise MintError(f"{service_account!r} is not a service account email")
+        url = f"{GCP_CREDENTIALS_URL}/projects/-/serviceAccounts/{service_account}:generateAccessToken"
+        status, data = self.http("POST", url, self._bearer(bearer), {"scope": [GCP_SCOPE], "lifetime": f"{seconds}s"})
+        if status != 200:
+            raise MintError(f"Google refused a token for {service_account}: {self._error(status, data)}")
+        token = str(data.get("accessToken") or "")
+        if not token:
+            raise MintError("Google answered without the token")
+        return token, _iso_epoch(str(data.get("expireTime") or "")) or self.now() + seconds
+
+    def _token_for(self, service_account: str | None, seconds: int) -> tuple[str, float, str]:
+        """A token for the connection's identity: the service account it names, impersonated with
+        bab's own token, or bab's own token itself, which ends when the metadata server says."""
+        seconds = max(1, min(int(seconds), GCP_MAX_SECONDS))
+        own, own_ends = self._own_token()
+        if service_account:
+            token, ends = self._impersonate(own, service_account, seconds)
+            return token, min(ends, self.now() + seconds), service_account
+        return own, min(own_ends, self.now() + seconds), GCP_OWN
+
+    def mint(self, agent, integration_id, spec, permissions, seconds):
+        project = str((spec or {}).get("project") or "").strip()
+        if not project:
+            raise MintError(f"integration {integration_id!r} names no Google Cloud project")
+        sa = str((spec or {}).get("service_account") or "").strip() or None
+        token, ends, who = self._token_for(sa, seconds)
+        return Minted(credential={"gcp_access_token": token, "gcp_project": project}, expires_at=ends, handle={},
+                      note=f"access token for {who}; narrowing is bab's check only, the token carries the role pack")
+
+    def end(self, handle):
+        """Nothing to end: Google cannot recall an access token before it expires, and bab keeps
+        no copy. The lease length is the revocation; the lease's end stops the hand-out at once."""
+        return
+
+    def identity(self, audience: str | None = None) -> dict:
+        """Who bab is to Google Cloud: its own service account, the principal an admin grants the
+        role pack to. Email and unique id (`sub`, which survives a delete-and-recreate of the
+        email) come from the metadata server's identity token, as for AWS."""
+        status, data = self._metadata(f"/identity?audience={audience or GCP_IDENTITY_AUDIENCE}&format=full")
+        token = str(data.get("text") or "")
+        if status != 200 or not token:
+            raise MintError("no identity token: bab's service account has no Google identity linked")
+        claims = jwt_claims(token)
+        return {"subject": str(claims.get("sub", "")), "email": claims.get("email"), "kind": "google_service_account"}
+
+    def probe(self, project: str | None = None, service_account: str | None = None, parent: str | None = None,
+              vertex_location: str | None = None) -> dict:
+        """Mint once and read the project: is bab's identity (or the service account it would
+        impersonate) granted anything there? With `parent` and no project: can bab list the
+        folder's or organization's projects? Google answers 403 for a project that does not
+        exist too, so the sentence covers both. With `vertex_location`, the same token then lists
+        Vertex AI's publisher models there (a project that serves models): `vertex.ok` in the
+        answer, or Unreachable naming the location."""
+        if parent and not project:
+            projects = self.list_accounts(parent)
+            return {"parent": parent, "projects": len(projects), "subject": self._email(), "hops": 1}
+        project = str(project or "").strip()
+        if not project:
+            raise MintError("a Google Cloud probe names a project, or a folder or organization")
+        if not _GCP_PROJECT.match(project):
+            raise MintError(f"{project!r} is not a Google Cloud project id")
+        token, _, who = self._token_for(service_account or None, GCP_PROBE_SECONDS)
+        if who == GCP_OWN:
+            who = self._email()
+        status, data = self.http("GET", f"{GCP_RESOURCE_MANAGER_URL}/v1/projects/{project}", self._bearer(token), None)
+        if status in (403, 404):
+            raise MintError(f"{who} has no access on project {project} (or there is no such project): grant it "
+                            "the role pack there, or on a folder or organization above it")
+        if status != 200:
+            raise MintError(f"Google did not show project {project}: {self._error(status, data)}")
+        out = {"project": str(data.get("projectId") or project), "project_number": str(data.get("projectNumber") or ""),
+               "subject": who, "hops": 2 if service_account else 1}
+        if vertex_location:
+            location = str(vertex_location).strip()
+            if not _GCP_LOCATION.match(location):
+                raise MintError(f"{location!r} is not a Vertex AI location")
+            status, data = self.http("GET", vertex_models_url(out["project"], location), self._bearer(token), None)
+            if status != 200:
+                raise Unreachable(f"{who} cannot reach Vertex AI in {location} for project {out['project']}: "
+                                  f"{self._error(status, data)}")
+            out["vertex"] = {"location": location, "ok": True}
+        return out
+
+    def list_accounts(self, parent: str) -> list[dict]:
+        """The active projects directly under a folder or organization, as bab's own identity
+        can see them (`resourcemanager.projects.list` on the parent). Projects inside a
+        sub-folder are not listed; connect that folder."""
+        parent = str(parent or "").strip()
+        if not _GCP_PARENT.match(parent):
+            raise MintError(f"{parent!r} is not a folder or organization (folders/<number> or organizations/<number>)")
+        token, _ = self._own_token()
+        out: list[dict] = []
+        page = ""
+        while True:
+            url = f"{GCP_RESOURCE_MANAGER_URL}/v3/projects?parent={parent}&pageSize=500" + (f"&pageToken={page}" if page else "")
+            status, data = self.http("GET", url, self._bearer(token), None)
+            if status != 200:
+                raise MintError(f"Google refused listing the projects under {parent}: {self._error(status, data)}")
+            out += [{"id": str(p.get("projectId") or ""), "name": str(p.get("displayName") or p.get("projectId") or ""),
+                     "status": str(p.get("state") or "")}
+                    for p in (data.get("projects") or []) if p.get("state") == "ACTIVE" and p.get("projectId")]
+            page = str(data.get("nextPageToken") or "")
+            if not page:
+                return sorted(out, key=lambda p: (p["name"], p["id"]))
+
+
+def _iso_epoch(iso: str) -> float:
+    """An RFC 3339 instant (`2026-10-31T17:00:00Z`, Google's `...00.123456Z` too) as an epoch,
+    0 when absent or odd."""
     if not iso:
         return 0.0
     try:
-        return float(calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")))
+        return float(calendar.timegm(time.strptime(re.sub(r"\.\d+Z$", "Z", iso), "%Y-%m-%dT%H:%M:%SZ")))
     except ValueError:
         return 0.0
 
@@ -697,7 +899,9 @@ def _gh_epoch(iso: str) -> float:
 def default_minters() -> dict[str, Minter]:
     """Datadog and GitHub are always registered; whether each can mint is decided per call
     from its mounted Secret (`BAB_DATADOG_DIR` /etc/bab/datadog, `BAB_GITHUB_DIR`
-    /etc/bab/github) or, failing that, the environment."""
+    /etc/bab/github) or, failing that, the environment. AWS and Google Cloud mint with bab's
+    own identity from the metadata server and need nothing mounted."""
     return {"aws": AwsMinter(),
+            "gcp": GcpMinter(),
             "datadog": DatadogMinter.from_dir(os.environ.get(DD_DIR_ENV, "").strip() or DD_DEFAULT_DIR),
             "github": GitHubMinter.from_dir(os.environ.get(GH_DIR_ENV, "").strip() or GH_DEFAULT_DIR)}
