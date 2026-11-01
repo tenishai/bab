@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-11-01
+
 ### Fixed
 
 - **A GitHub lease narrowed to a repository set works when the console stores full names.**
