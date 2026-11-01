@@ -6,6 +6,51 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+Google Cloud, the way the room's cloud-access design describes it: bab's own identity is
+granted, a lease is a token for it (kobo `docs/superpowers/specs/2026-10-25-cloud-access-design.md`,
+"GCP, the way Wiz does it").
+
+### Added
+
+- **Google Cloud minter.** A `gcp` integration is a project (`spec.project`, kind `account`),
+  flat or under an organization row that names a folder or organization (`spec.parent_resource`
+  = `folders/<n>` or `organizations/<n>`, kind `org`). An admin grants bab's own service account
+  the role pack on the project, folder or organization; a lease is then a fresh access token for
+  that identity from the metadata server (workload identity, the same source as the AWS web
+  identity token), capped at the token's own expiry and the hour. When the project's spec names
+  a `service_account`, bab impersonates it instead (`generateAccessToken`, `cloud-platform`
+  scope, lifetime at most an hour) and the lease carries that narrower identity's roles. The
+  credential is `{gcp_access_token, gcp_project}`; the note says `access token for <who>;
+  narrowing is bab's check only, the token carries the role pack`, because Google has no
+  session policy and the console must say so. `end` is a no-op: Google cannot recall a token.
+  `GET /identity/gcp` is bab's service account (`email`, `subject` = its unique id);
+  `POST /probe/gcp {project, service_account?}` mints once and reads the project with Resource
+  Manager (a 403 is one sentence naming the identity and the project; `{parent}` instead asks
+  whether bab can list a folder's or organization's projects; `vertex_location` then lists Vertex
+  AI's publisher models there with the same token, `vertex: {location, ok}` in the answer or a
+  502 saying the identity cannot reach Vertex AI in that location; the Vertex URL is built by bab
+  from the location and the project, and a `vertex_url` in the body is accepted but never
+  fetched, since the probe presents a token for bab's identity); `GET /integrations/{org}/accounts`
+  and `POST /integrations/{org}/discover` list the active projects directly under the folder or
+  organization and mark the ones bab's identity can already read. Nothing is mounted or stored.
+- **`gcp_vertex_ai_user`** in the room catalogue (tier read, group AI, label "Use Vertex AI
+  models", `roles/aiplatform.user`): the role pack for a project that also serves models
+  includes it. The other 23 Google Cloud rows are unchanged.
+
+### Changed
+
+- **`POST /probe/{vendor}`, `GET /integrations/{org}/accounts` and `POST /integrations/{org}/discover`
+  take every vendor's shape.** The probe body carries every vendor's fields (`role_arn`,
+  `audience`, `hub_role_arn`, `external_id` for AWS; `project`, `service_account`, `parent` for
+  Google Cloud) and each minter is handed the ones its `probe` accepts; a field it requires and
+  did not get is a 422 naming it (an AWS probe without `role_arn` was a 409 before). An
+  organization's accounts are listed with the vendor's own parent (`hub_role_arn` for AWS,
+  `parent_resource` for Google Cloud) and discover probes each account the vendor's way: the
+  AWS lane still builds `arn:aws:iam::<account>:role/<role_name>` and needs the organization's
+  external id; the Google Cloud lane probes `project=<id>` and needs neither. A vendor whose
+  minter lacks the method still answers 501. `GET /integrations` rows carry `project` and, on an
+  organization, `parent_resource`.
+
 ## [0.4.14] - 2026-11-01
 
 ### Fixed
