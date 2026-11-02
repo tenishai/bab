@@ -18,7 +18,7 @@ ones New agent shows (tenishai/kobo#405, section C).
   "stage", "via"}`. A Google Cloud row lists Vertex AI's publisher models (google and
   anthropic) from the global endpoint, the one that lists them, billed to the row's Vertex
   project (`spec.models.project`, then `spec.identity.project`, then `spec.project`) through
-  `x-goog-user-project`; `location` (default us-east5, or the row's `spec.models.location`)
+  `x-goog-user-project`; `location` (default global, or the row's `spec.models.location`)
   is checked and kept for the console, since the listing has no location. Kept: launch stage
   GA, or PUBLIC_PREVIEW only when a family has nothing GA; no `supportedActions` (every
   current Gemini row) or a generate-type one among them (deploy- or notebook-only rows go); a
@@ -35,6 +35,11 @@ ones New agent shows (tenishai/kobo#405, section C).
   Vertex project, is 409; the vendor refusing is 502 with its own sentence. The pure filters
   live in `bab/service/models.py`; `GcpMinter.list_models` and `AwsMinter.list_models` make
   the vendor calls.
+
+## [0.4.16] - 2026-11-02
+
+### Fixed
+- The Vertex AI probe at connect lists the project's own models (`projects/{p}/locations/{l}/models`) instead of the publisher catalogue under a project, which Google answers with 404; every Google Cloud connect with the models tick failed on it.
 
 ## [0.4.15] - 2026-11-01
 

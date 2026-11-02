@@ -565,7 +565,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         and cut to chat text models that are generally available: what an admin ticks for New
         agent. A Google Cloud row lists Vertex AI's publisher models for its Vertex project
         (`spec.models.project`, then `spec.identity.project`, then `spec.project`; `location`
-        default us-east5, the row's `spec.models.location` when set); an AWS row lists Bedrock's
+        default global, the row's `spec.models.location` when set); an AWS row lists Bedrock's
         models in `region` (default us-east-1) through its role, the hub lane for an account
         under an organization. Any other vendor is 501; the vendor refusing is 502 with its
         own sentence."""
@@ -588,7 +588,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 project = str(models_spec.get("project") or identity_spec.get("project") or spec.get("project") or "").strip()
                 if not project:
                     raise HTTPException(409, f"{integration!r} names no Vertex AI project; connect it again naming one")
-                where = str(location or models_spec.get("location") or "us-east5").strip()
+                where = str(location or models_spec.get("location") or "global").strip()
                 listed = minter.list_models(project=project, location=where,
                                             service_account=str(spec.get("service_account") or "") or None)
             else:

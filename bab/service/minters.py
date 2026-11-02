@@ -771,11 +771,14 @@ _GCP_LOCATION = re.compile(r"^(global|[a-z]+-[a-z]+\d+)$")
 
 
 def vertex_models_url(project: str, location: str) -> str:
-    """Vertex AI's publisher-models listing for a project and location: the regional host, or
-    the plain host for `global`. Built here, never taken from a caller: a probe presents a token
-    for bab's identity to this URL, so the host is bab's choice."""
+    """Vertex AI's model list for a project and location: the regional host, or the plain host
+    for `global`. The project's own models (an empty list is a fine answer): listing them needs
+    the Vertex AI role in that project and proves the API is on there, which is what a model
+    call needs. The publisher catalogue is not project-scoped and answers 404 under a project
+    (seen live 2026-11-02), so it is not the probe. Built here, never taken from a caller: a
+    probe presents a token for bab's identity to this URL, so the host is bab's choice."""
     host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
-    return f"https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models?pageSize=1"
+    return f"https://{host}/v1/projects/{project}/locations/{location}/models?pageSize=1"
 
 
 class GcpMinter:
@@ -922,7 +925,7 @@ class GcpMinter:
             out["vertex"] = {"location": location, "ok": True}
         return out
 
-    def list_models(self, project: str, location: str = "us-east5", service_account: str | None = None) -> list[dict]:
+    def list_models(self, project: str, location: str = "global", service_account: str | None = None) -> list[dict]:
         """Vertex AI's chat text models for a project: the publisher models of google and
         anthropic from the global endpoint (the one that lists them; the regional hosts answer
         an empty list), billed to `project` through `x-goog-user-project`, read with the same
