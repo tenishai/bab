@@ -21,6 +21,7 @@ from typing import Any, Protocol
 import httpx
 
 from bab.catalogue import Action
+from bab.service import models as discovery
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ TOKEN_FILE_ENV = "BAB_AWS_WEB_IDENTITY_TOKEN_FILE"
 DEFAULT_AUDIENCE = "sts.amazonaws.com"
 _ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]+$")
 _SESSION_NAME_BAD = re.compile(r"[^\w+=,.@-]")
+_AWS_REGION = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d$")
 MIN_SECONDS, MAX_SECONDS = 900, 43200
 
 
@@ -179,11 +181,13 @@ class AwsMinter:
 
     name = "aws"
 
-    def __init__(self, token_source=web_identity_token, assume=None, assume_role=None, list_org_accounts=None):
+    def __init__(self, token_source=web_identity_token, assume=None, assume_role=None, list_org_accounts=None,
+                 list_bedrock=None):
         self.token_source = token_source
         self.assume = assume or self._assume
         self.assume_role = assume_role or self._assume_role
         self.list_org_accounts = list_org_accounts or self._list_org_accounts
+        self.list_bedrock = list_bedrock or self._list_bedrock
 
     @staticmethod
     def _assume(role_arn: str, token: str, name: str, seconds: int, policy: dict | None) -> dict:
@@ -262,6 +266,38 @@ class AwsMinter:
         except BotoCoreError as exc:
             raise MintError(f"AWS call failed: {exc}") from exc
 
+    @staticmethod
+    def _list_bedrock(creds: dict, region: str) -> tuple[list[dict], list[dict]]:
+        """Bedrock's foundation models and system inference profiles in a region, as the
+        session sees them (`ListFoundationModels`, `ListInferenceProfiles`), raw."""
+        try:
+            import botocore.session
+            from botocore.exceptions import BotoCoreError, ClientError
+        except ImportError as exc:  # pragma: no cover
+            raise MintError("botocore is not installed; install bab with the [aws] extra") from exc
+        bedrock = botocore.session.get_session().create_client(
+            "bedrock", region_name=region, aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+        profiles: list[dict] = []
+        token = None
+        try:
+            models = list(bedrock.list_foundation_models().get("modelSummaries") or [])
+            while True:
+                kwargs = {"typeEquals": "SYSTEM_DEFINED", "maxResults": 1000}
+                if token:
+                    kwargs["nextToken"] = token
+                page = bedrock.list_inference_profiles(**kwargs)
+                profiles += list(page.get("inferenceProfileSummaries") or [])
+                token = page.get("nextToken")
+                if not token:
+                    return models, profiles
+        except ClientError as exc:
+            err = exc.response.get("Error", {})
+            raise MintError(f"AWS refused listing Bedrock models in {region}: {err.get('Code', 'error')} "
+                            f"{err.get('Message', '')}".strip()) from exc
+        except BotoCoreError as exc:
+            raise MintError(f"AWS call failed: {exc}") from exc
+
     def _hub(self, hub_role_arn: str, audience: str, agent: str) -> dict:
         """First hop: bab's identity into the organization's hub role, briefly, no policy."""
         if not _ROLE_ARN.match(hub_role_arn):
@@ -327,6 +363,30 @@ class AwsMinter:
     def list_accounts(self, hub_role_arn: str, audience: str = DEFAULT_AUDIENCE) -> list[dict]:
         """The organization's accounts, as the hub can see them."""
         return self.list_org_accounts(self._hub(hub_role_arn, audience, "discover"))
+
+    def list_models(self, region: str = "us-east-1", role_arn: str | None = None, spoke_role_arn: str | None = None,
+                    hub_role_arn: str | None = None, external_id: str | None = None,
+                    audience: str = DEFAULT_AUDIENCE) -> list[dict]:
+        """Bedrock's chat text models in `region`, as the connection's role sees them: the
+        role is assumed briefly with no policy, the way a probe assumes it (through the hub
+        for an account under an organization), then `ListFoundationModels` and
+        `ListInferenceProfiles` are read and cut down by `discovery.bedrock_models`."""
+        region = str(region or "").strip()
+        if not _AWS_REGION.match(region):
+            raise MintError(f"{region!r} is not an AWS region")
+        hub, spoke = str(hub_role_arn or "").strip(), str(spoke_role_arn or "").strip()
+        if hub and spoke:
+            if not _ROLE_ARN.match(spoke):
+                raise MintError(f"{spoke!r} is not an IAM role ARN")
+            resp = self.assume_role(self._hub(hub, audience, "models"), spoke, "bab-models", MIN_SECONDS, None,
+                                    str(external_id or "") or None)
+        else:
+            flat = str(role_arn or spoke or "").strip()
+            if not _ROLE_ARN.match(flat):
+                raise MintError("the connection names no IAM role to list Bedrock models with")
+            resp = self.assume(flat, self.token_source(audience), "bab-models", MIN_SECONDS, None)
+        models, profiles = self.list_bedrock(resp["Credentials"], region)
+        return discovery.bedrock_models(models, profiles, region)
 
 
 # ---- Datadog: a scoped application key on bab's service account, per lease -------
@@ -861,6 +921,37 @@ class GcpMinter:
                                   f"{self._error(status, data)}")
             out["vertex"] = {"location": location, "ok": True}
         return out
+
+    def list_models(self, project: str, location: str = "us-east5", service_account: str | None = None) -> list[dict]:
+        """Vertex AI's chat text models for a project: the publisher models of google and
+        anthropic from the global endpoint (the one that lists them; the regional hosts answer
+        an empty list), billed to `project` through `x-goog-user-project`, read with the same
+        token a probe presents (bab's own, or the connection's service account impersonated),
+        and cut down by `discovery.vertex_models`. `location` is checked and kept for the
+        console's row; the listing itself has no location."""
+        project = str(project or "").strip()
+        if not _GCP_PROJECT.match(project):
+            raise MintError(f"{project!r} is not a Google Cloud project id")
+        location = str(location or "").strip()
+        if not _GCP_LOCATION.match(location):
+            raise MintError(f"{location!r} is not a Vertex AI location")
+        token, _, who = self._token_for(service_account or None, GCP_PROBE_SECONDS)
+        headers = {**self._bearer(token), "x-goog-user-project": project}
+        listed: list[tuple[str, dict]] = []
+        for publisher in discovery.VERTEX_PUBLISHERS:
+            page = ""
+            while True:
+                status, data = self.http("GET", discovery.vertex_publisher_models_url(publisher, page), headers, None)
+                if status != 200:
+                    if who == GCP_OWN:
+                        who = self._email()
+                    raise Unreachable(f"{who} cannot list Vertex AI's {publisher} models for project {project}: "
+                                      f"{self._error(status, data)}")
+                listed += [(publisher, m) for m in (data.get("publisherModels") or []) if isinstance(m, dict)]
+                page = str(data.get("nextPageToken") or "")
+                if not page:
+                    break
+        return discovery.vertex_models(listed)
 
     def list_accounts(self, parent: str) -> list[dict]:
         """The active projects directly under a folder or organization, as bab's own identity

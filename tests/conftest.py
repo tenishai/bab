@@ -176,6 +176,18 @@ class FakeGoogle:
             sa = url.rsplit("/serviceAccounts/", 1)[1].split(":")[0]
             self.n += 1
             return 200, {"accessToken": f"imp-{self.n}-{sa}", "expireTime": "2026-11-01T13:00:00.123456Z"}
+        if url.startswith("https://aiplatform.googleapis.com/v1beta1/publishers/"):
+            # The global publisher-model listing, billed to the project in the header; two pages for google.
+            if headers.get("x-goog-user-project") in self.forbidden:
+                return 403, {"error": {"code": 403, "message": "Permission 'aiplatform.publisherModels.list' denied", "status": "PERMISSION_DENIED"}}
+            publisher = url.split("/publishers/")[1].split("/")[0]
+            if publisher == "google":
+                if "pageToken=" in url:
+                    return 200, {"publisherModels": VERTEX_GOOGLE_PAGE2}
+                return 200, {"publisherModels": VERTEX_GOOGLE_PAGE1, "nextPageToken": "g-2"}
+            if publisher == "anthropic":
+                return 200, {"publisherModels": VERTEX_ANTHROPIC}
+            return 200, {"publisherModels": []}
         if "aiplatform.googleapis.com/v1/projects/" in url and "/publishers/google/models" in url:
             location = url.split("/locations/")[1].split("/")[0]
             if location in self.vertex_forbidden:
@@ -194,3 +206,84 @@ class FakeGoogle:
             return 200, {"projects": [{"projectId": "example-project", "displayName": "Example", "state": "ACTIVE", "parent": parent}],
                          "nextPageToken": "page-2"}
         return 405, {}
+
+
+# ---- captured shapes for model discovery --------------------------------------------
+# Vertex AI's publisher-model rows as the global v1beta1 endpoint lists them (name, versionId,
+# launchStage, supportedActions); Bedrock's modelSummaries and inferenceProfileSummaries.
+# Shapes are the vendors'; the rows are a representative cut, not today's full list.
+
+
+def _vertex(publisher: str, name: str, stage: str, *actions: str, version: str = "001") -> dict:
+    return {"name": f"publishers/{publisher}/models/{name}", "versionId": version, "launchStage": stage,
+            "openSourceCategory": "PROPRIETARY",
+            "supportedActions": {a: {} for a in actions}}
+
+
+STUDIO, TUNE, NOTEBOOK, DEPLOY = "openGenerationAiStudio", "openPromptTuningPipeline", "openNotebook", "deploy"
+VERTEX_GOOGLE_PAGE1 = [
+    _vertex("google", "gemini-2.5-pro", "GA", STUDIO, TUNE),
+    _vertex("google", "gemini-2.5-flash", "GA", STUDIO, TUNE),
+    _vertex("google", "gemini-3-pro-preview", "PUBLIC_PREVIEW", STUDIO),  # the family has GA rows: dropped
+    _vertex("google", "gemini-1.5-pro", "DEPRECATED", STUDIO),
+    _vertex("google", "gemini-2.5-flash-preview-tts", "GA", STUDIO),  # speech
+    _vertex("google", "text-embedding-005", "GA", NOTEBOOK),
+    _vertex("google", "multimodalembedding", "GA", NOTEBOOK),
+    _vertex("google", "imagen-4.0-generate-001", "GA", STUDIO),
+    _vertex("google", "veo-3.0-generate-001", "GA", STUDIO),
+    _vertex("google", "text-bison", "GA", STUDIO),
+    _vertex("google", "gemma-3-27b-it", "GA", DEPLOY, NOTEBOOK),  # deploy-only: not a model the room can call
+]
+VERTEX_GOOGLE_PAGE2 = [
+    _vertex("google", "gemini-2.0-flash-001", "GA", STUDIO, TUNE),
+    _vertex("google", "gemini-2.5-pro", "GA", STUDIO),  # listed twice across pages: once in the answer
+    _vertex("google", "learnlm-2.0-flash-experimental", "EXPERIMENTAL", STUDIO),
+]
+VERTEX_ANTHROPIC = [
+    _vertex("anthropic", "claude-sonnet-4-6", "GA", STUDIO),
+    _vertex("anthropic", "claude-opus-4-1", "GA", STUDIO),
+    _vertex("anthropic", "claude-3-5-sonnet-v2", "GA", STUDIO),
+    _vertex("anthropic", "claude-haiku-4-5-preview", "PUBLIC_PREVIEW", STUDIO),
+]
+
+
+def _bedrock(model_id: str, name: str, provider: str, *kinds: str, outputs=("TEXT",), status="ACTIVE") -> dict:
+    return {"modelArn": f"arn:aws:bedrock:us-east-1::foundation-model/{model_id}", "modelId": model_id,
+            "modelName": name, "providerName": provider, "inputModalities": ["TEXT"],
+            "outputModalities": list(outputs), "responseStreamingSupported": True,
+            "customizationsSupported": [], "inferenceTypesSupported": list(kinds),
+            "modelLifecycle": {"status": status}}
+
+
+def _profile(pid: str, *model_ids: str, kind="SYSTEM_DEFINED", status="ACTIVE") -> dict:
+    return {"inferenceProfileId": pid, "inferenceProfileName": pid, "type": kind, "status": status,
+            "inferenceProfileArn": f"arn:aws:bedrock:us-east-1:123456789012:inference-profile/{pid}",
+            "models": [{"modelArn": f"arn:aws:bedrock:{r}::foundation-model/{m}"}
+                       for m in model_ids for r in ("us-east-1", "us-west-2")]}
+
+
+BEDROCK_MODELS = [
+    _bedrock("anthropic.claude-sonnet-4-5-20250929-v1:0", "Claude Sonnet 4.5", "Anthropic", "INFERENCE_PROFILE"),
+    _bedrock("anthropic.claude-3-haiku-20240307-v1:0", "Claude 3 Haiku", "Anthropic", "ON_DEMAND", "INFERENCE_PROFILE"),
+    _bedrock("anthropic.claude-3-5-sonnet-20240620-v1:0:200k", "Claude 3.5 Sonnet", "Anthropic", "PROVISIONED"),
+    _bedrock("anthropic.claude-v2", "Claude", "Anthropic", "ON_DEMAND", status="LEGACY"),
+    _bedrock("amazon.nova-pro-v1:0", "Nova Pro", "Amazon", "INFERENCE_PROFILE"),
+    _bedrock("amazon.nova-canvas-v1:0", "Nova Canvas", "Amazon", "ON_DEMAND", outputs=("IMAGE",)),
+    _bedrock("amazon.nova-sonic-v1:0", "Nova Sonic", "Amazon", "ON_DEMAND", outputs=("SPEECH", "TEXT")),
+    _bedrock("amazon.titan-embed-text-v2:0", "Titan Text Embeddings V2", "Amazon", "ON_DEMAND", outputs=("EMBEDDING",)),
+    _bedrock("amazon.titan-text-express-v1", "Titan Text G1 - Express", "Amazon", "ON_DEMAND"),
+    _bedrock("cohere.rerank-v3-5:0", "Rerank 3.5", "Cohere", "ON_DEMAND"),
+    _bedrock("meta.llama3-3-70b-instruct-v1:0", "Llama 3.3 70B Instruct", "Meta", "INFERENCE_PROFILE"),  # no profile here
+    _bedrock("deepseek.r1-v1:0", "DeepSeek-R1", "DeepSeek", "INFERENCE_PROFILE"),
+    _bedrock("mistral.pixtral-large-2502-v1:0", "Pixtral Large (25.02)", "Mistral AI", "INFERENCE_PROFILE"),
+]
+BEDROCK_PROFILES = [
+    _profile("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    _profile("global.anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    _profile("eu.anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    _profile("us.anthropic.claude-3-haiku-20240307-v1:0", "anthropic.claude-3-haiku-20240307-v1:0"),
+    _profile("us.amazon.nova-pro-v1:0", "amazon.nova-pro-v1:0"),
+    _profile("us.deepseek.r1-v1:0", "deepseek.r1-v1:0"),
+    _profile("global.mistral.pixtral-large-2502-v1:0", "mistral.pixtral-large-2502-v1:0"),
+    _profile("my-app-profile", "amazon.nova-pro-v1:0", kind="APPLICATION"),
+]

@@ -749,3 +749,118 @@ def test_a_google_cloud_project_is_probed_connected_discovered_and_leased(google
     lease = c.post("/leases", json={"integration": "example-project"}, headers=AGENT).json()
     assert lease["credential"]["gcp_access_token"].startswith("imp-") and lease["note"].startswith(f"access token for {sa};")
     assert fake.calls[-1][2] == {"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "3600s"}
+
+
+def test_a_google_cloud_row_lists_vertex_ai_chat_models_for_its_vertex_project(google):
+    from tests.conftest import BAB_EMAIL
+
+    c, fake, _ = google
+    # An organization row that names its Vertex project the way the console writes it, and a project row.
+    c.put("/integrations/example-org", json={"vendor": "gcp", "spec": {"parent_resource": "organizations/123", "name": "example-org",
+                                                                        "models": {"provider": "vertex_ai", "project": "example-project", "location": "us-east5"}}}, headers=ADMIN)
+    c.put("/integrations/example-project", json={"vendor": "gcp", "parent": "example-org", "ceiling": ["gcp_vertex_ai_user"],
+                                                 "spec": {"project": "example-project", "name": "example-project"}}, headers=ADMIN)
+    c.put("/integrations/locked-project", json={"vendor": "gcp", "ceiling": ["gcp_vertex_ai_user"],
+                                                "spec": {"project": "locked-project", "name": "locked-project"}}, headers=ADMIN)
+    # Console auth and the reviewer gate, as for discover.
+    assert c.get("/integrations/example-org/models").status_code == 401
+    assert c.get("/integrations/example-org/models", headers=OWNER).status_code == 403
+    assert c.get("/integrations/nope/models", headers=ADMIN).status_code == 404
+    out = c.get("/integrations/example-org/models", headers=ADMIN).json()
+    assert out["integration"] == "example-org" and out["provider"] == "vertex_ai" and out["fetched_at"] == "2026-10-27T12:00:00Z"
+    assert [m["id"] for m in out["models"]] == ["claude-3-5-sonnet-v2", "claude-opus-4-1", "claude-sonnet-4-6",
+                                                "gemini-2.0-flash-001", "gemini-2.5-flash", "gemini-2.5-pro"]
+    assert out["models"][2] == {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "publisher": "Anthropic",
+                                "family": "claude", "stage": "GA", "via": None}
+    # Only the global endpoint was asked, both publishers, billed to the Vertex project; a probe's token path.
+    urls = [u for _, u, _ in fake.calls if "/v1beta1/publishers/" in u]
+    assert len(urls) == 3 and all(u.startswith("https://aiplatform.googleapis.com/v1beta1/publishers/") for u in urls)
+    assert {u.split("/publishers/")[1].split("/")[0] for u in urls} == {"google", "anthropic"}
+    assert all(h.get("x-goog-user-project") == "example-project" for h in fake.headers[-3:])
+    assert fake.headers[-1]["Authorization"].startswith("Bearer own-")
+    # The project row answers the same list from its own project; a location is checked, not sent.
+    assert len(c.get("/integrations/example-project/models?location=global", headers=ADMIN).json()["models"]) == 6
+    r = c.get("/integrations/example-project/models?location=nowhere", headers=ADMIN)
+    assert r.status_code == 502 and "is not a Vertex AI location" in r.json()["detail"]
+    # Google refusing is a 502 with its sentence, naming the identity and the project.
+    r = c.get("/integrations/locked-project/models", headers=ADMIN)
+    assert r.status_code == 502
+    assert r.json()["detail"].startswith(f"{BAB_EMAIL} cannot list Vertex AI's google models for project locked-project:")
+    assert "publisherModels.list" in r.json()["detail"]
+    # An organization row that names no Vertex project cannot list.
+    c.put("/integrations/bare-org", json={"vendor": "gcp", "spec": {"parent_resource": "folders/9", "name": "bare-org"}}, headers=ADMIN)
+    r = c.get("/integrations/bare-org/models", headers=ADMIN)
+    assert r.status_code == 409 and "names no Vertex AI project" in r.json()["detail"]
+
+
+@pytest.fixture
+def bedrock():
+    """The room with a real AwsMinter over faked STS and Bedrock: who was assumed, which region was read."""
+    from bab.service.minters import AwsMinter
+    from tests.conftest import BEDROCK_MODELS, BEDROCK_PROFILES
+
+    clock = {"now": T0}
+    calls = {"hops": [], "listed": []}
+
+    def assume(role_arn, token, name, seconds, policy):
+        calls["hops"].append(("web-identity", role_arn, name))
+        return {"Credentials": {"AccessKeyId": "HUB" if "Hub" in role_arn else "FLAT", "SecretAccessKey": "s", "SessionToken": "t",
+                                "Expiration": T0}, "AssumedRoleUser": {"Arn": role_arn.replace(":role/", ":assumed-role/") + f"/{name}"}}
+
+    def assume_role(creds, role_arn, name, seconds, policy, external_id):
+        calls["hops"].append(("assume-role", creds["AccessKeyId"], role_arn, name, external_id))
+        return {"Credentials": {"AccessKeyId": "SPOKE", "SecretAccessKey": "s", "SessionToken": "t", "Expiration": T0},
+                "AssumedRoleUser": {"Arn": role_arn.replace(":role/", ":assumed-role/") + f"/{name}"}}
+
+    def list_bedrock(creds, region):
+        calls["listed"].append((creds["AccessKeyId"], region))
+        if region == "eu-west-1":
+            from bab.service.minters import MintError
+            raise MintError("AWS refused listing Bedrock models in eu-west-1: AccessDeniedException not authorized")
+        return BEDROCK_MODELS, BEDROCK_PROFILES
+
+    store = FakeStore({Tuple("user:kyle@example.com", "member", "team:admins"), Tuple("team:sre", "team", "agent:sherlock")})
+    cat = catalogue.load("catalogues/room.yaml")
+    app = create_app(store, cat, Ledger(), StaticVerifier({"sherlock-token": "sherlock"}), ConsoleAuth("console-secret"),
+                     {"aws": AwsMinter(token_source=lambda aud: "jwt", assume=assume, assume_role=assume_role, list_bedrock=list_bedrock)},
+                     Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"]))
+    return TestClient(app), calls
+
+
+def test_an_aws_row_lists_bedrock_models_through_its_role_and_other_vendors_cannot(bedrock):
+    c, calls = bedrock
+    hub = "arn:aws:iam::999999999999:role/KoboAccess-Hub"
+    c.put("/integrations/aws-prod", json={"vendor": "aws", "ceiling": ["aws_inventory_read"],
+                                          "spec": {"role_arn": "arn:aws:iam::123456789012:role/KoboAccess-Role"}}, headers=ADMIN)
+    c.put("/integrations/acme-aws", json={"vendor": "aws", "spec": {"hub_role_arn": hub, "external_id": "org-x", "name": "acme-aws"}}, headers=ADMIN)
+    c.put("/integrations/acme-data", json={"vendor": "aws", "parent": "acme-aws", "ceiling": ["aws_inventory_read"],
+                                           "spec": {"spoke_role_arn": "arn:aws:iam::111111111111:role/KoboAccess-Role", "account_id": "111111111111"}}, headers=ADMIN)
+    assert c.put("/integrations/github", json={"vendor": "github", "spec": {"installation_id": "777"}, "ceiling": ["github_repos_read"]}, headers=ADMIN).status_code == 200
+    # A flat role: one hop, the default region, the mapped list.
+    out = c.get("/integrations/aws-prod/models", headers=ADMIN).json()
+    assert out["integration"] == "aws-prod" and out["provider"] == "bedrock" and out["fetched_at"] == "2026-10-27T12:00:00Z"
+    assert calls["hops"][-1] == ("web-identity", "arn:aws:iam::123456789012:role/KoboAccess-Role", "bab-models")
+    assert calls["listed"][-1] == ("FLAT", "us-east-1")
+    by_id = {m["id"]: m for m in out["models"]}
+    assert by_id["us.anthropic.claude-sonnet-4-5-20250929-v1:0"]["via"] == "inference-profile"
+    assert by_id["anthropic.claude-3-haiku-20240307-v1:0"]["via"] == "on-demand"
+    assert "meta.llama3-3-70b-instruct-v1:0" not in by_id and not any("canvas" in k or "embed" in k for k in by_id)
+    # An account under an organization: through the hub with the organization's external id, in the asked region.
+    out = c.get("/integrations/acme-data/models?region=us-west-2", headers=ADMIN).json()
+    assert calls["hops"][-2:] == [("web-identity", hub, "bab-models"),
+                                  ("assume-role", "HUB", "arn:aws:iam::111111111111:role/KoboAccess-Role", "bab-models", "org-x")]
+    assert calls["listed"][-1] == ("SPOKE", "us-west-2") and len(out["models"]) == 6
+    # The organization row itself has no role to list with; AWS refusing is a 502 with its sentence.
+    r = c.get("/integrations/acme-aws/models", headers=ADMIN)
+    assert r.status_code == 409 and "is an organization" in r.json()["detail"]
+    r = c.get("/integrations/aws-prod/models?region=eu-west-1", headers=ADMIN)
+    assert r.status_code == 502 and r.json()["detail"].startswith("AWS refused listing Bedrock models in eu-west-1")
+    # A vendor that is not a cloud with models, or one whose minter cannot list, is 501.
+    r = c.get("/integrations/github/models", headers=ADMIN)
+    assert r.status_code == 501 and r.json()["detail"] == "bab cannot list models for 'github'"
+
+
+def test_a_cloud_row_whose_minter_cannot_list_models_is_501(world):
+    c, _, _, _ = world  # the static AWS minter has no list_models
+    connect(c, ["aws_inventory_read"])
+    assert c.get("/integrations/aws-prod/models", headers=ADMIN).status_code == 501
