@@ -459,8 +459,9 @@ def test_vertex_discovery_keeps_ga_chat_models_and_preview_only_where_a_family_h
 
     listed = [("google", m) for m in VERTEX_GOOGLE_PAGE1 + VERTEX_GOOGLE_PAGE2] + [("anthropic", m) for m in VERTEX_ANTHROPIC]
     rows = vertex_models(listed)
-    # GA chat text models only: embeddings, imagen, veo, tts, bison, a deploy-only gemma, the deprecated,
-    # the experimental and the preview rows of a family that has GA are all gone; a repeat is one row.
+    # GA chat text models only: embeddings, imagen, veo, tts, live audio, transcribe, nano-banana, bison, a
+    # deploy-only gemma, the deprecated, the experimental and the preview rows of a family that has GA are
+    # all gone; a repeat is one row.
     assert [r["id"] for r in rows] == ["claude-3-5-sonnet-v2", "claude-opus-4-1", "claude-sonnet-4-6",
                                        "gemini-2.0-flash-001", "gemini-2.5-flash", "gemini-2.5-pro"]
     assert {r["stage"] for r in rows} == {"GA"} and {r["via"] for r in rows} == {None}
@@ -475,8 +476,11 @@ def test_vertex_discovery_keeps_ga_chat_models_and_preview_only_where_a_family_h
                     ("google", {"name": "publishers/google/models/newfam-1.5", "launchStage": "PRIVATE_PREVIEW",
                                 "supportedActions": {"openGenerationAiStudio": {}}})]
     assert [(r["id"], r["stage"]) for r in vertex_models(only_preview)] == [("newfam-1.0-preview", "PUBLIC_PREVIEW")]
-    # A row without supportedActions is not something the room can call.
-    assert vertex_models([("google", {"name": "publishers/google/models/gemini-9-pro", "launchStage": "GA"})]) == []
+    # No supportedActions at all (every current Gemini row): kept, the name decides; actions that
+    # are deploy or notebook only: not something the room can call.
+    assert [r["id"] for r in vertex_models([("google", {"name": "publishers/google/models/gemini-9-pro", "launchStage": "GA"})])] == ["gemini-9-pro"]
+    assert vertex_models([("google", {"name": "publishers/google/models/gemini-9-pro", "launchStage": "GA",
+                                      "supportedActions": {"deploy": {}, "openNotebook": {}}})]) == []
     assert label_for("llama-3-3-70b-instruct") == "Llama 3.3 70B Instruct"
 
 

@@ -222,10 +222,13 @@ def _vertex(publisher: str, name: str, stage: str, *actions: str, version: str =
 
 STUDIO, TUNE, NOTEBOOK, DEPLOY = "openGenerationAiStudio", "openPromptTuningPipeline", "openNotebook", "deploy"
 VERTEX_GOOGLE_PAGE1 = [
-    _vertex("google", "gemini-2.5-pro", "GA", STUDIO, TUNE),
-    _vertex("google", "gemini-2.5-flash", "GA", STUDIO, TUNE),
+    _vertex("google", "gemini-2.5-pro", "GA"),  # current Gemini rows list no supportedActions at all
+    _vertex("google", "gemini-2.5-flash", "GA"),
+    _vertex("google", "gemini-3.5-transcribe", "GA"),
+    _vertex("google", "gemini-nano-banana-2.1", "GA"),  # image
     _vertex("google", "gemini-3-pro-preview", "PUBLIC_PREVIEW", STUDIO),  # the family has GA rows: dropped
     _vertex("google", "gemini-1.5-pro", "DEPRECATED", STUDIO),
+    _vertex("google", "gemini-live-2.5-flash-native-audio", "GA"),
     _vertex("google", "gemini-2.5-flash-preview-tts", "GA", STUDIO),  # speech
     _vertex("google", "text-embedding-005", "GA", NOTEBOOK),
     _vertex("google", "multimodalembedding", "GA", NOTEBOOK),

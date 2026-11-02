@@ -20,9 +20,10 @@ ones New agent shows (tenishai/kobo#405, section C).
   project (`spec.models.project`, then `spec.identity.project`, then `spec.project`) through
   `x-goog-user-project`; `location` (default us-east5, or the row's `spec.models.location`)
   is checked and kept for the console, since the listing has no location. Kept: launch stage
-  GA, or PUBLIC_PREVIEW only when a family has nothing GA; a generate-type action in
-  `supportedActions`; a chat text name (embedding, imagen, veo, tts, gecko, bison, codey and
-  the image, video and speech names go). `id` is the bare name (`claude-sonnet-4-6`), `via`
+  GA, or PUBLIC_PREVIEW only when a family has nothing GA; no `supportedActions` (every
+  current Gemini row) or a generate-type one among them (deploy- or notebook-only rows go); a
+  chat text name (embedding, imagen, veo, tts, gecko, bison, codey and the image, video,
+  speech, transcribe and translate names go). `id` is the bare name (`claude-sonnet-4-6`), `via`
   null. An AWS row lists Bedrock's models in `region` (default us-east-1) through its role,
   assumed briefly with no policy the way a probe does (through the hub for an account under
   an organization): `ListFoundationModels` cut to output TEXT, lifecycle ACTIVE, a chat name

@@ -22,14 +22,17 @@ PROVIDER_FOR = {"gcp": "vertex_ai", "aws": "bedrock"}  # vendor -> the provider 
 # Vertex launch stages: GA rows always; PUBLIC_PREVIEW only when a family has nothing GA.
 GA, PUBLIC_PREVIEW = "GA", "PUBLIC_PREVIEW"
 # A supportedActions key that means "this model answers a generate call" (Vertex AI Studio
-# opens it). Models that only deploy, tune or open a notebook are not chat models the room can call.
+# opens it). A row whose actions exist and are deploy, tune or notebook only is not a chat
+# model the room can call; a row with NO actions at all is kept and the name decides, since
+# every current Gemini row is listed with an empty supportedActions.
 _VERTEX_GENERATE_ACTION = re.compile(r"generation|genie", re.IGNORECASE)
 
 # Names that are not chat text models on either cloud: embeddings, image, video, speech and
 # the retired PaLM-era families. Matched as whole name segments (split on - . _ : @ /) ...
 _NOT_CHAT_TOKENS = frozenset({
     "tts", "gecko", "bison", "codey", "veo", "image", "video", "audio", "lyria", "chirp", "canvas",
-    "reel", "sonic", "live", "ocr", "speech", "stable", "voyage", "vision", "music",
+    "reel", "sonic", "live", "ocr", "speech", "stable", "voyage", "vision", "music", "transcribe",
+    "translate", "banana",
 })
 # ... or anywhere in the name, where the vendor glues words together (multimodalembedding, imagen).
 _NOT_CHAT_SUBSTRINGS = ("embed", "imagen", "rerank")
@@ -95,8 +98,9 @@ def vertex_publisher_models_url(publisher: str, page_token: str = "") -> str:
 
 def vertex_models(listed: list[tuple[str, dict]]) -> list[dict]:
     """The room's rows from Vertex's publisher models, `(publisher, publisherModel)` pairs as
-    listed. Kept: a chat text name, a generate-type action in `supportedActions`, launch stage
-    GA, or PUBLIC_PREVIEW when the family has nothing GA. Deprecated, private-preview and
+    listed. Kept: a chat text name, no `supportedActions` or a generate-type one among them
+    (deploy- or notebook-only rows go), launch stage GA, or PUBLIC_PREVIEW when the family has
+    nothing GA. Deprecated, private-preview and
     experimental rows go. `id` is the bare name; `via` is null (Vertex has one lane)."""
     rows: list[dict] = []
     for publisher, m in listed:
@@ -104,7 +108,7 @@ def vertex_models(listed: list[tuple[str, dict]]) -> list[dict]:
         if not name or not is_chat_name(name):
             continue
         actions = m.get("supportedActions") or {}
-        if not isinstance(actions, dict) or not any(_VERTEX_GENERATE_ACTION.search(k) for k in actions):
+        if isinstance(actions, dict) and actions and not any(_VERTEX_GENERATE_ACTION.search(k) for k in actions):
             continue
         stage = str(m.get("launchStage") or "")
         if stage not in (GA, PUBLIC_PREVIEW):
