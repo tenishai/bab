@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.17] - 2026-11-02
+
 The room's Models pane: which chat models each connected cloud offers, so an admin ticks the
 ones New agent shows (tenishai/kobo#405, section C).
 
