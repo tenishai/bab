@@ -6,6 +6,9 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The Vertex AI probe at connect lists the project's own models (`projects/{p}/locations/{l}/models`) instead of the publisher catalogue under a project, which Google answers with 404; every Google Cloud connect with the models tick failed on it.
+
 ## [0.4.15] - 2026-11-01
 
 Google Cloud, the way the room's cloud-access design describes it: bab's own identity is
