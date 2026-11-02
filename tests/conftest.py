@@ -176,11 +176,11 @@ class FakeGoogle:
             sa = url.rsplit("/serviceAccounts/", 1)[1].split(":")[0]
             self.n += 1
             return 200, {"accessToken": f"imp-{self.n}-{sa}", "expireTime": "2026-11-01T13:00:00.123456Z"}
-        if "aiplatform.googleapis.com/v1/projects/" in url and "/publishers/google/models" in url:
+        if "aiplatform.googleapis.com/v1/projects/" in url and url.split("?")[0].endswith("/models"):
             location = url.split("/locations/")[1].split("/")[0]
             if location in self.vertex_forbidden:
-                return 403, {"error": {"code": 403, "message": "Permission 'aiplatform.endpoints.predict' denied", "status": "PERMISSION_DENIED"}}
-            return 200, {"publisherModels": [{"name": f"publishers/google/models/gemini@{location}"}]}
+                return 403, {"error": {"code": 403, "message": "Permission 'aiplatform.models.list' denied", "status": "PERMISSION_DENIED"}}
+            return 200, {}  # a project with no models of its own answers an empty page
         if "/v1/projects/" in url:
             pid = url.rsplit("/", 1)[1]
             if pid in self.forbidden:

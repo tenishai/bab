@@ -406,11 +406,13 @@ def test_gcp_minter_identity_and_probe_name_the_identity_to_grant():
         m.probe()
     # A folder or organization probes as "can bab list its projects".
     assert m.probe(parent="folders/123") == {"parent": "folders/123", "projects": 2, "subject": BAB_EMAIL, "hops": 1}
-    # A project that serves models: the same token then lists Vertex AI's publisher models in the
-    # location, at a URL bab builds (regional host; the plain host for `global`), never one a caller sends.
+    # A project that serves models: the same token then lists the project's own Vertex AI models in
+    # the location (an empty page is fine; the publisher catalogue is not project-scoped and answers
+    # 404 under a project), at a URL bab builds (regional host; the plain host for `global`), never
+    # one a caller sends.
     out = m.probe(project="example-project", vertex_location="us-east5")
     assert out["vertex"] == {"location": "us-east5", "ok": True} and out["hops"] == 1
-    assert g.calls[-1][1] == "https://us-east5-aiplatform.googleapis.com/v1/projects/example-project/locations/us-east5/publishers/google/models?pageSize=1"
+    assert g.calls[-1][1] == "https://us-east5-aiplatform.googleapis.com/v1/projects/example-project/locations/us-east5/models?pageSize=1"
     assert g.headers[-1]["Authorization"] == g.headers[-2]["Authorization"]  # the token that read the project
     m.probe(project="example-project", vertex_location="global")
     assert g.calls[-1][1].startswith("https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/")

@@ -711,11 +711,14 @@ _GCP_LOCATION = re.compile(r"^(global|[a-z]+-[a-z]+\d+)$")
 
 
 def vertex_models_url(project: str, location: str) -> str:
-    """Vertex AI's publisher-models listing for a project and location: the regional host, or
-    the plain host for `global`. Built here, never taken from a caller: a probe presents a token
-    for bab's identity to this URL, so the host is bab's choice."""
+    """Vertex AI's model list for a project and location: the regional host, or the plain host
+    for `global`. The project's own models (an empty list is a fine answer): listing them needs
+    the Vertex AI role in that project and proves the API is on there, which is what a model
+    call needs. The publisher catalogue is not project-scoped and answers 404 under a project
+    (seen live 2026-11-02), so it is not the probe. Built here, never taken from a caller: a
+    probe presents a token for bab's identity to this URL, so the host is bab's choice."""
     host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
-    return f"https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models?pageSize=1"
+    return f"https://{host}/v1/projects/{project}/locations/{location}/models?pageSize=1"
 
 
 class GcpMinter:
