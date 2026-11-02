@@ -23,7 +23,8 @@ from bab.catalogue import Catalogue
 from bab.door import Door, Verdict, rfc3339
 from bab.service.identity import Caller, ConsoleAuth, IdentityError
 from bab.service.ledger import AgentRow, Event, GrantRow, Integration, Lease, Ledger, Request
-from bab.service.minters import Minter, MintError, NotConfigured, Unreachable
+from bab.service.minters import DEFAULT_AUDIENCE, Minter, MintError, NotConfigured, Unreachable
+from bab.service.models import PROVIDER_FOR
 from bab.store import Store, StoreError, Tuple
 from bab.sync import reconcile, topology
 
@@ -556,6 +557,52 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         lane = ({"external_id": external_id, "role_name": body.role_name} if hub
                 else {"parent": spec.get("parent_resource")})
         return {"organization": integration, **lane, "accounts": looked}
+
+    @app.get("/integrations/{integration}/models")
+    def integration_models(integration: str, caller: Console, location: str | None = None,
+                           region: str | None = None):
+        """The chat models a connected cloud offers, listed with the identity the probes use
+        and cut to chat text models that are generally available: what an admin ticks for New
+        agent. A Google Cloud row lists Vertex AI's publisher models for its Vertex project
+        (`spec.models.project`, then `spec.identity.project`, then `spec.project`; `location`
+        default global, the row's `spec.models.location` when set); an AWS row lists Bedrock's
+        models in `region` (default us-east-1) through its role, the hub lane for an account
+        under an organization. Any other vendor is 501; the vendor refusing is 502 with its
+        own sentence."""
+        reviewer(caller)
+        with ledger.session() as s:
+            row = integration_or_404(s, integration)
+            spec = {k: v for k, v in dict(row.spec or {}).items() if v is not None}
+            parent = s.get(Integration, row.parent) if row.parent else None
+            if parent is not None and parent.kind == "org":
+                spec = {"hub_role_arn": parent.spec.get("hub_role_arn"), "audience": parent.spec.get("audience"),
+                        "external_id": parent.spec.get("external_id"), **spec}
+        provider = PROVIDER_FOR.get(row.vendor)
+        minter = minters.get(row.vendor)
+        if provider is None or minter is None or not hasattr(minter, "list_models"):
+            raise HTTPException(501, f"bab cannot list models for {row.vendor!r}")
+        models_spec = spec.get("models") if isinstance(spec.get("models"), dict) else {}
+        identity_spec = spec.get("identity") if isinstance(spec.get("identity"), dict) else {}
+        try:
+            if provider == "vertex_ai":
+                project = str(models_spec.get("project") or identity_spec.get("project") or spec.get("project") or "").strip()
+                if not project:
+                    raise HTTPException(409, f"{integration!r} names no Vertex AI project; connect it again naming one")
+                where = str(location or models_spec.get("location") or "global").strip()
+                listed = minter.list_models(project=project, location=where,
+                                            service_account=str(spec.get("service_account") or "") or None)
+            else:
+                if row.kind == "org":
+                    raise HTTPException(409, f"{integration!r} is an organization; ask for one of its accounts' models")
+                where = str(region or models_spec.get("region") or "us-east-1").strip()
+                listed = minter.list_models(region=where, role_arn=spec.get("role_arn"),
+                                            spoke_role_arn=spec.get("spoke_role_arn"), hub_role_arn=spec.get("hub_role_arn"),
+                                            external_id=spec.get("external_id"),
+                                            audience=str(spec.get("audience") or "") or DEFAULT_AUDIENCE)
+        except MintError as exc:  # the vendor's sentence, whether it refused or did not answer
+            raise HTTPException(502, str(exc)) from exc
+        return {"integration": integration, "provider": provider, "models": listed,
+                "fetched_at": rfc3339(settings.now())}
 
     @app.delete("/integrations/{integration}")
     def delete_integration(integration: str, caller: Console):

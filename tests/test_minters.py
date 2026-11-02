@@ -453,3 +453,97 @@ def test_every_gcp_permission_names_its_roles_and_vertex_ai_is_the_one_user_role
     assert all(r.startswith("roles/") for rs in roles.values() for r in rs)
     not_viewer = {n for n, rs in roles.items() if any(not r.endswith(("viewer", "Viewer", "reader", "Reader", "browser")) for r in rs)}
     assert not_viewer == {"gcp_vertex_ai_user"}
+
+
+def test_vertex_discovery_keeps_ga_chat_models_and_preview_only_where_a_family_has_nothing_ga():
+    from bab.service.models import label_for, vertex_models
+    from tests.conftest import VERTEX_ANTHROPIC, VERTEX_GOOGLE_PAGE1, VERTEX_GOOGLE_PAGE2
+
+    listed = [("google", m) for m in VERTEX_GOOGLE_PAGE1 + VERTEX_GOOGLE_PAGE2] + [("anthropic", m) for m in VERTEX_ANTHROPIC]
+    rows = vertex_models(listed)
+    # GA chat text models only: embeddings, imagen, veo, tts, live audio, transcribe, nano-banana, bison, a
+    # deploy-only gemma, the deprecated, the experimental and the preview rows of a family that has GA are
+    # all gone; a repeat is one row.
+    assert [r["id"] for r in rows] == ["claude-3-5-sonnet-v2", "claude-opus-4-1", "claude-sonnet-4-6",
+                                       "gemini-2.0-flash-001", "gemini-2.5-flash", "gemini-2.5-pro"]
+    assert {r["stage"] for r in rows} == {"GA"} and {r["via"] for r in rows} == {None}
+    sonnet = next(r for r in rows if r["id"] == "claude-sonnet-4-6")
+    assert sonnet == {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "publisher": "Anthropic",
+                      "family": "claude", "stage": "GA", "via": None}
+    assert next(r for r in rows if r["id"] == "gemini-2.5-pro")["label"] == "Gemini 2.5 Pro"
+    assert next(r for r in rows if r["id"] == "claude-3-5-sonnet-v2")["label"] == "Claude 3.5 Sonnet v2"
+    # A family with nothing GA keeps its public preview; private preview never shows.
+    only_preview = [("google", {"name": "publishers/google/models/newfam-1.0-preview", "launchStage": "PUBLIC_PREVIEW",
+                                "supportedActions": {"openGenerationAiStudio": {}}}),
+                    ("google", {"name": "publishers/google/models/newfam-1.5", "launchStage": "PRIVATE_PREVIEW",
+                                "supportedActions": {"openGenerationAiStudio": {}}})]
+    assert [(r["id"], r["stage"]) for r in vertex_models(only_preview)] == [("newfam-1.0-preview", "PUBLIC_PREVIEW")]
+    # No supportedActions at all (every current Gemini row): kept, the name decides; actions that
+    # are deploy or notebook only: not something the room can call.
+    assert [r["id"] for r in vertex_models([("google", {"name": "publishers/google/models/gemini-9-pro", "launchStage": "GA"})])] == ["gemini-9-pro"]
+    assert vertex_models([("google", {"name": "publishers/google/models/gemini-9-pro", "launchStage": "GA",
+                                      "supportedActions": {"deploy": {}, "openNotebook": {}}})]) == []
+    assert label_for("llama-3-3-70b-instruct") == "Llama 3.3 70B Instruct"
+
+
+def test_bedrock_discovery_maps_profile_only_models_to_the_regions_system_profile():
+    from bab.service.models import bedrock_models, profile_for
+    from tests.conftest import BEDROCK_MODELS, BEDROCK_PROFILES
+
+    rows = {r["id"]: r for r in bedrock_models(BEDROCK_MODELS, BEDROCK_PROFILES, "us-east-1")}
+    # Text output, ACTIVE, a chat name, served on demand or by a profile: image, speech, embedding,
+    # rerank, provisioned-only, legacy and a profile-only model with no profile are gone.
+    assert sorted(rows) == ["amazon.titan-text-express-v1", "anthropic.claude-3-haiku-20240307-v1:0",
+                            "global.mistral.pixtral-large-2502-v1:0", "us.amazon.nova-pro-v1:0",
+                            "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "us.deepseek.r1-v1:0"]
+    # On demand when the model supports it, even if a profile exists too; the region's geo profile
+    # is preferred over global and over another geo's; global when the geo has none.
+    assert rows["anthropic.claude-3-haiku-20240307-v1:0"]["via"] == "on-demand"
+    assert rows["us.anthropic.claude-sonnet-4-5-20250929-v1:0"] == {
+        "id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "label": "Claude Sonnet 4.5", "publisher": "Anthropic",
+        "family": "claude", "stage": "GA", "via": "inference-profile"}
+    assert rows["global.mistral.pixtral-large-2502-v1:0"]["family"] == "pixtral"
+    assert rows["us.deepseek.r1-v1:0"]["family"] == "deepseek" and rows["us.amazon.nova-pro-v1:0"]["family"] == "nova"
+    assert profile_for("anthropic.claude-sonnet-4-5-20250929-v1:0", BEDROCK_PROFILES, "eu-west-1") == "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    assert profile_for("amazon.nova-pro-v1:0", BEDROCK_PROFILES, "eu-west-1") == "us.amazon.nova-pro-v1:0"  # the one there is
+    assert profile_for("meta.llama3-3-70b-instruct-v1:0", BEDROCK_PROFILES, "us-east-1") is None
+    # Nothing listed in another region: an empty answer, not an error.
+    assert bedrock_models([], [], "eu-west-1") == []
+
+
+def test_aws_minter_lists_bedrock_through_the_hub_for_an_account_under_an_organization():
+    from bab.service.minters import MintError
+    from tests.conftest import BEDROCK_MODELS, BEDROCK_PROFILES
+
+    hops, listed = [], []
+
+    def assume(role_arn, token, name, seconds, policy):
+        hops.append(("web-identity", role_arn, name, seconds, policy))
+        return {"Credentials": {"AccessKeyId": "HUB", "SecretAccessKey": "s", "SessionToken": "t",
+                                "Expiration": datetime(2026, 10, 27, 13, 0, tzinfo=UTC)},
+                "AssumedRoleUser": {"Arn": "arn:aws:sts::999999999999:assumed-role/BabHub/bab-models"}}
+
+    def assume_role(creds, role_arn, name, seconds, policy, external_id):
+        hops.append(("assume-role", creds["AccessKeyId"], role_arn, name, seconds, policy, external_id))
+        return {"Credentials": {"AccessKeyId": "SPOKE", "SecretAccessKey": "s", "SessionToken": "t",
+                                "Expiration": datetime(2026, 10, 27, 13, 0, tzinfo=UTC)},
+                "AssumedRoleUser": {"Arn": "arn:aws:sts::111111111111:assumed-role/BabSpoke/bab-models"}}
+
+    def list_bedrock(creds, region):
+        listed.append((creds["AccessKeyId"], region))
+        return BEDROCK_MODELS, BEDROCK_PROFILES
+
+    m = AwsMinter(token_source=lambda aud: "jwt", assume=assume, assume_role=assume_role, list_bedrock=list_bedrock)
+    rows = m.list_models(region="us-west-2", hub_role_arn="arn:aws:iam::999999999999:role/BabHub",
+                         spoke_role_arn="arn:aws:iam::111111111111:role/BabSpoke", external_id="x1")
+    # The probe's shape: hub first with no policy, then the spoke with the external id; Bedrock is read as the spoke.
+    assert hops[0][:3] == ("web-identity", "arn:aws:iam::999999999999:role/BabHub", "bab-models") and hops[0][4] is None
+    assert hops[1] == ("assume-role", "HUB", "arn:aws:iam::111111111111:role/BabSpoke", "bab-models", 900, None, "x1")
+    assert listed == [("SPOKE", "us-west-2")] and len(rows) == 6
+    # A flat role is one hop; no role at all, or a bad region, never reaches AWS.
+    m.list_models(role_arn="arn:aws:iam::123456789012:role/KoboAccess-Role")
+    assert hops[-1][:2] == ("web-identity", "arn:aws:iam::123456789012:role/KoboAccess-Role") and listed[-1] == ("HUB", "us-east-1")
+    with pytest.raises(MintError, match="names no IAM role"):
+        m.list_models()
+    with pytest.raises(MintError, match="is not an AWS region"):
+        m.list_models(region="everywhere", role_arn="arn:aws:iam::123456789012:role/KoboAccess-Role")
