@@ -419,7 +419,7 @@ def test_gcp_minter_identity_and_probe_name_the_identity_to_grant():
     with pytest.raises(Unreachable) as exc:
         m.probe(project="example-project", vertex_location="europe-west9")
     assert str(exc.value) == (f"{BAB_EMAIL} cannot reach Vertex AI in europe-west9 for project example-project: "
-                              "HTTP 403 Permission 'aiplatform.endpoints.predict' denied")
+                              "HTTP 403 Permission 'aiplatform.models.list' denied")
     with pytest.raises(MintError, match="is not a Vertex AI location"):
         m.probe(project="example-project", vertex_location="https://evil.example/")
 
