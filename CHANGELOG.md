@@ -6,6 +6,9 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- The room catalogue's first Atlassian writing level, `atlassian_jira_issues_write` (mutate tier, label "Write issues"): create and edit issues, add comments and move issues between statuses. A room's gateway opens the matching tools only to an agent granted it.
+
 ## [0.4.17] - 2026-11-02
 
 The room's Models pane: which chat models each connected cloud offers, so an admin ticks the
