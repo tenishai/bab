@@ -202,6 +202,11 @@ actions:
   - {name: atlassian_confluence_search,     tier: read, vendor: atlassian, group: Confluence, description: "Search content with CQL"}
   - {name: atlassian_confluence_spaces_read, tier: read, vendor: atlassian, group: Confluence, description: "List spaces and page trees"}
   - {name: atlassian_confluence_comments_read, tier: read, vendor: atlassian, group: Confluence, description: "Read comments on pages"}
+  # One writing level for Jira (tenishai/kobo, 2026-11-03). The gateway's atlassian target keeps the
+  # creating, editing, commenting and transitioning tools behind a scope only this permission opens;
+  # the connection's shared credential is the outer wall, and a room connected read-only never offers it.
+  - {name: atlassian_jira_issues_write, tier: mutate, vendor: atlassian, group: Jira, label: "Write issues",
+     description: "Create and edit issues, add comments and move issues between statuses"}
 
   # ---- github: three levels, each a superset of the one before (Read < Review < Open). Each row
   # names the GitHub App permissions it needs; the minter narrows an installation token to their
