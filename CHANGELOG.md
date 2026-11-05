@@ -7,6 +7,7 @@ All notable changes to bab are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- A deploy contract: `gojira.yaml`, `k8s/base` (bab's service account and OpenFGA, pinned by digest, migrating its Postgres schema before every start) and `k8s/cluster/tokenreview.yaml`, so Gojira, or the stack installer's published-image path, deploys bab and its store together. The Datadog and GitHub minters load as optional env Secrets; an install without one runs without that vendor.
 - The room catalogue's first Atlassian writing level, `atlassian_jira_issues_write` (mutate tier, label "Write issues"): create and edit issues, add comments and move issues between statuses. A room's gateway opens the matching tools only to an agent granted it.
 
 ## [0.4.17] - 2026-11-02
