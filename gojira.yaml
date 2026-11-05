@@ -1,0 +1,38 @@
+# bab's deploy contract (https://github.com/tenishai/gojira). Gojira renders the
+# Deployment, Service and probes; k8s/base carries what it doesn't model
+# (bab's service account and OpenFGA, the store bab keeps its tuples in).
+#
+# An install that deploys a published image (the stack installer's
+# deploy_repo) replaces app, class, image and environments, and merges its
+# own `contract:` last: set BAB_ADMIN_TEAM and BAB_SECURITY_TEAM there.
+app: bab
+class: gateway
+environments:
+  - name: dev
+    namespace: bab
+port: 8080
+health: /healthz
+service_account: bab
+# TokenReview: bab authenticates callers (the room, the tool gateway) by
+# their projected service-account tokens. k8s/cluster/tokenreview.yaml.
+cluster_roles: [bab-tokenreview]
+# BAB_CONSOLE_TOKEN (the room's key to the console API), BAB_DATABASE_URL
+# (Postgres: grants, leases, the ledger), BAB_FGA_TOKEN (OpenFGA's preshared
+# key; the same value openfga-secrets holds as OPENFGA_AUTHN_PRESHARED_KEYS).
+secrets_from: [bab-secrets]
+# Vendor minters, each optional: bab reads a key from its mounted directory
+# or, failing that, the environment, so these load as env. Absent, that
+# vendor's leases are refused and everything else runs.
+#   bab-datadog: DD_API_KEY, DD_MGMT_APP_KEY, DD_SERVICE_ACCOUNT_ID, DD_SITE
+#   bab-github:  GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, GITHUB_APP_PRIVATE_KEY
+secrets_from_optional: [bab-datadog, bab-github]
+env:
+  BAB_FGA_URL: http://openfga:8080
+  BAB_FGA_STORE_NAME: bab
+  BAB_CATALOGUE: catalogues/room.yaml
+  BAB_ROOM: kobo
+  BAB_IDENTITY: tokenreview
+  BAB_TOKEN_AUDIENCE: bab
+  # The tool gateway's service account (namespace/name): the one caller the
+  # gateway lane (POST /leases/for-agent) accepts.
+  BAB_GATEWAY_SERVICE_ACCOUNT: liminal/liminal
