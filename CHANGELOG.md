@@ -10,6 +10,9 @@ All notable changes to bab are documented here. The format follows
 - A deploy contract: `gojira.yaml`, `k8s/base` (bab's service account and OpenFGA, pinned by digest, migrating its Postgres schema before every start) and `k8s/cluster/tokenreview.yaml`, so Gojira, or the stack installer's published-image path, deploys bab and its store together. The Datadog and GitHub minters load as optional env Secrets; an install without one runs without that vendor.
 - The room catalogue's first Atlassian writing level, `atlassian_jira_issues_write` (mutate tier, label "Write issues"): create and edit issues, add comments and move issues between statuses. A room's gateway opens the matching tools only to an agent granted it.
 
+### Fixed
+- `bab serve` ignores the `BAB_PORT=tcp://<ip>:<port>` Kubernetes injects for a Service named bab, and listens on 8080. It used to take that Service's port, so a Service on 80 in front of the container moved bab to 80 and every probe on 8080 was refused.
+
 ## [0.4.17] - 2026-11-02
 
 The room's Models pane: which chat models each connected cloud offers, so an admin ticks the
