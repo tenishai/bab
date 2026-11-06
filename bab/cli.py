@@ -56,11 +56,15 @@ def cmd_sync(args) -> int:
 
 
 def _port_from_env(default: int = 8080) -> int:
-    """BAB_PORT, tolerating the `tcp://host:port` Kubernetes injects for a Service named bab."""
+    """BAB_PORT, ignoring the `tcp://host:port` Kubernetes injects for a Service named bab.
+
+    That value names the Service's port, not the one bab should listen on: a
+    Service on 80 in front of a container on 8080 would move bab to 80.
+    """
     raw = os.environ.get("BAB_PORT", "").strip()
-    if not raw:
+    if not raw or "://" in raw:
         return default
-    return int(raw.rsplit(":", 1)[-1])
+    return int(raw)
 
 
 def cmd_serve(args) -> int:

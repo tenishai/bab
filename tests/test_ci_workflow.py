@@ -19,12 +19,13 @@ def test_every_job_sends_fork_prs_to_a_hosted_runner():
         assert job["runs-on"] == FORK_SAFE, f"job {name!r} can reach the self-hosted runner"
 
 
-def test_port_from_env_tolerates_kubernetes_service_links(monkeypatch):
+def test_port_from_env_ignores_kubernetes_service_links(monkeypatch):
     from bab.cli import _port_from_env
 
     monkeypatch.delenv("BAB_PORT", raising=False)
     assert _port_from_env() == 8080
     monkeypatch.setenv("BAB_PORT", "9000")
     assert _port_from_env() == 9000
-    monkeypatch.setenv("BAB_PORT", "tcp://10.140.5.222:8080")
+    # A Service named bab on port 80 injects this; bab still listens on 8080.
+    monkeypatch.setenv("BAB_PORT", "tcp://10.140.5.222:80")
     assert _port_from_env() == 8080
