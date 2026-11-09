@@ -545,6 +545,13 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             if a.get("status") not in (None, "ACTIVE"):
                 out["reason"] = f"{noun} is {a.get('status')}"
                 return out
+            if not hub:
+                # Google Cloud: the tree came from `projects:search`, which lists only what bab's
+                # identity may read, so every project here is reachable by construction. Probing
+                # each one again (737 projects on 2026-11-09) took minutes and tripped Resource
+                # Manager's rate limit, which marked readable projects "not granted".
+                out["reachable"] = True
+                return out
             try:
                 minter.probe(**accepted(minter.probe, ask, f"a probe for {row.vendor!r}"))
                 out["reachable"] = True
