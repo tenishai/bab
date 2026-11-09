@@ -405,7 +405,7 @@ def test_gcp_minter_identity_and_probe_name_the_identity_to_grant():
     with pytest.raises(MintError, match="names a project, or a folder or organization"):
         m.probe()
     # A folder or organization probes as "can bab list its projects".
-    assert m.probe(parent="folders/123") == {"parent": "folders/123", "projects": 2, "subject": BAB_EMAIL, "hops": 1}
+    assert m.probe(parent="folders/123") == {"parent": "folders/123", "projects": 3, "subject": BAB_EMAIL, "hops": 1}
     # A project that serves models: the same token then lists the project's own Vertex AI models in
     # the location (an empty page is fine; the publisher catalogue is not project-scoped and answers
     # 404 under a project), at a URL bab builds (regional host; the plain host for `global`), never
@@ -430,15 +430,48 @@ def test_gcp_minter_lists_the_active_projects_under_a_folder_or_organization():
 
     g = FakeGoogle()
     m = GcpMinter(http=g)
-    assert m.list_accounts("organizations/456") == [{"id": "example-project", "name": "Example", "status": "ACTIVE"},
-                                                     {"id": "locked-project", "name": "Locked", "status": "ACTIVE"}]
-    urls = [u for _, u, _ in g.calls if "/v3/projects" in u]
-    assert urls == ["https://cloudresourcemanager.googleapis.com/v3/projects?parent=organizations/456&pageSize=500",
-                    "https://cloudresourcemanager.googleapis.com/v3/projects?parent=organizations/456&pageSize=500&pageToken=page-2"]
+    # The whole tree: the parent's own projects first (two pages, the deleted one dropped), then
+    # the sub-folder's, each naming the folders between the parent and itself and its number.
+    assert m.list_accounts("organizations/456") == [
+        {"id": "example-project", "name": "Example", "status": "ACTIVE", "project_number": "123456789012",
+         "folder": "organizations/456", "folder_path": []},
+        {"id": "locked-project", "name": "Locked", "status": "ACTIVE", "project_number": "222",
+         "folder": "organizations/456", "folder_path": []},
+        {"id": "nested-project", "name": "Nested", "status": "ACTIVE", "project_number": "777000111",
+         "folder": "folders/777", "folder_path": ["Dev"]},
+    ]
+    urls = [u.split("/v3/", 1)[1] for _, u, _ in g.calls if "/v3/" in u]
+    assert urls == ["projects?parent=organizations/456&pageSize=300",
+                    "projects?parent=organizations/456&pageSize=300&pageToken=page-2",
+                    "folders?parent=organizations/456&pageSize=300",
+                    "projects?parent=folders/777&pageSize=300",
+                    "folders?parent=folders/777&pageSize=300"]  # the deleted folder Gone is never entered
     assert all(h["Authorization"] == "Bearer own-1" for h in g.headers[1:])
     with pytest.raises(MintError, match="is not a folder or organization"):
         m.list_accounts("example-project")
     assert default_minters()["gcp"].name == "gcp"
+
+
+def test_gcp_minter_stops_walking_a_tree_at_its_depth_and_folder_caps():
+    """Gate (bounds): a tree deeper or wider than the caps answers what it found by then, so
+    a runaway organization cannot hold a discover open; projects already listed stay."""
+    from bab.service import minters as mod
+    from bab.service.minters import GcpMinter
+
+    class Endless:
+        """Every folder holds one folder; every node holds one project."""
+        def __call__(self, method, url, headers, body):
+            if "metadata.google.internal" in url:
+                return 200, {"access_token": "own", "expires_in": 1800}
+            parent = url.split("parent=")[1].split("&")[0]
+            n = int(parent.rsplit("/", 1)[1])
+            if "/v3/projects" in url:
+                return 200, {"projects": [{"name": f"projects/{n}", "projectId": f"p-{n:06d}", "displayName": f"P{n}", "state": "ACTIVE"}]}
+            return 200, {"folders": [{"name": f"folders/{n + 1}", "displayName": f"F{n + 1}", "state": "ACTIVE"}]}
+
+    out = GcpMinter(http=Endless()).list_accounts("folders/100000")
+    assert len(out) == mod.GCP_TREE_DEPTH + 1  # the parent and one project per level down to the cap
+    assert out[-1]["folder_path"] == [f"F{100000 + i}" for i in range(1, mod.GCP_TREE_DEPTH + 1)]
 
 
 def test_every_gcp_permission_names_its_roles_and_vertex_ai_is_the_one_user_role():

@@ -764,6 +764,10 @@ GCP_MAX_SECONDS = 3600  # generateAccessToken's ceiling without an org policy ch
 GCP_PROBE_SECONDS = 600
 GCP_IDENTITY_AUDIENCE = "bab"  # the identity token is read for its claims, never presented anywhere
 GCP_OWN = "bab's own identity"
+# The tree walk under a folder or organization: how deep, how many folders in all, and the page size.
+GCP_TREE_DEPTH = 10
+GCP_TREE_FOLDERS = 500
+GCP_PAGE_SIZE = 300
 _GCP_PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _GCP_PARENT = re.compile(r"^(folders|organizations)/\d+$")
 _GCP_SA = re.compile(r"^[\w.+-]+@[\w.-]+\.gserviceaccount\.com$")
@@ -957,27 +961,50 @@ class GcpMinter:
         return discovery.vertex_models(listed)
 
     def list_accounts(self, parent: str) -> list[dict]:
-        """The active projects directly under a folder or organization, as bab's own identity
-        can see them (`resourcemanager.projects.list` on the parent). Projects inside a
-        sub-folder are not listed; connect that folder."""
+        """The active projects under a folder or organization, the whole tree down
+        (`resourcemanager.folders.list` and `resourcemanager.projects.list`, both in
+        roles/browser), as bab's own identity can see them. Each project names the folders
+        between the parent and itself (`folder_path`, display names, the parent excluded)
+        and its number; the list is sorted by that path, then by name. The walk stops at
+        GCP_TREE_DEPTH folders down and GCP_TREE_FOLDERS folders in all, so a runaway
+        tree cannot hold a request open; what was found by then is answered."""
         parent = str(parent or "").strip()
         if not _GCP_PARENT.match(parent):
             raise MintError(f"{parent!r} is not a folder or organization (folders/<number> or organizations/<number>)")
         token, _ = self._own_token()
         out: list[dict] = []
+        queue: list[tuple[str, list[str], int]] = [(parent, [], 0)]
+        seen = 0
+        while queue:
+            node, path, depth = queue.pop(0)
+            for p in self._list_under(token, node, "projects"):
+                if p.get("state") == "ACTIVE" and p.get("projectId"):
+                    out.append({"id": str(p["projectId"]), "name": str(p.get("displayName") or p["projectId"]),
+                                "status": "ACTIVE", "project_number": str(p.get("name") or "").rsplit("/", 1)[-1],
+                                "folder": node, "folder_path": list(path)})
+            if depth >= GCP_TREE_DEPTH or seen >= GCP_TREE_FOLDERS:
+                continue
+            for f in self._list_under(token, node, "folders"):
+                if f.get("state", "ACTIVE") != "ACTIVE" or not f.get("name"):
+                    continue
+                seen += 1
+                queue.append((str(f["name"]), [*path, str(f.get("displayName") or f["name"])], depth + 1))
+        return sorted(out, key=lambda p: (p["folder_path"], p["name"], p["id"]))
+
+    def _list_under(self, token: str, parent: str, what: str) -> list[dict]:
+        """Every page of Resource Manager v3's `projects` or `folders` directly under `parent`."""
+        rows: list[dict] = []
         page = ""
         while True:
-            url = f"{GCP_RESOURCE_MANAGER_URL}/v3/projects?parent={parent}&pageSize=500" + (f"&pageToken={page}" if page else "")
+            url = (f"{GCP_RESOURCE_MANAGER_URL}/v3/{what}?parent={parent}&pageSize={GCP_PAGE_SIZE}"
+                   + (f"&pageToken={page}" if page else ""))
             status, data = self.http("GET", url, self._bearer(token), None)
             if status != 200:
-                raise MintError(f"Google refused listing the projects under {parent}: {self._error(status, data)}")
-            out += [{"id": str(p.get("projectId") or ""), "name": str(p.get("displayName") or p.get("projectId") or ""),
-                     "status": str(p.get("state") or "")}
-                    for p in (data.get("projects") or []) if p.get("state") == "ACTIVE" and p.get("projectId")]
+                raise MintError(f"Google refused listing the {what} under {parent}: {self._error(status, data)}")
+            rows += [r for r in (data.get(what) or []) if isinstance(r, dict)]
             page = str(data.get("nextPageToken") or "")
             if not page:
-                return sorted(out, key=lambda p: (p["name"], p["id"]))
-
+                return rows
 
 def _iso_epoch(iso: str) -> float:
     """An RFC 3339 instant (`2026-10-31T17:00:00Z`, Google's `...00.123456Z` too) as an epoch,
