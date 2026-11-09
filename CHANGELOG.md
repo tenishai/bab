@@ -6,6 +6,15 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.20] - 2026-11-09
+
+### Changed
+- **Google Cloud discover** no longer probes each project after the tree search: `projects:search`
+  lists only what bab's identity may read, so every project it returns is reachable by
+  construction. Probing 737 projects one by one took minutes and tripped Resource Manager's
+  rate limit, which marked readable projects "not granted" in the console. AWS discover still
+  probes each account through the hub (that is the only way to know the spoke role exists).
+
 ## [0.4.19] - 2026-11-09
 
 The Google Cloud tree is read in two searches, not two calls per folder: the 0.4.18 walk of
