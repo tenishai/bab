@@ -731,8 +731,9 @@ def test_a_google_cloud_project_is_probed_connected_discovered_and_leased(google
     assert found["organization"] == "example-org" and found["parent"] == "folders/123" and "external_id" not in found
     by_id = {a["id"]: a for a in found["accounts"]}
     assert by_id["example-project"]["connected"] is True and by_id["example-project"]["reachable"] is True
-    assert by_id["locked-project"]["connected"] is False and by_id["locked-project"]["reachable"] is False
-    assert "has no access on project locked-project" in by_id["locked-project"]["reason"]
+    # Every project the search returned is readable by construction: no per-project probe.
+    assert by_id["locked-project"]["connected"] is False and by_id["locked-project"]["reachable"] is True
+    assert by_id["locked-project"]["reason"] is None
     assert "role_arn" not in by_id["example-project"]
     # A project two folders down is discovered too, with the folders between it and the parent.
     assert by_id["nested-project"]["reachable"] is True and by_id["nested-project"]["folder_path"] == ["Dev"]
