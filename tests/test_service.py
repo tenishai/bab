@@ -703,7 +703,7 @@ def test_a_google_cloud_project_is_probed_connected_discovered_and_leased(google
     assert c.post("/probe/gcp", json={"project": "example-project", "service_account": sa}, headers=ADMIN).json()["hops"] == 2
     r = c.post("/probe/gcp", json={"project": "locked-project"}, headers=ADMIN)
     assert r.status_code == 409 and r.json()["detail"].startswith(f"{BAB_EMAIL} has no access on project locked-project")
-    assert c.post("/probe/gcp", json={"parent": "folders/123"}, headers=ADMIN).json()["projects"] == 2
+    assert c.post("/probe/gcp", json={"parent": "folders/123"}, headers=ADMIN).json()["projects"] == 3  # the sub-folder's too
     # A project that serves models: `vertex_location` adds a Vertex check; a `vertex_url` the room sends is
     # accepted and never fetched (the token goes only to the URL bab builds). Vertex refusing is a 502.
     out = c.post("/probe/gcp", json={"project": "example-project", "vertex_location": "us-east5",
@@ -717,7 +717,9 @@ def test_a_google_cloud_project_is_probed_connected_discovered_and_leased(google
     out = c.put("/integrations/example-org", json={"vendor": "gcp", "spec": {"parent_resource": "folders/123", "name": "example-org"}}, headers=ADMIN).json()
     assert out["kind"] == "org"
     accts = c.get("/integrations/example-org/accounts", headers=OWNER).json()
-    assert [(a["id"], a["status"], a["connected"]) for a in accts["accounts"]] == [("example-project", "ACTIVE", False), ("locked-project", "ACTIVE", False)]
+    assert [(a["id"], a["status"], a["connected"], a["folder_path"]) for a in accts["accounts"]] == [
+        ("example-project", "ACTIVE", False, []), ("locked-project", "ACTIVE", False, []), ("nested-project", "ACTIVE", False, ["Dev"])]
+    assert accts["accounts"][0]["project_number"] == "123456789012"
     # A project under it: kind account, no role to look for; discover marks the one bab can read.
     out = c.put("/integrations/example-project", json={"vendor": "gcp", "parent": "example-org", "ceiling": ["gcp_compute_read", "gcp_vertex_ai_user"],
                                                        "spec": {"project": "example-project", "name": "example-project"}}, headers=ADMIN).json()
@@ -732,6 +734,8 @@ def test_a_google_cloud_project_is_probed_connected_discovered_and_leased(google
     assert by_id["locked-project"]["connected"] is False and by_id["locked-project"]["reachable"] is False
     assert "has no access on project locked-project" in by_id["locked-project"]["reason"]
     assert "role_arn" not in by_id["example-project"]
+    # A project two folders down is discovered too, with the folders between it and the parent.
+    assert by_id["nested-project"]["reachable"] is True and by_id["nested-project"]["folder_path"] == ["Dev"]
     # A lease on the project is an access token for bab's own identity, capped at the token's own end.
     rid = c.post("/requests", json={"agent": "sherlock", "integration": "example-project", "permissions": ["gcp_compute_read"]}, headers=OWNER).json()["id"]
     c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN)

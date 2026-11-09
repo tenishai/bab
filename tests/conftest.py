@@ -200,11 +200,25 @@ class FakeGoogle:
             return 200, {"projectId": pid, "projectNumber": "123456789012", "name": pid, "lifecycleState": "ACTIVE"}
         if "/v3/projects?parent=" in url:
             parent = url.split("parent=")[1].split("&")[0]
+            if parent == "folders/777":
+                # The one sub-folder's project: two levels under the connected parent.
+                return 200, {"projects": [{"name": "projects/777000111", "projectId": "nested-project", "displayName": "Nested",
+                                           "state": "ACTIVE", "parent": parent}]}
+            if parent == "folders/778":
+                return 200, {"projects": []}
             if "pageToken=" in url:
-                return 200, {"projects": [{"projectId": "old-project", "displayName": "Old", "state": "DELETE_REQUESTED", "parent": parent},
-                                          {"projectId": "locked-project", "displayName": "Locked", "state": "ACTIVE", "parent": parent}]}
-            return 200, {"projects": [{"projectId": "example-project", "displayName": "Example", "state": "ACTIVE", "parent": parent}],
+                return 200, {"projects": [{"name": "projects/999", "projectId": "old-project", "displayName": "Old", "state": "DELETE_REQUESTED", "parent": parent},
+                                          {"name": "projects/222", "projectId": "locked-project", "displayName": "Locked", "state": "ACTIVE", "parent": parent}]}
+            return 200, {"projects": [{"name": "projects/123456789012", "projectId": "example-project", "displayName": "Example", "state": "ACTIVE", "parent": parent}],
                          "nextPageToken": "page-2"}
+        if "/v3/folders?parent=" in url:
+            # The connected parent holds one folder, Dev, which holds a deleted folder and no more.
+            parent = url.split("parent=")[1].split("&")[0]
+            if parent == "folders/777":
+                return 200, {"folders": [{"name": "folders/778", "displayName": "Gone", "state": "DELETE_REQUESTED", "parent": parent}]}
+            if parent.startswith("folders/77"):
+                return 200, {"folders": []}
+            return 200, {"folders": [{"name": "folders/777", "displayName": "Dev", "state": "ACTIVE", "parent": parent}]}
         return 405, {}
 
 

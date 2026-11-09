@@ -6,6 +6,23 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.18] - 2026-11-09
+
+A Google Cloud folder's projects, the whole tree down, so a console can offer them for
+picking instead of connecting every project the identity can read (tenishai/kobo, the
+project picker).
+
+### Changed
+- **`GcpMinter.list_accounts`** walks the tree under a folder or organization: Resource
+  Manager v3 `folders.list` and `projects.list` per folder (both in roles/browser), at most
+  `GCP_TREE_DEPTH` (10) folders down and `GCP_TREE_FOLDERS` (500) folders in all, deleted
+  folders never entered, active projects only. Each project now carries `project_number`,
+  `folder` (the resource it sits in) and `folder_path` (the display names of the folders
+  between the connected parent and the project, the parent excluded), and the list is sorted
+  by that path, then by name. `GET /integrations/{org}/accounts`, `POST
+  /integrations/{org}/discover` and a parent probe (`projects` count) answer for the tree.
+  Nothing changes for AWS.
+
 ### Added
 - A deploy contract: `gojira.yaml`, `k8s/base` (bab's service account and OpenFGA, pinned by digest, migrating its Postgres schema before every start) and `k8s/cluster/tokenreview.yaml`, so Gojira, or the stack installer's published-image path, deploys bab and its store together. The Datadog and GitHub minters load as optional env Secrets; an install without one runs without that vendor.
 - The room catalogue's first Atlassian writing level, `atlassian_jira_issues_write` (mutate tier, label "Write issues"): create and edit issues, add comments and move issues between statuses. A room's gateway opens the matching tools only to an agent granted it.
