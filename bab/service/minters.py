@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -765,9 +766,15 @@ GCP_PROBE_SECONDS = 600
 GCP_IDENTITY_AUDIENCE = "bab"  # the identity token is read for its claims, never presented anywhere
 GCP_OWN = "bab's own identity"
 # The tree walk under a folder or organization: how deep, how many folders in all, and the page size.
-GCP_TREE_DEPTH = 10
-GCP_TREE_FOLDERS = 500
-GCP_PAGE_SIZE = 300
+# A folder tree is read with two searches (every project and every folder bab may see), not a
+# walk of two calls per folder: a 2026-11-09 walk of a 100-folder tree hit Resource Manager's
+# rate limit (429) and held bab's workers until its liveness probe killed it. The answer is
+# kept GCP_TREE_TTL_SEC per parent, and one walk at a time runs per parent, so a console that
+# asks twice (or retries) does not ask Google twice.
+GCP_SEARCH_PAGE_SIZE = 500
+GCP_FOLDER_PAGE_SIZE = 300
+GCP_TREE_TTL_SEC = 120
+GCP_RETRY_PAUSES_SEC = (1.0, 2.0, 4.0)
 _GCP_PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _GCP_PARENT = re.compile(r"^(folders|organizations)/\d+$")
 _GCP_SA = re.compile(r"^[\w.+-]+@[\w.-]+\.gserviceaccount\.com$")
@@ -801,6 +808,10 @@ class GcpMinter:
     def __init__(self, http=None, now=time.time):
         self.http = http or self._http
         self.now = now
+        self.sleep = time.sleep
+        self._tree_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._tree_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
     @staticmethod
     def _http(method: str, url: str, headers: dict, body: dict | None) -> tuple[int, dict]:
@@ -961,50 +972,85 @@ class GcpMinter:
         return discovery.vertex_models(listed)
 
     def list_accounts(self, parent: str) -> list[dict]:
-        """The active projects under a folder or organization, the whole tree down
-        (`resourcemanager.folders.list` and `resourcemanager.projects.list`, both in
-        roles/browser), as bab's own identity can see them. Each project names the folders
-        between the parent and itself (`folder_path`, display names, the parent excluded)
-        and its number; the list is sorted by that path, then by name. The walk stops at
-        GCP_TREE_DEPTH folders down and GCP_TREE_FOLDERS folders in all, so a runaway
-        tree cannot hold a request open; what was found by then is answered."""
+        """The active projects under a folder or organization, the whole tree down, as bab's
+        own identity can see them: Resource Manager v3's `projects:search` and `folders:search`
+        (what roles/browser lets the caller see), two paged reads for the whole organization
+        instead of two calls per folder, then the tree is assembled here. Each project names the
+        folders between the parent and itself (`folder_path`, display names, the parent
+        excluded) and its number; the list is sorted by that path, then by name. A project whose
+        chain of folders bab cannot see is left out: nothing can be granted under it anyway.
+        The answer is kept GCP_TREE_TTL_SEC per parent and one read runs per parent at a time."""
         parent = str(parent or "").strip()
         if not _GCP_PARENT.match(parent):
             raise MintError(f"{parent!r} is not a folder or organization (folders/<number> or organizations/<number>)")
+        with self._locks_guard:
+            lock = self._tree_locks.setdefault(parent, threading.Lock())
+        with lock:
+            hit = self._tree_cache.get(parent)
+            if hit is not None and self.now() < hit[0]:
+                return [dict(p, folder_path=list(p["folder_path"])) for p in hit[1]]
+            out = self._tree(parent)
+            self._tree_cache[parent] = (self.now() + GCP_TREE_TTL_SEC, out)
+            return [dict(p, folder_path=list(p["folder_path"])) for p in out]
+
+    def _tree(self, parent: str) -> list[dict]:
         token, _ = self._own_token()
+        folders = {str(f["name"]): f for f in self._search(token, "folders", GCP_FOLDER_PAGE_SIZE)
+                   if f.get("name") and f.get("state", "ACTIVE") == "ACTIVE"}
         out: list[dict] = []
-        queue: list[tuple[str, list[str], int]] = [(parent, [], 0)]
-        seen = 0
-        while queue:
-            node, path, depth = queue.pop(0)
-            for p in self._list_under(token, node, "projects"):
-                if p.get("state") == "ACTIVE" and p.get("projectId"):
-                    out.append({"id": str(p["projectId"]), "name": str(p.get("displayName") or p["projectId"]),
-                                "status": "ACTIVE", "project_number": str(p.get("name") or "").rsplit("/", 1)[-1],
-                                "folder": node, "folder_path": list(path)})
-            if depth >= GCP_TREE_DEPTH or seen >= GCP_TREE_FOLDERS:
+        for p in self._search(token, "projects", GCP_SEARCH_PAGE_SIZE):
+            if p.get("state") != "ACTIVE" or not p.get("projectId"):
                 continue
-            for f in self._list_under(token, node, "folders"):
-                if f.get("state", "ACTIVE") != "ACTIVE" or not f.get("name"):
-                    continue
-                seen += 1
-                queue.append((str(f["name"]), [*path, str(f.get("displayName") or f["name"])], depth + 1))
+            path = self._path_to(parent, str(p.get("parent") or ""), folders)
+            if path is None:
+                continue
+            out.append({"id": str(p["projectId"]), "name": str(p.get("displayName") or p["projectId"]),
+                        "status": "ACTIVE", "project_number": str(p.get("name") or "").rsplit("/", 1)[-1],
+                        "folder": str(p.get("parent") or parent), "folder_path": path})
         return sorted(out, key=lambda p: (p["folder_path"], p["name"], p["id"]))
 
-    def _list_under(self, token: str, parent: str, what: str) -> list[dict]:
-        """Every page of Resource Manager v3's `projects` or `folders` directly under `parent`."""
+    @staticmethod
+    def _path_to(parent: str, node: str, folders: dict[str, dict]) -> list[str] | None:
+        """The display names of the folders from just under `parent` down to `node`, or None
+        when `node` is not under `parent` (or a folder on the way is not visible)."""
+        names: list[str] = []
+        seen = 0
+        while node != parent:
+            f = folders.get(node)
+            if f is None or seen > 64:
+                return None
+            names.append(str(f.get("displayName") or node))
+            node = str(f.get("parent") or "")
+            seen += 1
+        names.reverse()
+        return names
+
+    def _search(self, token: str, what: str, page_size: int) -> list[dict]:
+        """Every page of Resource Manager v3's `projects:search` or `folders:search`. A 429 or
+        a 5xx is retried after GCP_RETRY_PAUSES_SEC, then given up with Google's sentence."""
         rows: list[dict] = []
         page = ""
         while True:
-            url = (f"{GCP_RESOURCE_MANAGER_URL}/v3/{what}?parent={parent}&pageSize={GCP_PAGE_SIZE}"
-                   + (f"&pageToken={page}" if page else ""))
-            status, data = self.http("GET", url, self._bearer(token), None)
+            url = f"{GCP_RESOURCE_MANAGER_URL}/v3/{what}:search?pageSize={page_size}" + (f"&pageToken={page}" if page else "")
+            status, data = self._read_with_patience(url, token)
             if status != 200:
-                raise MintError(f"Google refused listing the {what} under {parent}: {self._error(status, data)}")
+                raise MintError(f"Google refused searching the {what}: {self._error(status, data)}")
             rows += [r for r in (data.get(what) or []) if isinstance(r, dict)]
             page = str(data.get("nextPageToken") or "")
             if not page:
                 return rows
+
+    def _read_with_patience(self, url: str, token: str) -> tuple[int, dict]:
+        pauses = iter(GCP_RETRY_PAUSES_SEC)
+        while True:
+            status, data = self.http("GET", url, self._bearer(token), None)
+            if status != 429 and status < 500:
+                return status, data
+            pause = next(pauses, None)
+            if pause is None:
+                return status, data
+            self.sleep(pause)
+
 
 def _iso_epoch(iso: str) -> float:
     """An RFC 3339 instant (`2026-10-31T17:00:00Z`, Google's `...00.123456Z` too) as an epoch,

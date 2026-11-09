@@ -430,48 +430,73 @@ def test_gcp_minter_lists_the_active_projects_under_a_folder_or_organization():
 
     g = FakeGoogle()
     m = GcpMinter(http=g)
-    # The whole tree: the parent's own projects first (two pages, the deleted one dropped), then
-    # the sub-folder's, each naming the folders between the parent and itself and its number.
-    assert m.list_accounts("organizations/456") == [
+    # The whole tree: the parent's own projects first (the deleted one dropped), then the
+    # sub-folder's, each naming the folders between the parent and itself and its number.
+    assert m.list_accounts("folders/123") == [
         {"id": "example-project", "name": "Example", "status": "ACTIVE", "project_number": "123456789012",
-         "folder": "organizations/456", "folder_path": []},
+         "folder": "folders/123", "folder_path": []},
         {"id": "locked-project", "name": "Locked", "status": "ACTIVE", "project_number": "222",
-         "folder": "organizations/456", "folder_path": []},
+         "folder": "folders/123", "folder_path": []},
         {"id": "nested-project", "name": "Nested", "status": "ACTIVE", "project_number": "777000111",
          "folder": "folders/777", "folder_path": ["Dev"]},
     ]
+    # Two searches for the whole organization, not two calls per folder; a project under another
+    # organization (Elsewhere) and the deleted project are left out.
     urls = [u.split("/v3/", 1)[1] for _, u, _ in g.calls if "/v3/" in u]
-    assert urls == ["projects?parent=organizations/456&pageSize=300",
-                    "projects?parent=organizations/456&pageSize=300&pageToken=page-2",
-                    "folders?parent=organizations/456&pageSize=300",
-                    "projects?parent=folders/777&pageSize=300",
-                    "folders?parent=folders/777&pageSize=300"]  # the deleted folder Gone is never entered
+    assert urls == ["folders:search?pageSize=300",
+                    "projects:search?pageSize=500",
+                    "projects:search?pageSize=500&pageToken=page-2"]
     assert all(h["Authorization"] == "Bearer own-1" for h in g.headers[1:])
     with pytest.raises(MintError, match="is not a folder or organization"):
         m.list_accounts("example-project")
     assert default_minters()["gcp"].name == "gcp"
 
 
-def test_gcp_minter_stops_walking_a_tree_at_its_depth_and_folder_caps():
-    """Gate (bounds): a tree deeper or wider than the caps answers what it found by then, so
-    a runaway organization cannot hold a discover open; projects already listed stay."""
+def test_gcp_minter_waits_out_a_rate_limit_and_gives_up_with_googles_sentence():
+    """Gate (patience): Resource Manager answers 429 under load (a 100-folder tree on
+    2026-11-09); bab pauses and asks again, three times, before it refuses."""
     from bab.service import minters as mod
-    from bab.service.minters import GcpMinter
+    from bab.service.minters import GcpMinter, MintError
 
-    class Endless:
-        """Every folder holds one folder; every node holds one project."""
+    class Flaky:
+        def __init__(self, fail: int):
+            self.fail, self.calls = fail, 0
         def __call__(self, method, url, headers, body):
             if "metadata.google.internal" in url:
                 return 200, {"access_token": "own", "expires_in": 1800}
-            parent = url.split("parent=")[1].split("&")[0]
-            n = int(parent.rsplit("/", 1)[1])
-            if "/v3/projects" in url:
-                return 200, {"projects": [{"name": f"projects/{n}", "projectId": f"p-{n:06d}", "displayName": f"P{n}", "state": "ACTIVE"}]}
-            return 200, {"folders": [{"name": f"folders/{n + 1}", "displayName": f"F{n + 1}", "state": "ACTIVE"}]}
+            self.calls += 1
+            if self.calls <= self.fail:
+                return 429, {"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED"}}
+            if "folders:search" in url:
+                return 200, {"folders": []}
+            return 200, {"projects": [{"name": "projects/1", "projectId": "one-project", "displayName": "One", "state": "ACTIVE", "parent": "folders/1"}]}
 
-    out = GcpMinter(http=Endless()).list_accounts("folders/100000")
-    assert len(out) == mod.GCP_TREE_DEPTH + 1  # the parent and one project per level down to the cap
-    assert out[-1]["folder_path"] == [f"F{100000 + i}" for i in range(1, mod.GCP_TREE_DEPTH + 1)]
+    m = GcpMinter(http=Flaky(fail=2)); naps = []; m.sleep = naps.append
+    assert [p["id"] for p in m.list_accounts("folders/1")] == ["one-project"]
+    assert naps == list(mod.GCP_RETRY_PAUSES_SEC[:2])
+    m = GcpMinter(http=Flaky(fail=10)); m.sleep = lambda _s: None
+    with pytest.raises(MintError, match="Google refused searching the folders: HTTP 429 Quota exceeded"):
+        m.list_accounts("folders/1")
+
+
+def test_gcp_minter_keeps_a_tree_for_two_minutes_and_reads_it_once_per_parent():
+    """Gate (load): a console that asks twice, or retries, gets the kept answer; after the TTL
+    Google is asked again. The kept list is copied out, so a caller cannot edit the cache."""
+    from bab.service import minters as mod
+    from bab.service.minters import GcpMinter
+    from tests.conftest import FakeGoogle
+
+    clock = [1000.0]
+    g = FakeGoogle(); m = GcpMinter(http=g, now=lambda: clock[0])
+    first = m.list_accounts("folders/123")
+    n = len([u for _, u, _ in g.calls if "/v3/" in u])
+    again = m.list_accounts("folders/123")
+    assert again == first and len([u for _, u, _ in g.calls if "/v3/" in u]) == n
+    again[0]["folder_path"].append("edited")
+    assert m.list_accounts("folders/123")[0]["folder_path"] == []
+    clock[0] += mod.GCP_TREE_TTL_SEC + 1
+    m.list_accounts("folders/123")
+    assert len([u for _, u, _ in g.calls if "/v3/" in u]) == 2 * n
 
 
 def test_every_gcp_permission_names_its_roles_and_vertex_ai_is_the_one_user_role():

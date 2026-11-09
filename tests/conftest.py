@@ -198,6 +198,20 @@ class FakeGoogle:
             if pid in self.forbidden:
                 return 403, {"error": {"code": 403, "message": "The caller does not have permission", "status": "PERMISSION_DENIED"}}
             return 200, {"projectId": pid, "projectNumber": "123456789012", "name": pid, "lifecycleState": "ACTIVE"}
+        if "/v3/projects:search" in url:
+            # Every project bab may see, two pages: the parent's two (one deleted) and the sub-folder's.
+            if "pageToken=" in url:
+                return 200, {"projects": [{"name": "projects/999", "projectId": "old-project", "displayName": "Old", "state": "DELETE_REQUESTED", "parent": "folders/123"},
+                                          {"name": "projects/222", "projectId": "locked-project", "displayName": "Locked", "state": "ACTIVE", "parent": "folders/123"},
+                                          {"name": "projects/777000111", "projectId": "nested-project", "displayName": "Nested", "state": "ACTIVE", "parent": "folders/777"},
+                                          {"name": "projects/555", "projectId": "elsewhere-project", "displayName": "Elsewhere", "state": "ACTIVE", "parent": "folders/555"}]}
+            return 200, {"projects": [{"name": "projects/123456789012", "projectId": "example-project", "displayName": "Example", "state": "ACTIVE", "parent": "folders/123"}],
+                         "nextPageToken": "page-2"}
+        if "/v3/folders:search" in url:
+            # Dev under the organization, a deleted folder under Dev, and a folder under another organization.
+            return 200, {"folders": [{"name": "folders/777", "displayName": "Dev", "state": "ACTIVE", "parent": "folders/123"},
+                                     {"name": "folders/778", "displayName": "Gone", "state": "DELETE_REQUESTED", "parent": "folders/777"},
+                                     {"name": "folders/555", "displayName": "Other", "state": "ACTIVE", "parent": "organizations/999"}]}
         if "/v3/projects?parent=" in url:
             parent = url.split("parent=")[1].split("&")[0]
             if parent == "folders/777":

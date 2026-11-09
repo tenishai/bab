@@ -6,6 +6,20 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.19] - 2026-11-09
+
+The Google Cloud tree is read in two searches, not two calls per folder: the 0.4.18 walk of
+a hundred-folder tree hit Resource Manager's rate limit and held bab's workers until its
+liveness probe killed the pod.
+
+### Changed
+- **`GcpMinter.list_accounts`** reads `projects:search` and `folders:search` once each (paged)
+  and assembles the tree under the parent itself; a project whose folders bab cannot see is
+  left out. A 429 or 5xx is retried after 1, 2 and 4 seconds, then refused with Google's
+  sentence. The answer is kept two minutes per parent and one read runs per parent at a
+  time, so a console that asks twice does not ask Google twice. `GCP_TREE_DEPTH` and
+  `GCP_TREE_FOLDERS` are gone with the walk.
+
 ## [0.4.18] - 2026-11-09
 
 A Google Cloud folder's projects, the whole tree down, so a console can offer them for
