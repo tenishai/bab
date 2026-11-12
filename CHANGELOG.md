@@ -4,6 +4,18 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **An agent's owner can pick its repositories.** `PUT /integrations/{id}` took an admin or
+  security reviewer for every vendor but `agents`, so a console that lets an agent's owner pick
+  the repositories the agent may reach (a set under the GitHub connection) was refused for
+  anyone not on those teams. A caller on no team may now write that one shape: a child of a
+  service connection whose spec names its `repositories`. Picking grants nothing; the level is
+  still asked for and decided by a reviewer, who sees the set. Two things stay a reviewer's:
+  an empty set (it would be the whole connection), and adding a repository to a set that
+  already carries grants (the answer says so and names the repository). Removing one is open.
+
 ## [0.4.21] - 2026-11-12
 
 ### Fixed

@@ -642,6 +642,48 @@ def test_a_lease_on_the_connection_lands_on_the_one_child_the_agent_holds(repos)
     assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github"}, headers=GATEWAY).json()["integration"] == "github-ledger"
 
 
+def test_an_owner_picks_an_agents_repositories_and_a_reviewer_still_decides_what_they_are_for(repos):
+    """Gate: an agent's repository set under a service connection is written by a caller on no
+    team (the room vouches the person owns the agent). It grants nothing, so it is safe to pick;
+    what stays a reviewer's is everything a pick could widen: any other integration, an empty
+    set (the whole connection), and a repository added to a set that already carries grants."""
+    c, _ = repos
+
+    def put(name, repositories, headers=OWNER, **body):
+        return c.put(f"/integrations/{name}", headers=headers,
+                     json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read", "github_pulls_write"],
+                           "spec": {"name": name, "repositories": repositories}, **body})
+
+    r = put("github-watson", ["acme-web"])
+    assert r.status_code == 200, r.text
+    assert (r.json()["kind"], r.json()["parent"]) == ("account", "github")
+    # Picked, not granted: the gateway is still refused for watson.
+    assert c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY).status_code == 403
+    # Nothing granted on it yet, so the set may grow.
+    assert put("github-watson", ["acme-web", "acme-infra"]).status_code == 200
+
+    team = "owner@example.com is not on the admin or security team"
+    # Not a repository set: no repositories named, no parent, the connection itself, another vendor's row.
+    assert put("github-watson", []).json()["detail"] == team
+    assert put("github-other", ["acme-web"], parent=None).json()["detail"] == team
+    assert put("github", ["acme-web"]).json()["detail"] == team
+    connect(c, ["aws_inventory_read"])
+    r = c.put("/integrations/aws-prod", headers=OWNER, json={"vendor": "aws", "ceiling": ["aws_inventory_read"],
+                                                           "spec": {"role_arn": "arn:aws:iam::123456789012:role/Other"}})
+    assert (r.status_code, r.json()["detail"]) == (403, team)
+
+    # Once the set carries a grant it only shrinks in an owner's hands; a reviewer may still add.
+    grant(c, "watson", "github-watson", ["github_repos_read"])
+    assert put("github-watson", ["acme-web"]).status_code == 200
+    r = put("github-watson", ["acme-web", "acme-secrets"])
+    assert r.status_code == 403
+    assert r.json()["detail"] == (f"github-watson already carries grants, so adding acme-secrets to it takes a reviewer ({team}); "
+                                  "revoke the grants and ask again, or ask a reviewer to add it")
+    rows = {i["integration"]: i for i in c.get("/integrations", headers=OWNER).json()["integrations"]}
+    assert rows["github-watson"]["repositories"] == ["acme-web"]
+    assert put("github-watson", ["acme-web", "acme-secrets"], headers=ADMIN).status_code == 200
+
+
 def test_events_read_newest_first_and_every_refusal_names_the_agent_and_integration(world):
     """`GET /events` (kobo#371, the Agents audit): console auth, newest first, `kind` repeats or takes a
     comma list, `agent` reads `detail.agent`, `since`/`until` bound `at`. A lease the agent holds nothing

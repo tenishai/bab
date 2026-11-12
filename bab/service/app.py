@@ -248,6 +248,34 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             raise HTTPException(403, f"{caller.actor} is not on the admin or security team")
         return {"admin": admin, "security": security}
 
+    def is_reviewer(caller: Caller) -> bool:
+        return is_member(caller.actor, settings.admin_team) or is_member(caller.actor, settings.security_team)
+
+    def repository_set_or_403(s, integration: str, body: IntegrationBody, caller: Caller) -> None:
+        """The one integration a caller who is no reviewer may write: an agent's repository set
+        under a service connection (github-<agent> under github). Picking repositories grants
+        nothing: a grant on the set is still a reviewer's decision, made looking at the set. So
+        the set must name repositories (an empty one would be the whole connection) and, once it
+        carries grants, only ever shrink: a repository added then would be one no reviewer looked
+        at. Its ceiling is not held to the connection's: that one bounds a grant on the whole
+        connection, and a level on a set is asked for and decided like any other."""
+        no = f"{caller.actor} is not on the admin or security team"
+        parent = s.get(Integration, body.parent) if body.parent else None
+        repos = body.spec.get("repositories")
+        named = isinstance(repos, list) and bool(repos) and all(isinstance(r, str) and r.strip() for r in repos)
+        if parent is None or parent.vendor != body.vendor or parent.kind != "connection" or not named:
+            raise HTTPException(403, no)
+        row = s.get(Integration, integration)
+        if row is None:
+            return
+        if row.parent != body.parent or row.vendor != body.vendor:
+            raise HTTPException(403, no)
+        before = set((row.spec or {}).get("repositories") or [])
+        added = sorted(set(repos) - before)
+        if before and added and ledger.active_grants_on(s, integration):
+            raise HTTPException(403, f"{integration} already carries grants, so adding {', '.join(added)} to it "
+                                     f"takes a reviewer ({no}); revoke the grants and ask again, or ask a reviewer to add it")
+
     # ---- helpers -----------------------------------------------------------
 
     def obj(integration: str) -> str:
@@ -379,15 +407,18 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def put_integration(integration: str, body: IntegrationBody, caller: Console):
         """Connect (or re-describe) an integration and set its ceiling: the most any agent may hold there.
         An `agents` integration is the room's own fact (which agents exist), like the topology: the console
-        token is the authority and any actor may write it; every other vendor takes a reviewer.
+        token is the authority and any actor may write it; every other vendor takes a reviewer, but for
+        an agent's repository set under a service connection, which the room lets the agent's owner pick
+        (`repository_set_or_403`: it grants nothing by itself).
         A `parent` hangs this row under an organization (a cloud account under its hub) or under a
         service connection (a repository set under the GitHub connection), one level deep: the parent
         must be the same vendor and must not have a parent of its own."""
-        if body.vendor != AGENTS_VENDOR:
-            reviewer(caller)
+        open_to_all = body.vendor == AGENTS_VENDOR or is_reviewer(caller)
         acts = permissions_or_422(body.ceiling, body.vendor)
         now = settings.now()
         with ledger.session() as s:
+            if not open_to_all:
+                repository_set_or_403(s, integration, body, caller)
             if body.parent:
                 if body.parent == integration:
                     raise HTTPException(422, "an integration cannot be its own parent")
