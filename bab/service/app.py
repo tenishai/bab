@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
+from sqlalchemy.orm import object_session
 
 from bab import ceiling, grants
 from bab.catalogue import Catalogue
@@ -35,6 +36,9 @@ LEASE_REQUEST_HOURS = 1  # an approved gated lease request becomes a grant this 
 # The vendor whose integrations are other agents (one per agent, id = its name) and the one
 # permission on them. Talking is a grant the switchboard reads; nothing is ever minted for it.
 AGENTS_VENDOR = "agents"
+# Vendors whose credential is narrowed to an integration's `repositories`: the only ones where
+# a child under the connection is a smaller thing than the connection, and so an owner's to pick.
+REPOSITORY_SET_VENDORS = frozenset({"github"})
 A2A_ASK = "a2a_ask"
 NO_BORROWING = "a credential is never borrowed for another agent's task"
 NOT_GRANTED = "not granted"
@@ -252,29 +256,48 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def is_reviewer(caller: Caller) -> bool:
         return is_member(caller.actor, settings.admin_team) or is_member(caller.actor, settings.security_team)
 
-    def repository_set_or_403(s, integration: str, body: IntegrationBody, caller: Caller) -> list[str]:
+    def asked_levels(s, integration: str) -> list[Request]:
+        """Level requests still waiting on an integration: what a reviewer may be about to allow."""
+        return list(s.scalars(select(Request).where(Request.integration == integration, Request.kind != "repositories",
+                                                    Request.status == "pending").order_by(Request.id)))
+
+    def levels_on(s, integration: str) -> list[str]:
+        """The levels a repository added to this set would be reached with: the ones held on it
+        and the ones asked for, since a reviewer may allow both in one sitting."""
+        return sorted({g.permission for g in ledger.active_grants_on(s, integration)}
+                      | {p for r in asked_levels(s, integration) for p in r.permissions})
+
+    def repository_set_or_403(s, integration: str, body: IntegrationBody, caller: Caller) -> tuple[list[str], list[str]]:
         """The one integration a caller who is no reviewer may write: an agent's repository set
-        under a service connection (github-<agent> under github). Picking repositories grants
-        nothing: a grant on the set is still a reviewer's decision, made looking at the set. So
-        the set must name repositories (an empty one would be the whole connection), and once it
-        carries grants a repository added to it is one no reviewer looked at: those are returned
-        and wait for one (`ask_for_repositories`) instead of landing. Its ceiling is not held to
-        the connection's: that one bounds a grant on the whole connection, and a level on a set is
-        asked for and decided like any other."""
+        under a service connection (github-<agent> under github), and of it the repositories
+        alone. Picking repositories grants nothing: a level on the set is still a reviewer's
+        decision, made looking at the set. So the set must name repositories (an empty one would
+        be the whole connection), and once it carries a grant, or a level request a reviewer has
+        yet to decide, a repository added to it is one no reviewer looked at: those wait for one
+        (`ask_for_repositories`) instead of landing. Returns the set as named (trimmed, each
+        name once) and what must wait. A new set's ceiling is not held to the connection's: that
+        one bounds a grant on the whole connection, and a level on a set is asked for and
+        decided like any other."""
         no = f"{caller.actor} is not on the admin or security team"
         parent = s.get(Integration, body.parent) if body.parent else None
         repos = body.spec.get("repositories")
-        named = isinstance(repos, list) and bool(repos) and all(isinstance(r, str) and r.strip() for r in repos)
-        if parent is None or parent.vendor != body.vendor or parent.kind != "connection" or not named:
+        # A name is what is left after the owner (the minter drops it): "acme/" names nothing.
+        named = isinstance(repos, list) and bool(repos) and all(
+            isinstance(r, str) and r.strip().rsplit("/", 1)[-1] for r in repos)
+        if (body.vendor not in REPOSITORY_SET_VENDORS or parent is None or parent.vendor != body.vendor
+                or parent.kind != "connection" or not named):
             raise HTTPException(403, no)
-        row = s.get(Integration, integration)
+        wanted = list(dict.fromkeys(r.strip() for r in repos))
+        # Locked: two picks, or a pick and an approval, decide one after the other.
+        row = s.get(Integration, integration, with_for_update=True)
         if row is None:
-            return []
+            return wanted, []
         if row.parent != body.parent or row.vendor != body.vendor:
             raise HTTPException(403, no)
         before = set((row.spec or {}).get("repositories") or [])
-        added = sorted(set(repos) - before)
-        return added if before and ledger.active_grants_on(s, integration) else []
+        added = sorted(set(wanted) - before)
+        watched = ledger.active_grants_on(s, integration) or asked_levels(s, integration)
+        return wanted, (added if before and watched else [])
 
     def ask_for_repositories(s, row: Integration, wanted: list[str], added: list[str], caller: Caller,
                              now: datetime) -> tuple[Request, bool]:
@@ -289,15 +312,17 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         narrowed = bool(kept) and len(kept) != len(before)
         if narrowed:
             row.spec, row.updated_at = {**row.spec, "repositories": kept}, now
-        held = ledger.active_grants_on(s, row.id)
         proposal = {"added": added, "removed": [] if kept else sorted(before)}
+        # The levels the new repositories would be reached with: what a reviewer is saying yes to.
+        # Read again whenever the request is shown (`request_summary`), frozen when it is decided.
+        holders = [g.agent for g in ledger.active_grants_on(s, row.id)] + [r.agent for r in asked_levels(s, row.id)]
+        levels = levels_on(s, row.id)
         req = s.scalar(select(Request).where(Request.integration == row.id, Request.kind == "repositories",
                                              Request.status == "pending"))
         if req is None:
             req = Request(integration=row.id, kind="repositories", created_at=now)
             s.add(req)
-        # The levels the new repositories would be reached with: what a reviewer is saying yes to.
-        req.agent, req.permissions = min(g.agent for g in held), sorted({g.permission for g in held})
+        req.agent, req.permissions = min(holders), levels
         req.requested_by, req.proposal = caller.actor, proposal
         ledger.event(s, now, "request.created", caller.actor, agent=req.agent, integration=row.id,
                      repositories=len(added))
@@ -307,15 +332,23 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         """The set was written whole: a pick still waiting on it is moot."""
         for req in s.scalars(select(Request).where(Request.integration == integration, Request.kind == "repositories",
                                                    Request.status == "pending")):
+            req.permissions = levels_on(s, integration)
             req.status, req.decided_at, req.decided_by = "withdrawn", now, actor
             req.reason = "the set was saved again before this was decided"
+
+    def withdraw_all(s, integration: str, actor: str, now: datetime) -> None:
+        """The integration is gone: nothing asked of it can be decided, and a row that later takes
+        its name is not the one these were asked of."""
+        for req in s.scalars(select(Request).where(Request.integration == integration, Request.status == "pending")):
+            req.status, req.decided_at, req.decided_by = "withdrawn", now, actor
+            req.reason = "the integration was disconnected before this was decided"
 
     def apply_repositories(s, req: Request, who: dict[str, bool], actor: str, now: datetime) -> set[str]:
         """Approve a `repositories` request: the set takes what was asked. The reviewer is saying
         yes to every level held on the set reaching the new repositories, so the destroy tier
         takes the security team here as it does on a grant. Returns the agents holding grants on
         the set, whose credential in hand no longer matches it."""
-        row = s.get(Integration, req.integration)
+        row = s.get(Integration, req.integration, with_for_update=True)
         change = req.proposal or {}
         added, removed = list(change.get("added") or []), list(change.get("removed") or [])
         held = ledger.active_grants_on(s, req.integration) if row is not None else []
@@ -327,6 +360,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         if why:
             req.status, req.outcome = "refused", {r: f"refused: {why}" for r in added}
             return set()
+        req.permissions = sorted({g.permission for g in held})  # what the yes was said to
         before = set((row.spec or {}).get("repositories") or [])
         row.spec, row.updated_at = {**(row.spec or {}), "repositories": sorted((before - set(removed)) | set(added))}, now
         req.status, req.outcome = "approved", {**{r: "removed" for r in removed}, **{r: "added" for r in added}}
@@ -361,12 +395,18 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 "created_at": g.created_at.isoformat(), "request_id": g.request_id}
 
     def request_summary(r: Request) -> dict:
+        permissions = r.permissions
+        s = object_session(r)
+        if r.kind == "repositories" and r.status == "pending" and s is not None:
+            # A pick is read against the levels on its set now, not the ones it was asked under:
+            # a level granted or asked for since would reach the new repositories too.
+            permissions = levels_on(s, r.integration)
         tiers: dict[str, int] = {}
-        for p in r.permissions:
+        for p in permissions:
             a = cat.action(p)
             if a:
                 tiers[a.tier] = tiers.get(a.tier, 0) + 1
-        return {"id": r.id, "agent": r.agent, "integration": r.integration, "permissions": r.permissions,
+        return {"id": r.id, "agent": r.agent, "integration": r.integration, "permissions": permissions,
                 "tiers": tiers, "kind": r.kind, "status": r.status, "requested_by": r.requested_by,
                 "note": r.note, "created_at": r.created_at.isoformat(),
                 "decided_at": r.decided_at.isoformat() if r.decided_at else None,
@@ -465,23 +505,31 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         An `agents` integration is the room's own fact (which agents exist), like the topology: the console
         token is the authority and any actor may write it; every other vendor takes a reviewer, but for
         an agent's repository set under a service connection, which the room lets the agent's owner pick
-        (`repository_set_or_403`: it grants nothing by itself). An owner's pick that adds to a set already
-        carrying grants answers 202 with the request a reviewer decides under `pending`; the set keeps
-        what it had, less what the pick dropped.
+        (`repository_set_or_403`: it grants nothing by itself). Of such a write only the repositories are
+        taken: an existing set keeps its ceiling and the rest of its spec, a new one starts with the
+        repositories alone. An owner's pick that adds to a set already carrying grants (or a level
+        request not yet decided) answers 202 with the request a reviewer decides under `pending`; the
+        set keeps what it had, less what the pick dropped. The `agents` lane is for rows that are, or
+        are about to be, `agents` rows: it does not re-describe another vendor's.
         A set that changes under grants drops the credential cached for it, so the next lease carries
         the new set.
         A `parent` hangs this row under an organization (a cloud account under its hub) or under a
         service connection (a repository set under the GitHub connection), one level deep: the parent
         must be the same vendor and must not have a parent of its own."""
-        open_to_all = body.vendor == AGENTS_VENDOR or is_reviewer(caller)
         acts = permissions_or_422(body.ceiling, body.vendor)
+        names = [a.name for a in acts]
         now = settings.now()
         stale: set[tuple[str, str]] = set()
         with ledger.session() as s:
-            waiting = [] if open_to_all else repository_set_or_403(s, integration, body, caller)
+            there = s.get(Integration, integration)
+            room_fact = body.vendor == AGENTS_VENDOR and (there is None or there.vendor == AGENTS_VENDOR)
+            picked: list[str] | None = None  # an owner's pick: the repositories, and nothing else of the body
+            waiting: list[str] = []
+            if not (room_fact or is_reviewer(caller)):
+                picked, waiting = repository_set_or_403(s, integration, body, caller)
             if waiting:
                 row = s.get(Integration, integration)
-                req, narrowed = ask_for_repositories(s, row, body.spec["repositories"], waiting, caller, now)
+                req, narrowed = ask_for_repositories(s, row, picked, waiting, caller, now)
                 if narrowed:
                     stale = {(g.agent, integration) for g in ledger.active_grants_on(s, integration)}
                     for agent, _ in sorted(stale):
@@ -503,31 +551,34 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 if parent is None or parent.vendor != body.vendor or parent.kind not in ("org", "connection"):
                     raise HTTPException(422, f"{body.parent!r} is not a connected {body.vendor} organization or service connection")
             row = s.get(Integration, integration)
+            spec = body.spec if picked is None else {"repositories": picked}
             if row is None:
                 row = Integration(id=integration, vendor=body.vendor, created_at=now)
                 s.add(row)
             else:
+                if picked is not None:
+                    spec, names = {**(row.spec or {}), "repositories": picked}, list(row.ceiling)
                 # The set stated whole, changed or not: a pick still waiting on it is taken back.
                 withdraw_repositories(s, integration, caller.actor, now)
-                if (row.spec or {}).get("repositories") != body.spec.get("repositories"):
+                if (row.spec or {}).get("repositories") != spec.get("repositories"):
                     # The set an agent's credential is narrowed to changed: the one in hand is for the old set.
                     stale = {(g.agent, integration) for g in ledger.active_grants_on(s, integration)}
                     for agent, _ in sorted(stale):
                         end_live(s, agent, integration, now)
-            row.vendor, row.spec, row.ceiling, row.updated_at = body.vendor, body.spec, [a.name for a in acts], now
+            row.vendor, row.spec, row.ceiling, row.updated_at = body.vendor, spec, names, now
             row.parent = body.parent
             try:
                 teams = sorted({t.user for t in store.read_all() if t.relation == "team"})
                 tuples = [Tuple(f"room:{settings.room}", "room", obj(integration))]
-                tuples += [Tuple(team, f"ceiling_{a.name}", obj(integration)) for team in teams for a in acts]
+                tuples += [Tuple(team, f"ceiling_{name}", obj(integration)) for team in teams for name in names]
                 store.write(tuples)
             except StoreError as exc:
                 raise HTTPException(503, f"the store cannot answer: {exc}") from exc
             ledger.event(s, now, "integration.put", caller.actor, integration=integration, vendor=body.vendor,
-                         ceiling=len(acts), teams=len(teams))
+                         ceiling=len(names), teams=len(teams))
             s.commit()
         forget_live(stale)
-        return {"integration": integration, "vendor": body.vendor, "ceiling": [a.name for a in acts], "teams": teams,
+        return {"integration": integration, "vendor": body.vendor, "ceiling": names, "teams": teams,
                 "parent": body.parent, "kind": row.kind}
 
     @app.put("/topology")
@@ -742,8 +793,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
     @app.delete("/integrations/{integration}")
     def delete_integration(integration: str, caller: Console):
-        """Disconnect: the row, every active grant on it (revoked), and every tuple
-        naming it (room link, ceilings, grants). Leases already minted run out on their own."""
+        """Disconnect: the row, every active grant on it (revoked), every request still waiting
+        on it (withdrawn), and every tuple naming it (room link, ceilings, grants). Leases already
+        minted run out on their own."""
         with ledger.session() as s0:
             row0 = s0.get(Integration, integration)
         if row0 is None or row0.vendor != AGENTS_VENDOR:
@@ -759,6 +811,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             for g in ledger.active_grants_on(s, integration):
                 g.revoked_at, g.revoked_by = now, caller.actor
                 revoked += 1
+            withdraw_all(s, integration, caller.actor, now)
             try:
                 gone = [t for t in store.read_all() if t.object == obj(integration)]
                 store.delete(gone)

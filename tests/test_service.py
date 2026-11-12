@@ -669,8 +669,12 @@ def test_an_owner_picks_an_agents_repositories_and_a_reviewer_still_decides_what
     assert put("github-watson", ["acme-web", "acme-infra"]).status_code == 200
 
     team = "owner@example.com is not on the admin or security team"
-    # Not a repository set: no repositories named, no parent, the connection itself, another vendor's row.
+    # Not a repository set: no repositories named (or a name that names nothing), no parent, the
+    # connection itself, another vendor's row.
     assert put("github-watson", []).json()["detail"] == team
+    for nothing in (None, "acme-web", [""], ["acme/"], [{"name": "acme-web"}]):
+        assert put("github-watson", nothing).json()["detail"] == team
+    assert put("github-watson", ["acme-web"], parent="github-other").json()["detail"] == team
     assert put("github-other", ["acme-web"], parent=None).json()["detail"] == team
     assert put("github", ["acme-web"]).json()["detail"] == team
     connect(c, ["aws_inventory_read"])
@@ -990,3 +994,116 @@ def test_a_cloud_row_whose_minter_cannot_list_models_is_501(world):
     c, _, _, _ = world  # the static AWS minter has no list_models
     connect(c, ["aws_inventory_read"])
     assert c.get("/integrations/aws-prod/models", headers=ADMIN).status_code == 501
+
+
+def test_an_owners_pick_changes_the_repositories_and_nothing_else(repos):
+    """Gate: of an owner's write the service takes the repositories alone. The ceiling and the
+    rest of the spec of an existing set stay a reviewer's; a new set starts with the repositories
+    only; the lane is for a vendor whose credential is narrowed by them; and naming the `agents`
+    vendor does not open another vendor's row."""
+    c, gh = repos
+    team = "owner@example.com is not on the admin or security team"
+
+    def put(name, spec, ceiling, headers=OWNER, vendor="github", parent="github"):
+        return c.put(f"/integrations/{name}", headers=headers,
+                     json={"vendor": vendor, "parent": parent, "ceiling": ceiling, "spec": spec})
+
+    def row(name):
+        return {i["integration"]: i for i in c.get("/integrations", headers=ADMIN).json()["integrations"]}[name]
+
+    # A reviewer made this set, with a ceiling short of opening pull requests.
+    made = {"name": "docs only", "repositories": ["acme-docs"]}
+    assert put("github-watson", made, ["github_repos_read"], headers=ADMIN).status_code == 200
+    r = put("github-watson", {"name": "anything", "installation_id": "999", "repositories": [" acme-docs ", "acme-docs", "acme-web"]},
+            ["github_repos_read", "github_pulls_write"])
+    assert (r.status_code, r.json()["ceiling"]) == (200, ["github_repos_read"])
+    held = row("github-watson")
+    assert (held["ceiling"], held["name"], held["repositories"]) == (["github_repos_read"], "docs only", ["acme-docs", "acme-web"])
+    grant(c, "watson", "github-watson", ["github_repos_read"])
+    c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY)
+    assert gh.minted[-1]["spec"].get("installation_id") != "999"
+    asked = c.post("/requests", json={"agent": "watson", "integration": "github-watson", "permissions": ["github_pulls_write"]},
+                   headers=OWNER).json()
+    out = c.post("/requests/decide", json={"ids": [asked["id"]], "verdict": "approve"}, headers=ADMIN).json()["results"][0]
+    assert out["status"] == "refused"
+
+    # A set an owner starts carries the repositories and nothing else of what was sent.
+    r = put("github-watson-web", {"name": "reviewed", "installation_id": "999", "repositories": ["acme-web"]}, ["github_repos_read"])
+    assert r.status_code == 200, r.text
+    assert (row("github-watson-web")["name"], row("github-watson-web")["repositories"]) == ("github-watson-web", ["acme-web"])
+    grant(c, "watson", "github-watson-web", ["github_repos_read"])
+    c.post("/leases/for-agent", json={"agent": "watson", "integration": "github-watson-web"}, headers=GATEWAY)
+    assert gh.minted[-1]["spec"].get("installation_id") != "999" and gh.minted[-1]["spec"]["repositories"] == ["acme-web"]
+
+    # Another vendor's connection takes no repository sets from an owner.
+    connect(c, ["aws_inventory_read"])
+    r = put("aws-prod-watson", {"repositories": ["x"]}, ["aws_inventory_read"], vendor="aws", parent="aws-prod")
+    assert (r.status_code, r.json()["detail"]) == (403, team)
+
+    # The agents lane writes agents rows: it does not turn this one into one (and so into one anybody may delete).
+    r = put("github-watson", {}, [], vendor="agents", parent=None)
+    assert (r.status_code, r.json()["detail"]) == (403, team)
+    assert c.delete("/integrations/github-watson", headers=OWNER).status_code == 403
+    assert row("github-watson")["vendor"] == "github"
+
+
+def test_a_level_being_asked_for_holds_the_set_as_a_grant_does(repos):
+    """Gate: a reviewer deciding a level request is saying yes to the set as they see it. So a
+    request still waiting holds the set the way a grant does (what an owner adds waits beside
+    it), a waiting pick is read against the levels on the set now, and a set that is
+    disconnected takes what waited on it along."""
+    c, gh = repos
+
+    def put(repositories, headers=OWNER):
+        return c.put("/integrations/github-watson", headers=headers,
+                     json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read", "github_pulls_write"],
+                           "spec": {"repositories": repositories}})
+
+    def waiting():
+        return c.get("/requests", headers=ADMIN).json()["requests"]
+
+    def held():
+        rows = {i["integration"]: i for i in c.get("/integrations", headers=ADMIN).json()["integrations"]}
+        return rows["github-watson"]["repositories"]
+
+    def ask(permissions):
+        return c.post("/requests", json={"agent": "watson", "integration": "github-watson", "permissions": permissions},
+                      headers=OWNER).json()["id"]
+
+    def decide(ids, verdict="approve"):
+        return c.post("/requests/decide", json={"ids": ids, "verdict": verdict, "reason": "no"}, headers=ADMIN).json()["results"]
+
+    assert put(["acme-web"]).status_code == 200
+    level = ask(["github_pulls_write"])
+    # The swap an owner could make while the reviewer reads the request: it waits beside it.
+    r = put(["acme-secrets", "acme-vault"])
+    assert r.status_code == 202, r.text
+    pick = r.json()["pending"]
+    assert (pick["agent"], pick["permissions"], held()) == ("watson", ["github_pulls_write"], ["acme-web"])
+    assert pick["proposal"] == {"added": ["acme-secrets", "acme-vault"], "removed": ["acme-web"]}
+    assert [q["id"] for q in waiting()] == [level, pick["id"]]
+    # The level is allowed on the set the reviewer saw; the swap is its own yes, and it carries what it replaces out.
+    assert decide([level])[0]["status"] == "approved"
+    c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY)
+    assert gh.minted[-1]["spec"]["repositories"] == ["acme-web"]
+    out = decide([pick["id"]])[0]
+    assert out["outcome"] == {"acme-web": "removed", "acme-secrets": "added", "acme-vault": "added"}
+    assert held() == ["acme-secrets", "acme-vault"]
+
+    # A pick shows the levels on its set as they stand: one asked for after it counts.
+    pick = put(["acme-secrets", "acme-vault", "acme-infra"]).json()["pending"]
+    assert pick["permissions"] == ["github_pulls_write"]
+    more = ask(["github_repos_read"])
+    assert [q["permissions"] for q in waiting() if q["id"] == pick["id"]] == [["github_pulls_write", "github_repos_read"]]
+    decide([more], "deny")
+    assert [q["permissions"] for q in waiting() if q["id"] == pick["id"]] == [["github_pulls_write"]]
+
+    # Disconnected: what waited on the set is taken back, and a set that later takes the name starts clean.
+    again = ask(["github_repos_read"])
+    assert c.delete("/integrations/github-watson", headers=ADMIN).status_code == 200
+    assert waiting() == []
+    gone = c.get("/requests", params={"status": "withdrawn"}, headers=ADMIN).json()["requests"]
+    assert sorted(q["id"] for q in gone) == [pick["id"], again]
+    assert put(["acme-docs"]).status_code == 200
+    assert decide([pick["id"], again])[0]["status"] == "skipped" and held() == ["acme-docs"]
+
