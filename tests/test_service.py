@@ -718,6 +718,10 @@ def test_an_owner_picks_an_agents_repositories_and_a_reviewer_still_decides_what
     assert put("github-watson", ["acme-web", "acme-infra"]).status_code == 202
     assert put("github-watson", ["acme-infra", "acme-web"], headers=ADMIN).status_code == 200
     assert held() == ["acme-infra", "acme-web"] and c.get("/requests", headers=OWNER).json()["requests"] == []
+    # So does the owner saving the set exactly as it stands: the addition is unticked, nothing else moved.
+    assert put("github-watson", ["acme-infra", "acme-web", "acme-vault"]).status_code == 202
+    assert put("github-watson", ["acme-infra", "acme-web"]).status_code == 200
+    assert held() == ["acme-infra", "acme-web"] and c.get("/requests", headers=OWNER).json()["requests"] == []
 
 
 def test_a_database_born_before_repository_requests_gains_the_column(tmp_path):

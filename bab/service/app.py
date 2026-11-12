@@ -506,12 +506,14 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             if row is None:
                 row = Integration(id=integration, vendor=body.vendor, created_at=now)
                 s.add(row)
-            elif (row.spec or {}).get("repositories") != body.spec.get("repositories"):
-                # The set an agent's credential is narrowed to changed: the one in hand is for the old set.
-                stale = {(g.agent, integration) for g in ledger.active_grants_on(s, integration)}
-                for agent, _ in sorted(stale):
-                    end_live(s, agent, integration, now)
+            else:
+                # The set stated whole, changed or not: a pick still waiting on it is taken back.
                 withdraw_repositories(s, integration, caller.actor, now)
+                if (row.spec or {}).get("repositories") != body.spec.get("repositories"):
+                    # The set an agent's credential is narrowed to changed: the one in hand is for the old set.
+                    stale = {(g.agent, integration) for g in ledger.active_grants_on(s, integration)}
+                    for agent, _ in sorted(stale):
+                        end_live(s, agent, integration, now)
             row.vendor, row.spec, row.ceiling, row.updated_at = body.vendor, body.spec, [a.name for a in acts], now
             row.parent = body.parent
             try:
