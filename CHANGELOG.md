@@ -4,7 +4,7 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.21] - 2026-11-12
 
 ### Fixed
 - **A new grant replaces the credential in hand.** Approving a request now ends what the agent
