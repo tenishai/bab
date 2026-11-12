@@ -6,6 +6,16 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A new grant replaces the credential in hand.** Approving a request now ends what the agent
+  holds on that integration, the way a revoke always has (Datadog deletes the key; the cached
+  credential is dropped), and the decide answer carries `leases_ended`. Before, a credential
+  minted with two permissions stayed in use beside a grant of two more: an agent granted
+  metrics a few minutes after its first Datadog call kept answering 403 until the hour ran out.
+  A tool gateway that holds a lease for its whole hour still has to ask again to see the new
+  one: `POST /leases/for-agent` answers the lease in hand while the grants stand, so asking
+  every few seconds is cheap.
+
 ## [0.4.20] - 2026-11-09
 
 ### Changed

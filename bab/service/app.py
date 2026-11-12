@@ -327,6 +327,20 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def end_expired(s, now: datetime) -> int:
         return end_leases(s, s.scalars(select(Lease).where(Lease.expires_at <= now.replace(tzinfo=None))), now)
 
+    def end_live(s, agent: str, integration: str, now: datetime) -> int:
+        """End what `agent` holds on `integration` right now. A grant or a revoke changes
+        what the next credential may carry, so the one in hand is ended where the vendor
+        allows it rather than left to run out its hour beside the new one."""
+        return end_leases(s, s.scalars(select(Lease).where(
+            Lease.agent == agent, Lease.integration == integration,
+            Lease.expires_at > now.replace(tzinfo=None))), now)
+
+    def forget_live(pairs) -> None:
+        """Drop the cached credential of each (agent, integration): the next ask mints afresh."""
+        pairs = set(pairs)
+        for key in [k for k in live if (k[0], k[1]) in pairs]:
+            live.pop(key, None)
+
     # ---- routes ------------------------------------------------------------
 
     @app.get("/healthz")
@@ -701,6 +715,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             raise HTTPException(422, "a denial needs a reason")
         now = settings.now()
         results = []
+        changed: set[tuple[str, str]] = set()
         with ledger.session() as s:
             for rid in body.ids:
                 req = s.get(Request, rid)
@@ -721,9 +736,17 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 granted = [p for p, o in req.outcome.items() if o == "granted"]
                 req.status = "approved" if granted else "refused"
                 req.decided_at, req.decided_by, req.reason = now, caller.actor, body.reason
-                results.append({"id": rid, "status": req.status, "outcome": req.outcome})
+                result = {"id": rid, "status": req.status, "outcome": req.outcome}
+                if granted and (req.agent, req.integration) not in changed:
+                    # The agent now holds more here than the credential in its hand carries:
+                    # that one is ended, so the next call gets one with the new access instead
+                    # of failing on the old one until its hour is up.
+                    changed.add((req.agent, req.integration))
+                    result["leases_ended"] = end_live(s, req.agent, req.integration, now)
+                results.append(result)
             ledger.event(s, now, "request.decided", caller.actor, verdict=body.verdict, ids=body.ids)
             s.commit()
+        forget_live(changed)
         return {"results": results}
 
     @app.get("/agents/{agent}/grants")
@@ -766,14 +789,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             g.revoked_at, g.revoked_by = now, caller.actor
             # A credential the agent still holds there is ended where the vendor allows it:
             # the next call mints afresh, narrower, or gets nothing.
-            ended = end_leases(s, s.scalars(select(Lease).where(
-                Lease.agent == g.agent, Lease.integration == g.integration,
-                Lease.expires_at > now.replace(tzinfo=None))), now)
+            ended = end_live(s, g.agent, g.integration, now)
             ledger.event(s, now, "grant.revoked", caller.actor, grant=grant_id, agent=g.agent,
                          permission=g.permission, leases_ended=ended)
             s.commit()
-        for key in [k for k in live if k[0] == g.agent and k[1] == g.integration]:
-            live.pop(key, None)
+        forget_live([(g.agent, g.integration)])
         return {"revoked": grant_id, "leases_ended": ended}
 
     def lease_for(agent: str, body: LeaseBody, via: str | None) -> dict:

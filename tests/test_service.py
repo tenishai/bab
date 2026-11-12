@@ -497,6 +497,32 @@ def test_a_datadog_lease_is_a_scoped_key_that_a_revoke_or_expiry_deletes(gateway
     assert [(x["via"], x["expires_at"][:16]) for x in rows] == [("gateway", "2026-10-27T15:00"), ("gateway", "2026-10-27T13:00"), ("gateway", "2026-10-27T12:00")]
 
 
+def test_a_new_grant_ends_the_credential_in_hand_and_the_next_one_carries_both(gateway):
+    c, _, _, dd = gateway
+    c.put("/integrations/datadog", json={"vendor": "datadog", "spec": {"service_account_id": "sa-123"},
+                                        "ceiling": ["datadog_monitors_read", "datadog_metrics_read"]}, headers=ADMIN)
+    c.post("/probe/datadog", json={}, headers=ADMIN)
+    grant(c, "ledger", "datadog", ["datadog_monitors_read"])
+    ask = {"agent": "ledger", "integration": "datadog"}
+    first = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    held = first["credential"]["dd_app_key"].removeprefix("secret-")
+    assert dd.keys[held]["scopes"] == ["mcp_read", "monitors_read"]
+    # Someone sees the agent needs more and approves it while that key is still good.
+    rid = c.post("/requests", json={**ask, "permissions": ["datadog_metrics_read"]}, headers=OWNER).json()["id"]
+    out = c.post("/requests/decide", json={"ids": [rid], "verdict": "approve"}, headers=ADMIN).json()["results"][0]
+    assert out["status"] == "approved" and out["leases_ended"] == 1
+    assert held not in dd.keys
+    second = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert second["reused"] is False and second["lease_id"] != first["lease_id"]
+    assert sorted(second["granted"]) == ["datadog_metrics_read", "datadog_monitors_read"]
+    fresh = second["credential"]["dd_app_key"].removeprefix("secret-")
+    assert dd.keys[fresh]["scopes"] == ["mcp_read", "metrics_read", "monitors_read", "timeseries_query"]
+    # A denial changes nothing the agent holds, so its credential stays.
+    rid = c.post("/requests", json={**ask, "permissions": ["datadog_metrics_read"]}, headers=OWNER).json()["id"]
+    out = c.post("/requests/decide", json={"ids": [rid], "verdict": "deny", "reason": "held already"}, headers=ADMIN).json()["results"][0]
+    assert "leases_ended" not in out and fresh in dd.keys
+
+
 def test_the_gateway_lane_is_closed_until_a_gateway_is_named(pods):
     c, _ = pods
     r = c.post("/leases/for-agent", json={"agent": "ledger", "integration": "aws-prod"}, headers={"Authorization": "Bearer ledger-pod"})
