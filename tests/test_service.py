@@ -646,19 +646,25 @@ def test_an_owner_picks_an_agents_repositories_and_a_reviewer_still_decides_what
     """Gate: an agent's repository set under a service connection is written by a caller on no
     team (the room vouches the person owns the agent). It grants nothing, so it is safe to pick;
     what stays a reviewer's is everything a pick could widen: any other integration, an empty
-    set (the whole connection), and a repository added to a set that already carries grants."""
-    c, _ = repos
+    set (the whole connection), and a repository added to a set that already carries grants,
+    which the owner may ask for and a reviewer allows."""
+    c, gh = repos
 
     def put(name, repositories, headers=OWNER, **body):
         return c.put(f"/integrations/{name}", headers=headers,
                      json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read", "github_pulls_write"],
                            "spec": {"name": name, "repositories": repositories}, **body})
 
+    def held():
+        rows = {i["integration"]: i for i in c.get("/integrations", headers=OWNER).json()["integrations"]}
+        return rows["github-watson"]["repositories"]
+
     r = put("github-watson", ["acme-web"])
     assert r.status_code == 200, r.text
     assert (r.json()["kind"], r.json()["parent"]) == ("account", "github")
     # Picked, not granted: the gateway is still refused for watson.
-    assert c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY).status_code == 403
+    ask = {"agent": "watson", "integration": "github"}
+    assert c.post("/leases/for-agent", json=ask, headers=GATEWAY).status_code == 403
     # Nothing granted on it yet, so the set may grow.
     assert put("github-watson", ["acme-web", "acme-infra"]).status_code == 200
 
@@ -672,16 +678,59 @@ def test_an_owner_picks_an_agents_repositories_and_a_reviewer_still_decides_what
                                                            "spec": {"role_arn": "arn:aws:iam::123456789012:role/Other"}})
     assert (r.status_code, r.json()["detail"]) == (403, team)
 
-    # Once the set carries a grant it only shrinks in an owner's hands; a reviewer may still add.
+    # Once the set carries a grant, what an owner removes leaves at once and what they add waits.
     grant(c, "watson", "github-watson", ["github_repos_read"])
-    assert put("github-watson", ["acme-web"]).status_code == 200
+    first = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
     r = put("github-watson", ["acme-web", "acme-secrets"])
-    assert r.status_code == 403
-    assert r.json()["detail"] == (f"github-watson already carries grants, so adding acme-secrets to it takes a reviewer ({team}); "
-                                  "revoke the grants and ask again, or ask a reviewer to add it")
-    rows = {i["integration"]: i for i in c.get("/integrations", headers=OWNER).json()["integrations"]}
-    assert rows["github-watson"]["repositories"] == ["acme-web"]
-    assert put("github-watson", ["acme-web", "acme-secrets"], headers=ADMIN).status_code == 200
+    assert r.status_code == 202, r.text
+    asked = r.json()["pending"]
+    assert r.json()["repositories"] == held() == ["acme-web"]
+    assert (asked["kind"], asked["status"], asked["agent"], asked["requested_by"]) == ("repositories", "pending", "watson", "owner@example.com")
+    assert asked["proposal"] == {"added": ["acme-secrets"], "removed": []} and asked["permissions"] == ["github_repos_read"]
+    # The set narrowed, so the credential in hand is dropped: the next one is for acme-web alone.
+    second = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert second["reused"] is False and second["lease_id"] != first["lease_id"]
+    assert gh.minted[-1]["spec"]["repositories"] == ["acme-web"]
+    # Picking again replaces what waits; an owner cannot decide it.
+    again = put("github-watson", ["acme-web", "acme-secrets", "acme-vault"]).json()["pending"]
+    assert again["id"] == asked["id"] and again["proposal"]["added"] == ["acme-secrets", "acme-vault"]
+    assert [q["id"] for q in c.get("/requests", headers=OWNER).json()["requests"]] == [asked["id"]]
+    assert c.post("/requests/decide", json={"ids": [asked["id"]], "verdict": "approve"}, headers=OWNER).status_code == 403
+    # A reviewer allows it: the set grows and the next credential carries it.
+    out = c.post("/requests/decide", json={"ids": [asked["id"]], "verdict": "approve"}, headers=ADMIN).json()["results"][0]
+    assert (out["status"], out["outcome"]) == ("approved", {"acme-secrets": "added", "acme-vault": "added"})
+    assert held() == ["acme-secrets", "acme-vault", "acme-web"]
+    third = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert third["reused"] is False and gh.minted[-1]["spec"]["repositories"] == ["acme-secrets", "acme-vault", "acme-web"]
+
+    # A denial leaves the set as it was.
+    rid = put("github-watson", ["acme-secrets", "acme-vault", "acme-web", "acme-infra"]).json()["pending"]["id"]
+    c.post("/requests/decide", json={"ids": [rid], "verdict": "deny", "reason": "not that one"}, headers=ADMIN)
+    assert held() == ["acme-secrets", "acme-vault", "acme-web"]
+    # A pick that keeps nothing is not applied in part (it would empty the set): the swap waits whole.
+    swap = put("github-watson", ["acme-infra"]).json()
+    assert swap["repositories"] == ["acme-secrets", "acme-vault", "acme-web"]
+    assert swap["pending"]["proposal"] == {"added": ["acme-infra"], "removed": ["acme-secrets", "acme-vault", "acme-web"]}
+    # Saving the set without the addition takes back what waits; so does a reviewer writing the set.
+    assert put("github-watson", ["acme-web"]).status_code == 200
+    gone = [q for q in c.get("/requests", params={"status": "withdrawn"}, headers=OWNER).json()["requests"]]
+    assert [(q["id"], q["decided_by"]) for q in gone] == [(swap["pending"]["id"], "owner@example.com")]
+    assert put("github-watson", ["acme-web", "acme-infra"]).status_code == 202
+    assert put("github-watson", ["acme-infra", "acme-web"], headers=ADMIN).status_code == 200
+    assert held() == ["acme-infra", "acme-web"] and c.get("/requests", headers=OWNER).json()["requests"] == []
+
+
+def test_a_database_born_before_repository_requests_gains_the_column(tmp_path):
+    """`create_all` never alters a table: a requests table from an older bab gets `proposal` at boot."""
+    from sqlalchemy import create_engine, inspect, text
+
+    url = f"sqlite+pysqlite:///{tmp_path / 'bab.db'}"
+    Ledger(url)
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE requests DROP COLUMN proposal"))
+    Ledger(url)
+    assert "proposal" in {col["name"] for col in inspect(engine).get_columns("requests")}
 
 
 def test_events_read_newest_first_and_every_refusal_names_the_agent_and_integration(world):

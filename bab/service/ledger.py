@@ -69,13 +69,16 @@ class Request(Base):
     permissions: Mapped[list] = mapped_column(JSON, nullable=False)
     requested_by: Mapped[str] = mapped_column(String(320), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
-    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="standing")  # standing | lease
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="standing")  # standing | lease | repositories
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)  # + withdrawn
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     decided_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     outcome: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # per permission: granted|refused + why
+    # kind repositories: what an owner's pick would change on a set that carries grants,
+    # {"added": [...], "removed": [...]}; a reviewer's approval applies it to the integration.
+    proposal: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class GrantRow(Base):
@@ -142,6 +145,10 @@ class Ledger:
         if "via" not in have:
             with self.engine.begin() as conn:
                 conn.execute(text("ALTER TABLE leases ADD COLUMN via VARCHAR(16)"))
+        have = {c["name"] for c in inspect(self.engine).get_columns("requests")}
+        if "proposal" not in have:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE requests ADD COLUMN proposal JSON"))
 
     def session(self) -> Session:
         return self.sessions()

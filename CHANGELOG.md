@@ -12,9 +12,22 @@ All notable changes to bab are documented here. The format follows
   the repositories the agent may reach (a set under the GitHub connection) was refused for
   anyone not on those teams. A caller on no team may now write that one shape: a child of a
   service connection whose spec names its `repositories`. Picking grants nothing; the level is
-  still asked for and decided by a reviewer, who sees the set. Two things stay a reviewer's:
-  an empty set (it would be the whole connection), and adding a repository to a set that
-  already carries grants (the answer says so and names the repository). Removing one is open.
+  still asked for and decided by a reviewer, who sees the set. An empty set stays a reviewer's
+  (it would be the whole connection).
+
+### Added
+- **A repository added to a set that carries grants waits for a reviewer.** Once an agent
+  holds a level on its set, an owner's pick is split: what it removes leaves the set at once,
+  and what it adds becomes one request of kind `repositories` (`proposal: {added, removed}`,
+  `permissions` the levels held, so the reviewer sees what the new repositories would be
+  reached with). The `PUT` answers 202 with the set as it stands and the request under
+  `pending`; picking again replaces what waits, and saving the set without the addition (or a
+  reviewer writing the set) marks it `withdrawn`. `POST /requests/decide` applies an approved
+  one to the set; a denial leaves it. `GET /requests` rows carry `proposal` (null on a
+  permission request). The `requests` table gains a `proposal` column at boot.
+- **A changed set reaches the agent on its next call.** Writing a set that carries grants, or
+  approving an addition to it, drops the credential cached for it, so the next lease is minted
+  for the new set instead of the old one being handed out until its hour ran out.
 
 ## [0.4.21] - 2026-11-12
 
