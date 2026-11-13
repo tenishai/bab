@@ -20,6 +20,17 @@ def test_an_action_may_carry_a_label():
     assert cat.action("github_repos_read").label == ""
 
 
+def test_a_read_action_may_be_a_room_default():
+    """`room_default: true` marks the levels a room may allow itself; in the room's catalogue
+    that is GitHub's Read and nothing else."""
+    cat = Catalogue.from_dict({"resources": ["room"], "actions": [
+        {"name": "github_repos_read", "tier": "read", "vendor": "github", "room_default": True},
+        {"name": "github_pulls_write", "tier": "mutate", "vendor": "github"}]})
+    assert cat.action("github_repos_read").room_default is True
+    assert cat.action("github_pulls_write").room_default is False
+    assert [a.name for a in load("catalogues/room.yaml").actions if a.room_default] == ["github_repos_read"]
+
+
 @pytest.mark.parametrize("raw,msg", [
     ({"resources": []}, "at least one level"),
     ({"resources": ["project"], "actions": [{"name": "Pod-Delete", "tier": "mutate"}]}, "bad action name"),
@@ -28,6 +39,8 @@ def test_an_action_may_carry_a_label():
     ({"resources": ["project"], "actions": [{"name": "x", "tier": "yolo"}]}, "tier must be"),
     ({"resources": ["project"], "actions": [{"name": "x", "tier": "read"}] * 2}, "duplicate action"),
     ({"resources": ["project", "project"]}, "duplicate resource"),
+    ({"resources": ["project"], "actions": [{"name": "x", "tier": "mutate", "room_default": True}]}, "room_default is for the read tier"),
+    ({"resources": ["project"], "actions": [{"name": "x", "tier": "read", "room_default": "yes"}]}, "room_default must be true or false"),
 ])
 def test_rejects_bad_catalogues(raw, msg):
     with pytest.raises(CatalogueError, match=msg):

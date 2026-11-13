@@ -40,6 +40,9 @@ class Action:
     vendor: str = ""  # which integration family this permission belongs to (aws, datadog, github)
     extra: dict = field(default_factory=dict)  # minter data (e.g. aws: {"iam": ["ec2:Describe*"]})
     label: str = ""  # a short display name for a console ("Review pull requests"); "" = show the name
+    # The room may allow this one itself on an agent's own repository set (the service's
+    # POST /requests/decide), with no reviewer. Read tier only: a default never mutates.
+    room_default: bool = False
 
     @property
     def gated(self) -> str:
@@ -124,9 +127,14 @@ class Catalogue:
             extra = entry.get("extra") or {}
             if not isinstance(extra, dict):
                 raise CatalogueError(f"action {name!r}: extra must be a mapping")
+            room_default = entry.get("room_default", False)
+            if not isinstance(room_default, bool):
+                raise CatalogueError(f"action {name!r}: room_default must be true or false")
+            if room_default and tier != "read":
+                raise CatalogueError(f"action {name!r}: room_default is for the read tier, not {tier}")
             actions.append(Action(name, tier, entry.get("description", ""), bool(entry.get("global")),
                                   str(entry.get("group", "") or ""), str(entry.get("vendor", "") or ""),
-                                  dict(extra), str(entry.get("label", "") or "")))
+                                  dict(extra), str(entry.get("label", "") or ""), room_default))
         names = [a.name for a in actions]
         if len(set(names)) != len(names):
             raise CatalogueError("duplicate action name")

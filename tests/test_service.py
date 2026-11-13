@@ -536,11 +536,13 @@ def test_the_github_catalogue_is_three_labelled_levels(world):
     assert [g["name"] for g in tree["groups"]] == ["Repositories", "Pull requests"]
     assert tree["groups"][0]["permissions"] == [
         {"name": "github_repos_read", "tier": "read", "label": "Read",
-         "description": "Read code, issues, pull requests, checks and workflow runs"}]
+         "description": "Read code, issues, pull requests, checks and workflow runs", "room_default": True}]
+    # Read is the one level the room may allow itself (on an agent's own repository set).
+    assert [p["room_default"] for p in tree["groups"][1]["permissions"]] == [False, False]
     assert [(p["name"], p["label"]) for p in tree["groups"][1]["permissions"]] == [
         ("github_pulls_review", "Review pull requests"), ("github_pulls_write", "Open pull requests")]
     aws = c.get("/catalogue/aws", headers=OWNER).json()
-    assert all(p["label"] is None for g in aws["groups"] for p in g["permissions"])
+    assert all(p["label"] is None and p["room_default"] is False for g in aws["groups"] for p in g["permissions"])
     assert c.get("/catalogue", headers=OWNER).json()["vendors"][5]["permissions"] == {"read": 1, "mutate": 2}
 
 
@@ -1107,3 +1109,214 @@ def test_a_level_being_asked_for_holds_the_set_as_a_grant_does(repos):
     assert put(["acme-docs"]).status_code == 200
     assert decide([pick["id"], again])[0]["status"] == "skipped" and held() == ["acme-docs"]
 
+
+
+ROOM = {"X-Bab-Console-Token": "console-secret", "X-Bab-Actor": "room@acme"}
+
+
+def test_the_room_allows_the_default_it_asked_for_and_nothing_else(repos):
+    """Gate: one caller on no team may approve, and only its own default. The room asks for
+    Read on a newborn agent's repository set as itself (`room@<room>`) with nobody there to
+    click yes, so it may say yes to exactly that: a pending level request it raised, every
+    permission marked `room_default` in the catalogue, on a set that names repositories under
+    a service connection. Anything else in the batch refuses the whole batch with the
+    sentence every non-reviewer gets, and leaves what was asked waiting for a reviewer."""
+    c, gh = repos
+    assert Settings(room="acme", admin_team="admins", security_team="security").room_actor == "room@acme"
+    team = "room@acme is not on the admin or security team"
+
+    def put(name, repositories, headers=ROOM):
+        return c.put(f"/integrations/{name}", headers=headers,
+                     json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read", "github_pulls_write"],
+                           "spec": {"repositories": repositories}})
+
+    def ask(integration, permissions, headers=ROOM, agent="watson"):
+        r = c.post("/requests", json={"agent": agent, "integration": integration, "permissions": permissions}, headers=headers)
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    def decide(ids, headers=ROOM, verdict="approve", **body):
+        return c.post("/requests/decide", json={"ids": ids, "verdict": verdict, **body}, headers=headers)
+
+    def refused(ids, **kw):
+        r = decide(ids, **kw)
+        return (r.status_code, r.json()["detail"]) == (403, team)
+
+    def waiting():
+        return [q["id"] for q in c.get("/requests", headers=ADMIN).json()["requests"]]
+
+    # An agent is born: the room writes its set, asks for Read as itself, and says yes.
+    assert put("github-watson", ["acme-watson"]).status_code == 200
+    born = ask("github-watson", ["github_repos_read"])
+    r = decide([born])
+    assert r.status_code == 200, r.text
+    assert r.json()["results"] == [{"id": born, "status": "approved", "outcome": {"github_repos_read": "granted"},
+                                    "leases_ended": 0}]
+    held = c.get("/agents/watson/grants", headers=OWNER).json()["grants"]
+    assert [(g["integration"], g["permission"], g["granted_by"], g["expires_at"]) for g in held] == [
+        ("github-watson", "github_repos_read", "room@acme", None)]
+    lease = c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY).json()
+    assert lease["granted"] == ["github_repos_read"] and gh.minted[-1]["spec"]["repositories"] == ["acme-watson"]
+    # The ledger names the room as the one who decided, and says it was a default.
+    event = c.get("/events?kind=request.decided", headers=OWNER).json()["events"][0]
+    assert (event["actor"], event["detail"]) == ("room@acme", {"verdict": "approve", "ids": [born], "room_default": True})
+    asked = c.get("/requests", params={"status": "approved"}, headers=OWNER).json()["requests"][-1]
+    assert (asked["id"], asked["requested_by"], asked["decided_by"]) == (born, "room@acme", "room@acme")
+
+    # Decided once: the room has no second say on it, as it has none on anything already decided.
+    assert refused([born])
+    # A repository added to a set that carries a grant waits for a reviewer, whoever picked it:
+    # the room's own pick, with Read the only level on the set, is still not the room's to allow.
+    r = put("github-watson", ["acme-watson", "acme-secrets"])
+    assert r.status_code == 202, r.text
+    pick = r.json()["pending"]["id"]
+    assert (r.json()["pending"]["requested_by"], r.json()["pending"]["permissions"]) == ("room@acme", ["github_repos_read"])
+    assert refused([pick])
+    # A request a person raised is a reviewer's, even for the same level on the same set.
+    mine = ask("github-watson", ["github_repos_read"], headers=OWNER)
+    assert refused([mine])
+    # A level the catalogue does not mark, alone or beside one it does.
+    more = ask("github-watson", ["github_pulls_write"])
+    both = ask("github-watson", ["github_repos_read", "github_pulls_write"])
+    assert refused([more]) and refused([both])
+    # The connection itself is every repository; so is a set that names none. Never a default.
+    whole = ask("github", ["github_repos_read"])
+    assert c.put("/integrations/github-all", headers=ADMIN,
+                 json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read"], "spec": {}}).status_code == 200
+    unnamed = ask("github-all", ["github_repos_read"])
+    assert refused([whole]) and refused([unnamed])
+    # The room approves; it does not deny. And nobody else on no team decides the room's request.
+    again = ask("github-ledger", ["github_repos_read"], agent="ledger")
+    assert refused([again], verdict="deny", reason="no")
+    for other in ("owner@example.com", "room@elsewhere"):
+        r = decide([again], headers={**ROOM, "X-Bab-Actor": other})
+        assert (r.status_code, r.json()["detail"]) == (403, f"{other} is not on the admin or security team")
+    # An agent's default is on its own set: Read for one agent on another's set is a reviewer's.
+    crossed = ask("github-watson", ["github_repos_read"], agent="ledger")
+    assert refused([crossed])
+    # One request in a batch that is not a default refuses the batch: nothing in it is decided.
+    assert refused([again, mine]) and refused([again, 9999])
+    assert waiting() == [pick, mine, more, both, whole, unnamed, again, crossed]
+    assert [g["integration"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"]] == []
+    # Alone, it is the room's to allow; what the room could not decide is still a reviewer's.
+    assert decide([again]).json()["results"][0]["status"] == "approved"
+    out = decide([mine, more, pick], headers=ADMIN).json()["results"]
+    assert [o["status"] for o in out] == ["approved", "approved", "approved"]
+
+
+def test_the_room_says_an_agent_is_gone_and_what_it_held_goes_with_it(repos):
+    """Gate: `DELETE /agents/{agent}` is the room's own fact, like the topology: any actor
+    holding the console token may say it, and it is refused while the topology still lists
+    the agent. It takes back everything the agent held anywhere (grants, the tuples, the
+    credential in hand, requests still waiting), removes its repository set and its `agents`
+    row (so nobody is left allowed to talk to it), and keeps a set another agent still uses.
+    Saying it again finds nothing."""
+    c, gh = repos
+
+    def put(name, repositories, headers=ROOM):
+        return c.put(f"/integrations/{name}", headers=headers,
+                     json={"vendor": "github", "parent": "github", "ceiling": ["github_repos_read", "github_pulls_write"],
+                           "spec": {"repositories": repositories}})
+
+    def rows():
+        return {i["integration"] for i in c.get("/integrations", headers=OWNER).json()["integrations"]}
+
+    def held(agent):
+        return sorted((g["integration"], g["permission"]) for g in c.get(f"/agents/{agent}/grants", headers=OWNER).json()["grants"])
+
+    def verdict(agent, action, integration):
+        return c.post("/check", json={"agent": agent, "action": action, "object": f"integration:{integration}"},
+                      headers=OWNER).json()["verdict"]
+
+    for name in ("ledger", "watson"):
+        assert c.put(f"/integrations/{name}", json={"vendor": "agents", "spec": {"name": name}, "ceiling": ["a2a_ask"]},
+                     headers=ROOM).status_code == 200
+    assert put("github-watson", ["acme-watson"]).status_code == 200
+    grant(c, "watson", "github-watson", ["github_repos_read"])
+    grant(c, "watson", "github-ledger", ["github_repos_read"])  # a level on another agent's set
+    grant(c, "ledger", "github-ledger", ["github_repos_read"])
+    grant(c, "ledger", "github-watson", ["github_repos_read"])  # and another agent on this one's
+    grant(c, "watson", "ledger", ["a2a_ask"])
+    grant(c, "ledger", "watson", ["a2a_ask"])
+    asked = c.post("/requests", json={"agent": "watson", "integration": "github-watson", "permissions": ["github_pulls_write"]},
+                   headers=OWNER).json()["id"]
+    elsewhere = c.post("/requests", json={"agent": "watson", "integration": "github-ledger", "permissions": ["github_pulls_review"]},
+                       headers=OWNER).json()["id"]
+    c.post("/leases/for-agent", json={"agent": "watson", "integration": "github-watson"}, headers=GATEWAY)
+    c.post("/leases/for-agent", json={"agent": "ledger", "integration": "github-ledger"}, headers=GATEWAY)
+
+    # Still in the topology: a living agent keeps what it holds.
+    r = c.delete("/agents/watson", headers=ROOM)
+    assert r.status_code == 409 and "push the topology without it first" in r.json()["detail"]
+    assert len(held("watson")) == 3 and verdict("watson", "github_repos_read", "github-watson") == "allow"
+    assert c.delete("/agents/watson", headers=AGENT).status_code == 401
+
+    topology = {"agents": [{"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"}]}
+    assert c.put("/topology", json=topology, headers=ROOM).json()["removed"] == 1
+    out = c.delete("/agents/watson", headers=OWNER)
+    assert out.status_code == 200, out.text
+    # Its three grants and the one that let ledger talk to it (four grant tuples, and the room
+    # link and the team's ceiling on its `agents` row); both requests; the credential in hand.
+    # Its `agents` row goes; its set stays, because ledger still holds a level there.
+    assert out.json() == {"agent": "watson", "grants_revoked": 4, "requests_withdrawn": 2, "integrations_removed": 1,
+                          "tuples_deleted": 6, "leases_ended": 1, "removed": ["watson"], "kept": ["github-watson"]}
+    assert held("watson") == [] and len(gh.ended) == 1
+    for action, integration in (("github_repos_read", "github-watson"), ("github_repos_read", "github-ledger"), ("a2a_ask", "ledger")):
+        assert verdict("watson", action, integration) == "deny"
+    assert verdict("ledger", "a2a_ask", "watson") == "deny" and verdict("ledger", "github_repos_read", "github-watson") == "allow"
+    assert held("ledger") == [("github-ledger", "github_repos_read"), ("github-watson", "github_repos_read")]
+    assert c.get("/agents/ledger/talks-to", headers=OWNER).json()["talks_to"] == []
+    assert rows() >= {"github", "github-ledger", "github-watson", "ledger"} and "watson" not in rows()
+    gone = c.get("/requests", params={"status": "withdrawn", "agent": "watson"}, headers=OWNER).json()["requests"]
+    assert [(q["id"], q["decided_by"], q["reason"]) for q in gone] == [
+        (q, "owner@example.com", "the agent was removed before this was decided") for q in (asked, elsewhere)]
+    event = c.get("/events?kind=agent.removed&agent=watson", headers=OWNER).json()["events"]
+    assert len(event) == 1 and event[0]["actor"] == "owner@example.com" and event[0]["detail"] == out.json()
+    # Nothing it held can be approved back: the requests are no longer pending.
+    out = c.post("/requests/decide", json={"ids": [asked, elsewhere], "verdict": "approve"}, headers=ADMIN).json()["results"]
+    assert [o["status"] for o in out] == ["skipped", "skipped"]
+
+    # Once nobody else uses the set, saying it again takes the set too; a third time finds nothing.
+    gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"] if g["integration"] == "github-watson")
+    assert c.delete(f"/grants/{gid}", headers=ADMIN).status_code == 200
+    out = c.delete("/agents/watson", headers=ROOM).json()
+    assert (out["removed"], out["kept"], out["grants_revoked"], out["integrations_removed"]) == (["github-watson"], [], 0, 1)
+    assert out["tuples_deleted"] >= 2 and "github-watson" not in rows()  # the room link and the team's ceilings
+    assert c.delete("/agents/watson", headers=ROOM).json() == {
+        "agent": "watson", "grants_revoked": 0, "requests_withdrawn": 0, "integrations_removed": 0,
+        "tuples_deleted": 0, "leases_ended": 0, "removed": [], "kept": []}
+    assert len(c.get("/events?kind=agent.removed", headers=OWNER).json()["events"]) == 2
+    # An agent the room never knew is the same answer; a set named like another agent's is not this one's.
+    assert c.delete("/agents/led", headers=ROOM).json()["removed"] == []
+    assert {"github-ledger", "github-ledger-web"} <= rows()
+
+    # A pick of repositories names the first agent on its set. When that agent goes, a pick on a
+    # set that stays is handed to whoever is left there, and taken back when nobody is.
+    abel = {"name": "abel", "team": "sre", "namespace": "abel", "service_account": "agent-abel"}
+    c.put("/topology", json={"agents": [*topology["agents"], abel]}, headers=ROOM)
+    grant(c, "abel", "github-ledger", ["github_repos_read"])
+    grant(c, "abel", "github-ledger-web", ["github_repos_read"])
+    shared, alone = (c.put(f"/integrations/{name}", headers=OWNER,
+                           json={"vendor": "github", "parent": "github", "ceiling": [], "spec": {"repositories": [*repos_, "acme-docs"]}})
+                     for name, repos_ in (("github-ledger", ["acme-infra"]), ("github-ledger-web", ["acme-web"])))
+    assert (shared.status_code, shared.json()["pending"]["agent"]) == (202, "abel")
+    assert (alone.status_code, alone.json()["pending"]["agent"]) == (202, "abel")
+    c.put("/topology", json=topology, headers=ROOM)
+    out = c.delete("/agents/abel", headers=ROOM).json()
+    assert (out["grants_revoked"], out["requests_withdrawn"], out["removed"], out["kept"]) == (2, 1, [], [])
+    assert [(q["id"], q["agent"]) for q in c.get("/requests", headers=ADMIN).json()["requests"]] == [
+        (shared.json()["pending"]["id"], "ledger")]
+
+
+def test_a_missing_integration_is_404_whoever_asks(world):
+    """Disconnecting a row that is not there answered 403 to a caller on no team (the reviewer
+    gate ran first), so a room tidying up after itself could not tell "already gone" from
+    "not yours". Absent is 404 for everyone; a row that is there still takes a reviewer."""
+    c, _, _, _ = world
+    connect(c, ["aws_inventory_read"])
+    for who in (OWNER, ROOM, ADMIN):
+        r = c.delete("/integrations/never-there", headers=who)
+        assert (r.status_code, r.json()["detail"]) == (404, "no integration 'never-there'")
+    assert c.delete("/integrations/aws-prod", headers=OWNER).status_code == 403
+    assert c.delete("/integrations/aws-prod", headers=ADMIN).status_code == 200
+    assert c.delete("/integrations/aws-prod", headers=OWNER).status_code == 404
