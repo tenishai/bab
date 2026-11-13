@@ -4,7 +4,7 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.23] - 2026-11-13
 
 ### Added
 - **The room allows its own default.** A room that gives a newborn agent Read on its own
