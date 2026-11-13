@@ -1191,9 +1191,12 @@ def test_the_room_allows_the_default_it_asked_for_and_nothing_else(repos):
     for other in ("owner@example.com", "room@elsewhere"):
         r = decide([again], headers={**ROOM, "X-Bab-Actor": other})
         assert (r.status_code, r.json()["detail"]) == (403, f"{other} is not on the admin or security team")
+    # An agent's default is on its own set: Read for one agent on another's set is a reviewer's.
+    crossed = ask("github-watson", ["github_repos_read"], agent="ledger")
+    assert refused([crossed])
     # One request in a batch that is not a default refuses the batch: nothing in it is decided.
     assert refused([again, mine]) and refused([again, 9999])
-    assert waiting() == [pick, mine, more, both, whole, unnamed, again]
+    assert waiting() == [pick, mine, more, both, whole, unnamed, again, crossed]
     assert [g["integration"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"]] == []
     # Alone, it is the room's to allow; what the room could not decide is still a reviewer's.
     assert decide([again]).json()["results"][0]["status"] == "approved"

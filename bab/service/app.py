@@ -368,11 +368,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         default. The room asks for it as itself (`Settings.room_actor`) when an agent is born,
         and nobody is there to click yes, so it may approve exactly what it asked for and only
         where the catalogue says a default is safe: every permission in the request is marked
-        `room_default`, and the request is on an agent's repository set (a child of a service
+        `room_default`, and the request is on that agent's own repository set (a child of a service
         connection that names its repositories), never on the connection itself. Anything else
         in the batch refuses the whole batch with the sentence every non-reviewer gets: a
         denial, a request a person raised, one already decided, a pick of repositories, a level
-        the catalogue does not mark, a set that names nothing."""
+        the catalogue does not mark, a set that names nothing, another agent's set."""
         no = HTTPException(403, f"{caller.actor} is not on the admin or security team")
         if caller.actor != settings.room_actor or body.verdict != "approve":
             raise no
@@ -387,6 +387,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             parent = s.get(Integration, row.parent) if row is not None and row.parent else None
             if (parent is None or row.vendor not in REPOSITORY_SET_VENDORS or parent.vendor != row.vendor
                     or parent.kind != "connection" or not (row.spec or {}).get("repositories")):
+                raise no
+            # The agent's OWN set: `<connection>-<agent>`, never another agent's.
+            if row.id != f"{row.parent}-{req.agent}":
                 raise no
 
     def apply_repositories(s, req: Request, who: dict[str, bool], actor: str, now: datetime) -> set[str]:
