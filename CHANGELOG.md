@@ -4,6 +4,41 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **An agent's owner can pick its repositories.** `PUT /integrations/{id}` took an admin or
+  security reviewer for every vendor but `agents`, so a console that lets an agent's owner pick
+  the repositories the agent may reach (a set under the GitHub connection) was refused for
+  anyone not on those teams. A caller on no team may now write that one shape: a child of a
+  service connection whose spec names its `repositories`, for a vendor whose credential is
+  narrowed by them (GitHub). Picking grants nothing; the level is still asked for and decided
+  by a reviewer, who sees the set. An empty set stays a reviewer's (it would be the whole
+  connection), and of such a write the repositories alone are taken: an existing set keeps its
+  ceiling and the rest of its spec, a new one starts with the repositories only.
+- **Naming the `agents` vendor no longer opens another vendor's row.** Any actor may write an
+  `agents` integration, and the check read the vendor from the request, so a caller on no team
+  could re-describe any integration as an `agents` one and then delete it. The lane is now for
+  rows that are, or are about to be, `agents` rows.
+- **Disconnecting an integration takes back what waited on it.** Requests still pending on a
+  deleted integration are marked `withdrawn`, so none can be approved onto a row that later
+  takes the same name.
+
+### Added
+- **A repository added to a set that carries grants waits for a reviewer.** Once an agent
+  holds a level on its set, or has asked for one a reviewer has yet to decide, an owner's pick
+  is split: what it removes leaves the set at once, and what it adds becomes one request of
+  kind `repositories` (`proposal: {added, removed}`; `permissions` the levels held or asked
+  for on the set, read again each time the request is listed and frozen when it is decided, so
+  the reviewer sees what the new repositories would be reached with). The `PUT` answers 202 with the set as it stands and the request under
+  `pending`; picking again replaces what waits, and saving the set without the addition (or a
+  reviewer writing the set) marks it `withdrawn`. `POST /requests/decide` applies an approved
+  one to the set; a denial leaves it. `GET /requests` rows carry `proposal` (null on a
+  permission request). The `requests` table gains a `proposal` column at boot.
+- **A changed set reaches the agent on its next call.** Writing a set that carries grants, or
+  approving an addition to it, drops the credential cached for it, so the next lease is minted
+  for the new set instead of the old one being handed out until its hour ran out.
+
 ## [0.4.21] - 2026-11-12
 
 ### Fixed
