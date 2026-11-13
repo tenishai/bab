@@ -86,6 +86,12 @@ class Settings:
     def team(self, name: str) -> str:
         return name if ":" in name else f"team:{name}"
 
+    @property
+    def room_actor(self) -> str:
+        """Who the room is when it acts for itself and not for a person: the actor its console
+        sends on the calls nobody clicked (the topology push, an agent's default at birth)."""
+        return f"room@{self.room}"
+
 
 class RequestBody(BaseModel):
     agent: str = Field(min_length=1, max_length=100)
@@ -336,12 +342,52 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             req.status, req.decided_at, req.decided_by = "withdrawn", now, actor
             req.reason = "the set was saved again before this was decided"
 
-    def withdraw_all(s, integration: str, actor: str, now: datetime) -> None:
+    def withdraw_all(s, integration: str, actor: str, now: datetime) -> int:
         """The integration is gone: nothing asked of it can be decided, and a row that later takes
-        its name is not the one these were asked of."""
-        for req in s.scalars(select(Request).where(Request.integration == integration, Request.status == "pending")):
+        its name is not the one these were asked of. Returns how many were taken back."""
+        waiting = list(s.scalars(select(Request).where(Request.integration == integration, Request.status == "pending")))
+        for req in waiting:
             req.status, req.decided_at, req.decided_by = "withdrawn", now, actor
             req.reason = "the integration was disconnected before this was decided"
+        return len(waiting)
+
+    def disconnect(s, row: Integration, actor: str, now: datetime) -> tuple[int, int]:
+        """Take one integration out of the ledger: every active grant on it revoked, every request
+        still waiting on it withdrawn, the row deleted. The tuples naming it are the caller's to
+        delete from the store. Returns how many grants and requests that was."""
+        revoked = 0
+        for g in ledger.active_grants_on(s, row.id):
+            g.revoked_at, g.revoked_by = now, actor
+            revoked += 1
+        withdrawn = withdraw_all(s, row.id, actor, now)
+        s.delete(row)
+        return revoked, withdrawn
+
+    def room_default_or_403(s, body: DecideBody, caller: Caller) -> None:
+        """The one decision a caller who is no reviewer may make: the room allowing its own
+        default. The room asks for it as itself (`Settings.room_actor`) when an agent is born,
+        and nobody is there to click yes, so it may approve exactly what it asked for and only
+        where the catalogue says a default is safe: every permission in the request is marked
+        `room_default`, and the request is on an agent's repository set (a child of a service
+        connection that names its repositories), never on the connection itself. Anything else
+        in the batch refuses the whole batch with the sentence every non-reviewer gets: a
+        denial, a request a person raised, one already decided, a pick of repositories, a level
+        the catalogue does not mark, a set that names nothing."""
+        no = HTTPException(403, f"{caller.actor} is not on the admin or security team")
+        if caller.actor != settings.room_actor or body.verdict != "approve":
+            raise no
+        for rid in body.ids:
+            req = s.get(Request, rid)
+            if (req is None or req.status != "pending" or req.kind == "repositories"
+                    or req.requested_by != settings.room_actor or not req.permissions):
+                raise no
+            if not all(cat.action(p) and cat.action(p).room_default for p in req.permissions):
+                raise no
+            row = s.get(Integration, req.integration)
+            parent = s.get(Integration, row.parent) if row is not None and row.parent else None
+            if (parent is None or row.vendor not in REPOSITORY_SET_VENDORS or parent.vendor != row.vendor
+                    or parent.kind != "connection" or not (row.spec or {}).get("repositories")):
+                raise no
 
     def apply_repositories(s, req: Request, who: dict[str, bool], actor: str, now: datetime) -> set[str]:
         """Approve a `repositories` request: the set takes what was asked. The reviewer is saying
@@ -490,7 +536,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         groups: dict[str, list] = {}
         for a in cat.for_vendor(vendor):
             groups.setdefault(a.group or "General", []).append(
-                {"name": a.name, "tier": a.tier, "label": a.label or None, "description": a.description})
+                {"name": a.name, "tier": a.tier, "label": a.label or None, "description": a.description,
+                 "room_default": a.room_default})
         if not groups:
             raise HTTPException(404, f"the catalogue has no permissions for {vendor!r}")
         v = cat.vendor(vendor)
@@ -795,10 +842,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def delete_integration(integration: str, caller: Console):
         """Disconnect: the row, every active grant on it (revoked), every request still waiting
         on it (withdrawn), and every tuple naming it (room link, ceilings, grants). Leases already
-        minted run out on their own."""
+        minted run out on their own. A row that is not there is 404 whoever asks: that it is
+        absent is no secret from a caller holding the console token."""
         with ledger.session() as s0:
-            row0 = s0.get(Integration, integration)
-        if row0 is None or row0.vendor != AGENTS_VENDOR:
+            row0 = integration_or_404(s0, integration)
+        if row0.vendor != AGENTS_VENDOR:
             reviewer(caller)
         now = settings.now()
         with ledger.session() as s:
@@ -807,17 +855,12 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             if children:
                 what = "accounts" if row.kind == "org" else "integrations"
                 raise HTTPException(409, f"{integration!r} still has {what} under it: {', '.join(children)}; disconnect those first")
-            revoked = 0
-            for g in ledger.active_grants_on(s, integration):
-                g.revoked_at, g.revoked_by = now, caller.actor
-                revoked += 1
-            withdraw_all(s, integration, caller.actor, now)
+            revoked, _ = disconnect(s, row, caller.actor, now)
             try:
                 gone = [t for t in store.read_all() if t.object == obj(integration)]
                 store.delete(gone)
             except StoreError as exc:
                 raise HTTPException(503, f"the store cannot answer: {exc}") from exc
-            s.delete(row)
             ledger.event(s, now, "integration.removed", caller.actor, integration=integration,
                          grants_revoked=revoked, tuples_deleted=len(gone))
             s.commit()
@@ -854,6 +897,92 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         return {"agents": [{"name": r.name, "team": r.team, "namespace": r.namespace,
                             "service_account": r.service_account} for r in rows]}
 
+    @app.delete("/agents/{agent}")
+    def delete_agent(agent: str, caller: Console):
+        """The room says an agent is gone, and everything it held goes with it: every active
+        grant it holds on any integration (revoked, the tuples deleted, a credential in hand
+        ended where the vendor allows it), every request still waiting for it (withdrawn), its
+        repository sets (the child named `<connection>-<agent>` under a service connection) and
+        its `agents` integration (so nobody is left allowed to talk to it). Like the topology,
+        this is the room's own fact: the console token is the authority and the actor is
+        recorded. It is refused while the topology still lists the agent (409: push the
+        topology without it first), so it cannot take a living agent's grants. A set another
+        agent still holds a level on, or is waiting for one on, is kept and named. Calling it
+        again finds nothing and answers zeros."""
+        now = settings.now()
+        with ledger.session() as s:
+            if s.get(AgentRow, agent) is not None:
+                raise HTTPException(409, f"{agent!r} is still one of the room's agents; push the topology without it first")
+            held = ledger.active_grants(s, agent)
+            for g in held:
+                g.revoked_at, g.revoked_by = now, caller.actor
+            revoked = len(held)
+            withdrawn = 0
+            for req in s.scalars(select(Request).where(Request.agent == agent, Request.kind != "repositories",
+                                                       Request.status == "pending")):
+                req.status, req.decided_at, req.decided_by = "withdrawn", now, caller.actor
+                req.reason = "the agent was removed before this was decided"
+                withdrawn += 1
+            s.flush()
+
+            def others(integration: str) -> list[str]:
+                """Who else holds a level on an integration, or waits for one."""
+                return sorted(({g.agent for g in ledger.active_grants_on(s, integration)}
+                               | {r.agent for r in asked_levels(s, integration)}) - {agent})
+
+            going: list[Integration] = []
+            kept: list[str] = []
+            for row in s.scalars(select(Integration).where(Integration.parent.is_not(None)).order_by(Integration.id)):
+                if row.vendor not in REPOSITORY_SET_VENDORS or row.id != f"{row.parent}-{agent}":
+                    continue
+                if others(row.id):
+                    kept.append(row.id)
+                else:
+                    going.append(row)
+            own = s.get(Integration, agent)
+            if own is not None and own.vendor == AGENTS_VENDOR:
+                # Nothing hangs under an agent's row; one that somehow does is left for a person.
+                if s.scalar(select(Integration.id).where(Integration.parent == own.id).limit(1)) is None:
+                    going.append(own)
+                else:
+                    kept.append(own.id)
+            removed = sorted(r.id for r in going)
+            # A pick of repositories names the first agent on its set. On a set that stays, it
+            # is handed to whoever is left there, or taken back when nobody is.
+            for req in s.scalars(select(Request).where(Request.agent == agent, Request.kind == "repositories",
+                                                       Request.status == "pending")):
+                if req.integration in removed:
+                    continue
+                left = others(req.integration)
+                if left:
+                    req.agent = left[0]
+                    continue
+                req.status, req.decided_at, req.decided_by = "withdrawn", now, caller.actor
+                req.reason = "the agent was removed before this was decided"
+                withdrawn += 1
+            for row in going:
+                more, taken = disconnect(s, row, caller.actor, now)
+                revoked, withdrawn = revoked + more, withdrawn + taken
+            objects = {obj(i) for i in removed}
+            try:
+                gone = [t for t in store.read_all()
+                        if t.object in objects or (t.user == f"agent:{agent}" and t.object.startswith("integration:"))]
+                store.delete(gone)
+            except StoreError as exc:
+                raise HTTPException(503, f"the store cannot answer: {exc}") from exc
+            pairs = sorted({(g.agent, g.integration) for g in held})
+            ended = sum(end_live(s, a, i, now) for a, i in pairs)
+            out = {"agent": agent, "grants_revoked": revoked, "requests_withdrawn": withdrawn,
+                   "integrations_removed": len(removed), "tuples_deleted": len(gone), "leases_ended": ended,
+                   "removed": removed, "kept": sorted(kept)}
+            if revoked or withdrawn or removed or gone or ended:
+                ledger.event(s, now, "agent.removed", caller.actor, **out)
+            s.commit()
+        forget_live(pairs)
+        log.info("agent %s removed by %s: grants -%d, requests -%d, integrations -%d, tuples -%d", agent,
+                 caller.actor, revoked, withdrawn, len(removed), len(gone))
+        return out
+
     @app.post("/requests", status_code=201)
     def post_request(body: RequestBody, caller: Console):
         now = settings.now()
@@ -878,13 +1007,21 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
 
     @app.post("/requests/decide")
     def decide(body: DecideBody, caller: Console):
-        who = reviewer(caller)
-        if body.verdict == "deny" and not (body.reason or "").strip():
+        """A reviewer's verdict on a batch of requests. One caller on no team may approve: the
+        room, deciding the default it asked for itself (`room_default_or_403`). It holds neither
+        flag below, so nothing a reviewer's team opens (the destroy tier, a pick of
+        repositories) is open to it even if the gate were wrong."""
+        who = {"admin": is_member(caller.actor, settings.admin_team),
+               "security": is_member(caller.actor, settings.security_team)}
+        by_room = not (who["admin"] or who["security"])
+        if body.verdict == "deny" and not (body.reason or "").strip() and not by_room:
             raise HTTPException(422, "a denial needs a reason")
         now = settings.now()
         results = []
         changed: set[tuple[str, str]] = set()
         with ledger.session() as s:
+            if by_room:
+                room_default_or_403(s, body, caller)
             for rid in body.ids:
                 req = s.get(Request, rid)
                 if req is None or req.status != "pending":
@@ -924,7 +1061,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                     changed.add((req.agent, req.integration))
                     result["leases_ended"] = end_live(s, req.agent, req.integration, now)
                 results.append(result)
-            ledger.event(s, now, "request.decided", caller.actor, verdict=body.verdict, ids=body.ids)
+            ledger.event(s, now, "request.decided", caller.actor, verdict=body.verdict, ids=body.ids,
+                         **({"room_default": True} if by_room else {}))
             s.commit()
         forget_live(changed)
         return {"results": results}

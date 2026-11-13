@@ -4,6 +4,43 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **The room allows its own default.** A room that gives a newborn agent Read on its own
+  repository asks for it as itself, with nobody there to click yes, and `POST /requests/decide`
+  took an admin or security reviewer from every caller, so the default never landed. One
+  caller on no team may now approve: the room, whose actor is `room@<BAB_ROOM>`
+  (`Settings.room_actor`; no new setting), and only its own default. Every request in the batch
+  must be pending, a level request (not a pick of repositories), raised by that same actor,
+  made only of permissions the catalogue marks `room_default`, and on an agent's repository
+  set: a child of a service connection that names its repositories, never the connection
+  itself. Anything else in the batch, a denial included, refuses the whole batch with the 403
+  every non-reviewer gets. The grant's `granted_by`, the request's `decided_by` and the
+  `request.decided` event name the room, and the event carries `room_default: true`.
+- **`room_default` in the catalogue.** An action may carry `room_default: true` (read tier
+  only; anything else is a catalogue error). The room's catalogue sets it on
+  `github_repos_read` and nothing else. `GET /catalogue/{vendor}` carries it on every
+  permission.
+- **`DELETE /agents/{agent}`: the room says an agent is gone.** Nothing removed what a
+  departed agent held: its repository set, its grants on other integrations and its pending
+  requests stayed behind, and a later agent of the same name would have inherited them. Like
+  the topology, this is the room's own fact: the console token is the authority and the actor
+  is recorded. It answers 409 while the topology still lists the agent. Otherwise it revokes
+  every active grant the agent holds on any integration and deletes the tuples, ends the
+  credentials it has in hand where the vendor allows, withdraws its pending requests, removes
+  its repository set (`<connection>-<agent>`) and its `agents` integration with the grants on
+  it, and writes one `agent.removed` event. A set another agent still holds a level on, or is
+  waiting for one on, is kept and named under `kept`. The answer is
+  `{agent, grants_revoked, requests_withdrawn, integrations_removed, tuples_deleted,
+  leases_ended, removed, kept}`; calling it again answers zeros.
+
+### Fixed
+- **A missing integration is 404 whoever asks.** `DELETE /integrations/{id}` ran the reviewer
+  gate before looking for the row, so a caller on no team got 403 for a row that was not
+  there and could not tell "already gone" from "not yours". A row that exists still takes a
+  reviewer (or is an `agents` row).
+
 ## [0.4.22] - 2026-11-12
 
 ### Fixed

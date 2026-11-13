@@ -211,8 +211,11 @@ actions:
   # ---- github: three levels, each a superset of the one before (Read < Review < Open). Each row
   # names the GitHub App permissions it needs; the minter narrows an installation token to their
   # union (write wins over read per permission) and to the leased integration's `repositories`.
-  # `label` is what a console shows; the names stay because grants carry them. ----
+  # `label` is what a console shows; the names stay because grants carry them.
+  # `room_default` on Read: the room allows it itself on an agent's own repository set (an agent
+  # is born reading its own repository); every other level, and Read anywhere else, is a reviewer's. ----
   - {name: github_repos_read,    tier: read,   vendor: github, group: Repositories,  label: "Read",
+     room_default: true,
      description: "Read code, issues, pull requests, checks and workflow runs",
      extra: {permissions: {metadata: read, contents: read, issues: read, pull_requests: read, checks: read, actions: read}}}
   - {name: github_pulls_review,  tier: mutate, vendor: github, group: Pull requests, label: "Review pull requests",
