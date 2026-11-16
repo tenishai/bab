@@ -4,6 +4,16 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Okta in the room catalogue.** A new service vendor, `okta`, with two levels:
+  `okta_directory_read` (read tier, label "Look up people and groups") and
+  `okta_access_write` (mutate tier, label "Change group membership and assignments").
+  Nothing is minted for it: a room holds one API token for the org and its gateway opens
+  the matching tools only to an agent granted the level. The token's own admin role in
+  Okta is the outer wall.
+
 ## [0.4.23] - 2026-11-13
 
 ### Added

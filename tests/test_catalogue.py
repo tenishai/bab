@@ -31,6 +31,14 @@ def test_a_read_action_may_be_a_room_default():
     assert [a.name for a in load("catalogues/room.yaml").actions if a.room_default] == ["github_repos_read"]
 
 
+def test_okta_is_a_service_with_a_standing_read_and_a_thirty_day_write():
+    cat = load("catalogues/room.yaml")
+    assert cat.vendor("okta").kind == "service" and cat.vendor("okta").label == "Okta"
+    assert {a.name: a.tier for a in cat.for_vendor("okta")} == {
+        "okta_directory_read": "read", "okta_access_write": "mutate"}
+    assert not any(a.room_default or a.extra for a in cat.for_vendor("okta"))
+
+
 @pytest.mark.parametrize("raw,msg", [
     ({"resources": []}, "at least one level"),
     ({"resources": ["project"], "actions": [{"name": "Pod-Delete", "tier": "mutate"}]}, "bad action name"),

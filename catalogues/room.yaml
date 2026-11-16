@@ -2,7 +2,7 @@
 #
 # Two kinds of vendor. A CLOUD (aws, gcp, azure) is connected one account, project or
 # subscription at a time; a permission is read access to one service there, and the
-# minter narrows the leased session to it. A SERVICE (datadog, atlassian, github) is one
+# minter narrows the leased session to it. A SERVICE (datadog, atlassian, github, okta) is one
 # connection; a permission is one read capability the vendor's own API or MCP server
 # exposes, and the gateway in front of it is what honours the grant.
 #
@@ -26,6 +26,7 @@ vendors:
   datadog:   {kind: service, label: Datadog}
   atlassian: {kind: service, label: Atlassian}
   github:    {kind: service, label: GitHub}
+  okta:      {kind: service, label: Okta}
   # Another agent in the room, one integration per agent (id = the agent's name). Talking
   # is a grant the switchboard reads, never a lease: nothing is minted for this vendor.
   agents:    {kind: service, label: Other agents}
@@ -224,6 +225,15 @@ actions:
   - {name: github_pulls_write,   tier: mutate, vendor: github, group: Pull requests, label: "Open pull requests",
      description: "Create branches and commits and open pull requests",
      extra: {permissions: {metadata: read, contents: write, issues: read, pull_requests: write, checks: read, actions: read}}}
+
+  # ---- okta: two levels. The room holds one API token for the org and its gateway is what
+  # honours the grant: nothing is minted for this vendor. The token's own admin role in Okta
+  # is the outer wall, so a room connected with a read-only token never changes anything
+  # whatever is granted here. ----
+  - {name: okta_directory_read, tier: read, vendor: okta, group: Directory, label: "Look up people and groups",
+     description: "Find people and groups, list a person's groups and a group's members, and check app assignments"}
+  - {name: okta_access_write, tier: mutate, vendor: okta, group: Access, label: "Change group membership and assignments",
+     description: "Add a person to a group, assign a person to an app, and set the profile attributes the room allows"}
 
   # ---- agents: talking to another team's agent is a permission its owner requests ----
   - {name: a2a_ask, tier: read, vendor: agents, group: Colleagues, description: "Ask this agent for help; it answers from what it knows and never borrows a credential for the asker"}
