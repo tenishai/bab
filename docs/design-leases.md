@@ -212,6 +212,19 @@ permissions name no scope is refused rather than minted wide. This is the
 first service vendor where the vendor itself enforces the granted set during
 the hour, as AWS does with the session policy.
 
+Datadog refuses a new application key for a moment after it creates it
+(0.7 to 1.8 seconds, measured from bab's pod; then 200 and never 403 again).
+So the minter reads with the key before it hands it out, and returns once
+Datadog answers 200. The read has to be one the key's own scopes allow, so
+it is picked from a short table of pairings (`DD_KEY_READS` in
+`bab/service/minters.py`): monitors, events, a metric query. A key that
+carries none of those scopes is held for a fixed 2.5 seconds instead. The
+wait is bounded at 6 seconds, and it fails open: a key Datadog has not
+accepted by then is handed out with a note on the lease, because a lease
+that works a second late is better than no lease. A caller's lease request
+therefore takes 1 to 3 seconds longer on a mint, and its timeout has to
+allow for that.
+
 The tool gateway, not the agent, is what reaches Datadog today; it leases
 through `POST /leases/for-agent` with its own pod identity, naming the agent
 whose call it is serving. The checks are the agent's; the row says `via:

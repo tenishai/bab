@@ -423,6 +423,30 @@ def dd_scopes(permissions: list[Action]) -> list[str]:
     return sorted(scopes)
 
 
+# Datadog refuses a new application key for a moment after it creates it. Measured on
+# 2026-11-16 from the permission service's own pod: five keys of five answered 403 for 0.7
+# to 1.8 seconds after the create returned, then 200, and never 403 again. A lease handed
+# out inside that moment failed the agent's first call, and the refusal read like a missing
+# permission. So a key is read with before it is handed out.
+#
+# A key can only be read with on a scope it carries, and a read on the wrong scope is
+# refused for good, so each row here is a pairing the tool gateway's own Datadog reads have
+# proven. Add a row when another is proven; a key that carries none of them is held for the
+# usual delay instead.
+DD_KEY_READS = (
+    ("monitors_read", "/api/v1/monitor?page=0&page_size=1"),
+    ("events_read", "/api/v1/events?start={then}&end={now}"),
+    ("timeseries_query", "/api/v1/query?from={then}&to={now}&query=avg%3Asystem.cpu.idle%7B%2A%7D"),
+)
+# The longest a mint waits for its key: three times the slowest one measured, and inside
+# the ten seconds the tool gateway gives a lease it has none of.
+DD_KEY_WAIT_SECONDS = 6.0
+DD_KEY_STEP_SECONDS = 0.2
+DD_KEY_SETTLE_SECONDS = 2.5
+DD_KEY_NOTE = "application key scoped to the granted permissions"
+DD_KEY_LATE_NOTE = DD_KEY_NOTE + "; Datadog had not accepted it yet when it was handed out"
+
+
 @dataclass(frozen=True)
 class DatadogConfig:
     service_account_id: str
@@ -444,11 +468,14 @@ class DatadogMinter:
 
     name = "datadog"
 
-    def __init__(self, directory: str | None = None, env: Mapping[str, str] | None = None, http=None, now=time.time):
+    def __init__(self, directory: str | None = None, env: Mapping[str, str] | None = None, http=None, now=time.time,
+                 sleep=time.sleep, clock=time.monotonic):
         self.directory = directory
         self.env: Mapping[str, str] = {} if env is None else env
         self.http = http or self._http
         self.now = now
+        self.sleep = sleep  # the wait for a new key, between reads
+        self.clock = clock
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ, **kwargs) -> DatadogMinter:
@@ -538,9 +565,41 @@ class DatadogMinter:
         now = self.now()
         name = _DD_KEY_NAME_BAD.sub("-", f"bab-{agent}-{time.strftime('%Y%m%d%H%M', time.gmtime(now))}")
         key_id, key = self._create_key(cfg, name, scopes)
+        accepted = self._await_key(cfg, name, key, scopes)
         return Minted(credential={"dd_api_key": cfg.api_key, "dd_app_key": key, "dd_site": cfg.site},
                       expires_at=now + max(1, min(int(seconds), DD_MAX_SECONDS)), handle={"key_id": key_id},
-                      note="application key scoped to the granted permissions")
+                      note=DD_KEY_NOTE if accepted else DD_KEY_LATE_NOTE)
+
+    def _await_key(self, cfg: DatadogConfig, name: str, key: str, scopes: list[str]) -> bool:
+        """Hold a new key until Datadog answers a read made with it (see DD_KEY_READS). True
+        when it answered, or when it carries no scope there is a proven read for and was held
+        for the usual delay instead. False when Datadog still refused it after
+        DD_KEY_WAIT_SECONDS: the key is handed out all the same, as every key was before this,
+        because it is real and its lease is about to be recorded, and a late key is likelier
+        than a dead one. Never raises, and logs the key's name, never the key."""
+        path = next((p for scope, p in DD_KEY_READS if scope in scopes), None)
+        if path is None:
+            self.sleep(DD_KEY_SETTLE_SECONDS)
+            return True
+        headers = {"DD-API-KEY": cfg.api_key, "DD-APPLICATION-KEY": key, "Accept": "application/json"}
+        started, reads, status = self.clock(), 0, 0
+        while True:
+            at = int(self.now())
+            try:
+                status, _ = self.http("GET", f"https://api.{cfg.site}{path.format(then=at - 1, now=at)}", headers, None)
+            except MintError:  # Datadog did not answer this read: not a word about the key
+                status = 0
+            reads += 1
+            waited = self.clock() - started
+            if status == 200:
+                log.info("datadog key %s answered after %.1fs (%d reads)", name, waited, reads)
+                return True
+            # 429 is Datadog asking for fewer reads, so this stops asking.
+            if status == 429 or waited + DD_KEY_STEP_SECONDS > DD_KEY_WAIT_SECONDS:
+                log.warning("datadog key %s handed out unanswered: HTTP %d after %.1fs (%d reads)",
+                            name, status, waited, reads)
+                return False
+            self.sleep(DD_KEY_STEP_SECONDS)
 
     def end(self, handle):
         key_id = str((handle or {}).get("key_id") or "")

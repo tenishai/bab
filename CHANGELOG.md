@@ -4,6 +4,22 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **A Datadog lease is not handed out before Datadog accepts its key.** Datadog refuses a new
+  application key for a moment after it creates it: measured from the service's own pod, five
+  keys of five answered 403 for 0.7 to 1.8 seconds after the create returned, then 200, and
+  never 403 again. A lease handed out inside that moment failed the agent's first call, and
+  read as a missing permission. The minter now reads with the new key until Datadog answers
+  200, then hands it out. The read is one the key's own scopes allow (`monitors_read`,
+  `events_read` or `timeseries_query`); a key that carries none of those is held for 2.5
+  seconds instead. The wait is bounded at 6 seconds. A key Datadog still has not accepted by
+  then is handed out anyway, with a note on the lease and a warning in the log, so a slow
+  Datadog never costs an agent its lease. A Datadog lease request now takes 1 to 3 seconds
+  longer the first time in each hour; a caller that waits less than that on a lease should
+  wait longer.
+
 ## [0.4.24] - 2026-11-16
 
 ### Added
