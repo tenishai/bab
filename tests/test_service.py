@@ -590,6 +590,24 @@ def test_a_kept_datadog_key_never_outlives_what_its_agent_holds():
     assert dd.keys == {} and keys.stored == {}
 
 
+def test_a_change_on_one_vendor_never_asks_another_vendors_key_store():
+    """A revoke, an approval or a refusal tells only the integration's own minter that the
+    agent's access changed. An AWS revoke never waits on the store Datadog keeps its keys in."""
+    from tests.conftest import FakeKeys
+
+    keys = FakeKeys()
+    c, _, _, _ = gateway_room(keys)
+    connect(c, ["aws_inventory_read"])
+    grant(c, "ledger", "aws-prod", ["aws_inventory_read"])
+    asked = []
+    names = keys.names
+    keys.names = lambda: (asked.append(1), names())[1]
+    gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"])
+    assert c.delete(f"/grants/{gid}", headers=ADMIN).status_code == 200
+    assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "aws-prod"}, headers=GATEWAY).status_code == 403
+    assert asked == []
+
+
 def test_a_change_that_lands_while_a_lease_is_being_made_is_not_outrun_by_it():
     """A lease reads the grants, then mints. A revoke or an approval between the two finds no
     lease to end, and the key made a moment later would carry what was just taken back, for as

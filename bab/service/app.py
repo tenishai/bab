@@ -246,6 +246,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     # new vendor session each time. Memory only; a restart simply mints afresh.
     live: dict[tuple[str, str, tuple[str, ...]], tuple[int, dict, float, str]] = {}
     LIVE_MARGIN_S = 120
+    checking: set[int] = set()  # leases cached but not yet past their second check: never a cache hit
     # How often a lease also checks every kept key against the ledger (`settle_kept`).
     SETTLE_EVERY_S = 300
     settled = {"at": 0.0}
@@ -368,7 +369,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             revoked += 1
             holders.add(g.agent)
         for agent in sorted(holders | {agent for _, agent, integration in kept_keys() if integration == row.id}):
-            drop_standing(agent, row.id)
+            drop_standing(agent, row.id, row.vendor)
         withdrawn = withdraw_all(s, row.id, actor, now)
         s.delete(row)
         return revoked, withdrawn
@@ -510,10 +511,12 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def end_expired(s, now: datetime) -> int:
         return end_leases(s, s.scalars(select(Lease).where(Lease.expires_at <= now.replace(tzinfo=None))), now)
 
-    def drop_standing(agent: str, integration: str) -> None:
+    def drop_standing(agent: str, integration: str, vendor: str | None) -> None:
         """A key a minter keeps for `agent` across leases goes when what the agent may do on
-        `integration` changes or ends, live lease or none."""
-        for m in minters.values():
+        `integration` changes or ends, live lease or none. Only the vendor's own minter is
+        told, so a change on one vendor never waits on another's store; with no vendor known
+        (the row is gone), every minter is."""
+        for m in [minters.get(vendor)] if vendor else list(minters.values()):
             drop = getattr(m, "drop", None)
             if drop is not None:
                 drop(agent, integration)
@@ -559,7 +562,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         """End what `agent` holds on `integration` right now. A grant or a revoke changes
         what the next credential may carry, so the one in hand is ended where the vendor
         allows it rather than left to run out its hour beside the new one."""
-        drop_standing(agent, integration)
+        row = s.get(Integration, integration)
+        drop_standing(agent, integration, row.vendor if row is not None else None)
         return end_leases(s, s.scalars(select(Lease).where(
             Lease.agent == agent, Lease.integration == integration,
             Lease.expires_at > now.replace(tzinfo=None))), now)
@@ -1219,7 +1223,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 cat.action(g.permission) for g in ledger.active_grants(s, agent, iid)
                 if cat.action(g.permission) and not g.gated]
             if not wanted:
-                drop_standing(agent, iid)  # every grant lapsed or was taken back: nothing is left to carry
+                drop_standing(agent, iid, integ.vendor)  # every grant lapsed or was taken back: nothing is left to carry
                 ledger.event(s, now, "lease.refused", agent, agent=agent, integration=iid, permissions=[],
                              reason=NOT_GRANTED, via=via)
                 s.commit()
@@ -1242,7 +1246,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 s.add(pending)
             if not granted:
                 if not body.permissions:
-                    drop_standing(agent, iid)
+                    drop_standing(agent, iid, integ.vendor)
                 if not gated:
                     # Nothing held and nothing waiting: a refusal, recorded like the borrowing one so
                     # the room's Agents audit can show it next to the leases that did mint.
@@ -1256,7 +1260,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             key = (agent, iid, tuple(sorted(a.name for a in granted)))
             resolved = {"resolved_from": body.integration} if iid != body.integration else {}
             held = live.get(key)
-            if held and held[2] - now.timestamp() > LIVE_MARGIN_S:
+            if held and held[0] not in checking and held[2] - now.timestamp() > LIVE_MARGIN_S:
                 lease_id, credential, expires_ts, note = held
                 if pending is not None:
                     s.commit()
@@ -1281,6 +1285,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                           via=via)
             s.add(lease)
             s.commit()
+            checking.add(lease.id)
             live[key] = (lease.id, minted.credential, minted.expires_at, minted.note)
             # Asked again now that the lease is on the books. A revoke or an approval that
             # landed while the credential was made found no lease to end; one that lands from
@@ -1291,9 +1296,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             except StoreError:
                 still = None
             holds = getattr(minter, "holds", None)
-            if not still or (holds is not None and not holds(minted.handle)):
+            given = bool(still) and (holds is None or holds(minted.handle))
+            checking.discard(lease.id)
+            if not given:
                 if still is False:
-                    drop_standing(agent, iid)
+                    drop_standing(agent, iid, integ.vendor)
                 lease.expires_at = now.replace(tzinfo=None)  # ended now, whether or not the vendor could
                 end_leases(s, [lease], now)
                 if live.get(key, (None,))[0] == lease.id:

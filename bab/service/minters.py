@@ -677,12 +677,18 @@ class DatadogMinter:
 
     def _adopt(self) -> None:
         """Take up every key the store holds and memory does not. A record whose key this
-        process saw deleted is the store catching up, and is left."""
+        process saw deleted is the store catching up, and is left. A name another lease holds
+        right now is skipped, not waited on: that lease reads it itself."""
         for name, record in self.keys.all().items():
-            with self._lock_for(name):
+            lock = self._lock_for(name)
+            if not lock.acquire(blocking=False):
+                continue
+            try:
                 read = None if name in self._standing else self._parse(name, record)
                 if read is not None and read.key_id not in self._gone:
                     self._standing[name] = read
+            finally:
+                lock.release()
 
     def _exists(self, cfg: DatadogConfig, key_id: str) -> bool | None:
         """Whether Datadog still has this key, asked with the management key so the answer

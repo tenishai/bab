@@ -18,8 +18,8 @@ All notable changes to bab are documented here. The format follows
   changes: a permission approved, a grant revoked or lapsed, the agent removed, Datadog
   disconnected. A revoke still deletes the key in the agent's hand at once. A key Datadog
   refuses to delete at that moment is never handed out again. Every kept key is checked
-  against the ledger after a lease is answered (any agent's lease, at most every five
-  minutes, so a slow Datadog never slows a lease) and on `POST /sweep`: one whose delete was
+  against the ledger after a lease is given (any agent's lease, at most every five minutes,
+  after the answer is sent, so a slow Datadog never slows a lease) and on `POST /sweep`: one whose delete was
   refused, or that carries a scope its agent no longer holds because a grant ran out while
   the agent was not asking, is deleted then. A
   lease that names its permissions (`permissions` on `POST /leases`) still gets a key of its

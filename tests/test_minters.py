@@ -374,6 +374,39 @@ def test_the_check_against_the_ledger_drops_the_key_it_judged_and_never_its_repl
     assert m.holds(out["m"].handle) and not m.holds({"key_id": old})
 
 
+def test_reading_the_mount_never_waits_on_another_agents_key():
+    """Ending any lease reads the mount for kept keys. A key another lease is making right now
+    (a create and up to six seconds of Datadog's wait) is skipped, not waited on."""
+    import threading
+    import time
+
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+    m = DatadogMinter.from_env(DD_ENV, http=dd, keys=keys, now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
+    keys.stored["datadog.sherlock"] = keys.mounted["datadog.sherlock"] = {"key_id": "kid-9", "key": "k", "scopes": ["monitors_read"]}
+    busy, done = threading.Event(), threading.Event()
+
+    def making():
+        with m._lock_for("datadog.sherlock"):
+            busy.set()
+            done.wait(5)
+
+    t = threading.Thread(target=making)
+    t.start()
+    busy.wait(5)
+    started = time.monotonic()
+    own = m.mint("watson", "datadog", {}, read, 3600)
+    m.end(own.handle)
+    assert time.monotonic() - started < 1 and own.handle["key_id"] not in dd.keys
+    done.set()
+    t.join(5)
+    assert m.kept() == [("sherlock", "datadog")]
+
+
 def test_a_kept_key_the_mount_never_shows_is_asked_for_again_and_never_lost():
     """The store took a key and the delivery to the cluster never came. A process that cannot
     read a kept key never writes one, and only a write asked for the delivery: so reading the

@@ -245,7 +245,7 @@ runs out. What changes is when the key is deleted:
   key does, so the old key is deleted and a new one made; when nothing is
   left, the refusal deletes it. An agent that has stopped asking tells
   nobody, so every kept key is also checked against the ledger
-  (`settle_kept`: after any lease is answered, at most every five minutes,
+  (`settle_kept`: after any lease is given, at most every five minutes,
   in a session of its own, and on `/sweep`), and one that carries a scope
   its agent no longer holds is deleted. The check takes the key's lock, so
   it deletes the key it judged and never one a lease made meanwhile;
@@ -269,7 +269,8 @@ is kept. An approval in the same moment takes nothing away but deletes the
 kept key, so the lease would hand out a key Datadog no longer has. So
 `lease_for` records the lease first and then asks again, for every vendor:
 the store whether the grants still hold, and the minter (`holds`) whether
-the credential is still one to hand out. A change after that point finds
+the credential is still one to hand out; until both answer, the cached
+credential is not served to anyone else. A change after that point finds
 the recorded lease and ends it. A change before it is caught by the second
 asking: the lease is ended at once, a kept key dropped on a revoke, and the
 lease refused with 409 and "ask again".
@@ -312,7 +313,7 @@ hold secrets, and a key kept only in memory would be remade for every agent
 at every restart with the old ones left in Datadog.
 
 Limits. One bab process is assumed, as the lease cache already assumes. The
-check against the ledger runs when some lease is asked for or on a sweep,
+check against the ledger runs when some lease is given or on a sweep,
 so a room with no lease traffic at all keeps a lapsed grant's key until
 the next of either. A lease that ends in the minute after a restart, before
 the mount shows the kept key it carried, deletes that key, and the next
