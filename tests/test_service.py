@@ -416,6 +416,7 @@ def gateway_room(keys=None):
                      Settings(room="acme", admin_team="admins", security_team="security", now=lambda: clock["now"],
                               gateway_service_account="gateway/tool-gateway"))
     app.state.ledger = ledger
+    app.state.datadog = datadog
     c = TestClient(app)
     c.put("/topology", json={"agents": [{"name": "ledger", "team": "sre", "namespace": "ledger", "service_account": "agent-ledger"},
                                         {"name": "watson", "team": "sre", "namespace": "watson", "service_account": "agent-watson"}]},
@@ -538,6 +539,132 @@ def test_a_kept_datadog_key_is_still_leased_by_the_hour_and_goes_when_access_cha
     # Disconnecting Datadog takes the kept key with the grants.
     assert c.delete("/integrations/datadog", headers=ADMIN).json()["grants_revoked"] == 1
     assert dd.keys == {} and keys.stored == {}
+
+
+def test_a_kept_datadog_key_never_outlives_what_its_agent_holds():
+    """A revoke tells the minter once, and a grant that runs out tells nobody. A key Datadog
+    would not delete when asked, or whose grant ran out while its agent was not asking, must
+    still go: every kept key is checked against the ledger as leases are made and on a sweep."""
+    from tests.conftest import FakeKeys
+
+    keys = FakeKeys()
+    c, clock, _, dd = gateway_room(keys)
+    c.put("/integrations/datadog", headers=ADMIN, json={
+        "vendor": "datadog", "spec": {"service_account_id": "sa-123"},
+        "ceiling": ["datadog_monitors_read", "datadog_metrics_read", "datadog_monitors_write"]})
+    grant(c, "ledger", "datadog", ["datadog_monitors_read", "datadog_monitors_write"])
+    grant(c, "watson", "datadog", ["datadog_monitors_read"])
+
+    def lease(agent):
+        return c.post("/leases/for-agent", json={"agent": agent, "integration": "datadog"}, headers=GATEWAY).json()
+
+    def key_of(agent):
+        return [k for k, v in dd.keys.items() if v["name"] == f"bab-{agent}"]
+
+    def grant_id(agent, permission):
+        return next(g["id"] for g in c.get(f"/agents/{agent}/grants", headers=OWNER).json()["grants"] if g["permission"] == permission)
+
+    lease("ledger"), lease("watson")
+    assert "monitors_write" in dd.keys[key_of("ledger")[0]]["scopes"] and len(dd.keys) == 2
+    # The write grant runs out while ledger is idle. Another agent's lease is what notices.
+    clock["now"] = T0 + timedelta(days=31)
+    watsons = key_of("watson")
+    lease("watson")
+    assert key_of("ledger") == [] and key_of("watson") == watsons and set(keys.stored) == {"datadog.watson"}
+    # Datadog refuses the delete when the last grant is revoked, and the agent never asks again.
+    lease("ledger")
+    stuck, dd.keep = key_of("ledger"), True
+    c.delete(f"/grants/{grant_id('ledger', 'datadog_monitors_read')}", headers=ADMIN)
+    assert key_of("ledger") == stuck
+    dd.keep = False
+    c.post("/sweep", headers=ADMIN)
+    assert key_of("ledger") == [] and set(keys.stored) == {"datadog.watson"}
+    # The same refusal, and then the connection goes: the key goes with it though its agent holds no grant by then.
+    grant(c, "ledger", "datadog", ["datadog_monitors_read"])
+    lease("ledger")
+    dd.keep = True
+    c.delete(f"/grants/{grant_id('ledger', 'datadog_monitors_read')}", headers=ADMIN)
+    dd.keep = False
+    assert len(key_of("ledger")) == 1
+    assert c.delete("/integrations/datadog", headers=ADMIN).status_code == 200
+    assert dd.keys == {} and keys.stored == {}
+
+
+def test_a_change_on_one_vendor_never_asks_another_vendors_key_store():
+    """A revoke, an approval or a refusal tells only the integration's own minter that the
+    agent's access changed. An AWS revoke never waits on the store Datadog keeps its keys in."""
+    from tests.conftest import FakeKeys
+
+    keys = FakeKeys()
+    c, _, _, _ = gateway_room(keys)
+    connect(c, ["aws_inventory_read"])
+    grant(c, "ledger", "aws-prod", ["aws_inventory_read"])
+    asked = []
+    names = keys.names
+    keys.names = lambda: (asked.append(1), names())[1]
+    gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"])
+    assert c.delete(f"/grants/{gid}", headers=ADMIN).status_code == 200
+    assert c.post("/leases/for-agent", json={"agent": "ledger", "integration": "aws-prod"}, headers=GATEWAY).status_code == 403
+    assert asked == []
+
+
+def test_a_change_that_lands_while_a_lease_is_being_made_is_not_outrun_by_it():
+    """A lease reads the grants, then mints. A revoke or an approval between the two finds no
+    lease to end, and the key made a moment later would carry what was just taken back, for as
+    long as the key is kept, or be a key the approval just deleted. The grants and the minter
+    are asked again once the lease is recorded, and the lease is refused: ask again."""
+    import threading
+
+    from tests.conftest import FakeKeys
+
+    keys = FakeKeys()
+    c, clock, _, dd = gateway_room(keys)
+    c.put("/integrations/datadog", headers=ADMIN, json={
+        "vendor": "datadog", "spec": {"service_account_id": "sa-123"}, "ceiling": ["datadog_monitors_read", "datadog_metrics_read"]})
+    grant(c, "ledger", "datadog", ["datadog_monitors_read", "datadog_metrics_read"])
+    gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"] if g["permission"] == "datadog_metrics_read")
+    minter, revoked = c.app.state.datadog, []
+    mint_standing = minter.mint_standing
+
+    def racing(*args, **kwargs):
+        if not revoked:
+            t = threading.Thread(target=lambda: revoked.append(c.delete(f"/grants/{gid}", headers=ADMIN).status_code))
+            t.start()
+            t.join(20)
+        return mint_standing(*args, **kwargs)
+
+    minter.mint_standing = racing
+    ask = {"agent": "ledger", "integration": "datadog"}
+    refused = c.post("/leases/for-agent", json=ask, headers=GATEWAY)
+    assert revoked == [200] and refused.status_code == 409 and "ask again" in refused.json()["detail"]
+    assert dd.keys == {} and keys.stored == {}
+    again = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert again["granted"] == ["datadog_monitors_read"]
+    assert list(dd.keys.values()) == [{"name": "bab-ledger", "scopes": ["mcp_read", "monitors_read"]}]
+    first = next(r for r in c.get("/leases", headers=ADMIN).json()["leases"] if sorted(r["permissions"]) == ["datadog_metrics_read", "datadog_monitors_read"])
+    assert first["expires_at"] <= first["issued_at"]  # recorded, and ended at once
+
+    # An approval in the same moment takes nothing away, and drops the key the lease was just
+    # given, so the agent can have the wider one. The lease is refused rather than handed a
+    # key Datadog no longer has.
+    minter.mint_standing, approved = mint_standing, []
+    clock["now"] = T0 + timedelta(hours=2)  # the lease in hand ran out: the next one is minted
+
+    def approving(*args, **kwargs):
+        out = mint_standing(*args, **kwargs)
+        if not approved:
+            t = threading.Thread(target=lambda: (grant(c, "ledger", "datadog", ["datadog_metrics_read"]), approved.append(1)))
+            t.start()
+            t.join(20)
+        return out
+
+    minter.mint_standing = approving
+    raced = c.post("/leases/for-agent", json=ask, headers=GATEWAY)
+    assert approved == [1] and raced.status_code == 409 and "ask again" in raced.json()["detail"]
+    minter.mint_standing = mint_standing
+    wide = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert sorted(wide["granted"]) == ["datadog_metrics_read", "datadog_monitors_read"]
+    assert wide["credential"]["dd_app_key"].removeprefix("secret-") in dd.keys
 
 
 def test_a_new_grant_ends_the_credential_in_hand_and_the_next_one_carries_both(gateway):

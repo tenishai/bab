@@ -213,7 +213,7 @@ first service vendor where the vendor itself enforces the granted set during
 the hour, as AWS does with the session policy.
 
 Datadog refuses a new application key for a moment after it creates it
-(0.7 to 1.8 seconds, measured from bab's pod; then 200 and never 403 again).
+(0.7 to 3.1 seconds, measured from bab's pod; then 200 and never 403 again).
 So the minter reads with the key before it hands it out, and returns once
 Datadog answers 200. The read has to be one the key's own scopes allow, so
 it is picked from a short table of pairings (`DD_KEY_READS` in
@@ -243,8 +243,15 @@ runs out. What changes is when the key is deleted:
   with the new scopes;
 - a grant lapses by its date: the next lease carries fewer scopes than the
   key does, so the old key is deleted and a new one made; when nothing is
-  left, the refusal deletes it;
-- the agent is removed, or Datadog is disconnected: deleted with the grants.
+  left, the refusal deletes it. An agent that has stopped asking tells
+  nobody, so every kept key is also checked against the ledger
+  (`settle_kept`: after any lease is given, at most every five minutes,
+  in a session of its own, and on `/sweep`), and one that carries a scope
+  its agent no longer holds is deleted. The check takes the key's lock, so
+  it deletes the key it judged and never one a lease made meanwhile;
+- the agent is removed, or Datadog is disconnected: deleted with the
+  grants. A disconnect deletes every kept key on the connection, whether or
+  not its agent still holds a grant there.
 
 A lease ending is not on that list. `end` knows a kept key from a key made
 for one lease and leaves the first alone. A lease that names its
@@ -252,28 +259,67 @@ permissions still gets a key of its own (`mint`), so asking for less never
 replaces the key the gateway is using.
 
 A key Datadog refuses to delete when access changes is marked and never
-handed out again; the next lease deletes it before it makes another, and
-fails if it cannot.
+handed out again. The same check against the ledger tries the delete again,
+and so does the agent's next lease, which fails if it cannot.
+
+A lease reads the grants and then mints, and a revoke that lands between
+the two finds no lease to end. For a key made per lease that was an hour of
+a scope just taken back; for a kept key it would be for as long as the key
+is kept. An approval in the same moment takes nothing away but deletes the
+kept key, so the lease would hand out a key Datadog no longer has. So
+`lease_for` records the lease first and then asks again, for every vendor:
+the store whether the grants still hold, and the minter (`holds`) whether
+the credential is still one to hand out; until both answer, the cached
+credential is not served to anyone else. A change after that point finds
+the recorded lease and ends it. A change before it is caught by the second
+asking: the lease is ended at once, a kept key dropped on a revoke, and the
+lease refused with 409 and "ask again".
 
 The store is the room's secret store, written through sero's machine lane
 as bab's own identity and read back from a Secret sero delivers to bab's
 namespace: sero never returns a value. bab needs the mount only after a
-restart, and it lags a write by about a minute, which gives three cases a
-restart has to get right. A key in the mount that Datadog no longer has
-(deleted just before the restart): bab asks Datadog for it by id, with the
-management key, before handing it out, and replaces it on a 404. A key in
-Datadog that the mount does not have yet (made just before the restart):
-bab makes another, and the first is deleted when the lease that carried it
-ends, because the ledger still holds its id. A key the store refused: it is
-one lease's key and is deleted with it.
+restart, and it lags a write by about a minute.
+
+One rule covers what a restart has to get right: an agent never has two
+kept keys. Only its record knows a kept key's id, so a second key made
+beside it would leave the first in Datadog for good. Datadog enforces the
+same thing from its side: a service account has one application key per
+name, and a second create under `bab-<agent>` answers 409 (measured). So
+`mint_standing` makes a kept key only when it knows none is standing, and
+otherwise gives the lease a key of its own (`mint`), deleted with the
+lease, saying why in the log once:
+
+- the mount does not show a record the store holds (asked by name; sero
+  answers names, never values): the restart came before the delivery, or
+  the delivery was refused. bab asks for the delivery again (at most once a
+  minute), and the kept key is used again once the mount shows it. A revoke
+  that finds only the store's record says so in the log, and the ledger
+  check deletes the key once the mount shows it;
+- the store does not answer;
+- the mount shows a key and Datadog will not say whether it still has it
+  (asked by id with the management key: 200 keeps it, 404 replaces it,
+  anything else is no answer);
+- Datadog refuses the name: a newer kept key the mount has not shown yet,
+  or a key someone else made. The store's record is not overwritten.
+
+A key the store refused is one lease's key and is deleted with it. A key
+recorded on another service account (the connection was moved) is deleted
+there while the management key can still reach it, and named in the log
+when it cannot. An agent with a dot in its name has no kept key, so
+`<integration>.<agent>` splits one way.
 
 Without a key store bab keeps no key past its lease. The ledger does not
 hold secrets, and a key kept only in memory would be remade for every agent
 at every restart with the old ones left in Datadog.
 
-Two limits. A grant that lapses by date on an agent that never asks again
-leaves the key in Datadog until a revoke, a removal or a disconnect. And
-one bab process is assumed, as the lease cache already assumes.
+Limits. One bab process is assumed, as the lease cache already assumes. The
+check against the ledger runs when some lease is given or on a sweep,
+so a room with no lease traffic at all keeps a lapsed grant's key until
+the next of either. A lease that ends in the minute after a restart, before
+the mount shows the kept key it carried, deletes that key, and the next
+lease makes another. A key under an agent's kept name that bab does not
+hold is not deleted by name (two rooms may mint on one service account):
+a person deletes it, and until then that agent gets a key per lease.
 
 The tool gateway, not the agent, is what reaches Datadog today; it leases
 through `POST /leases/for-agent` with its own pod identity, naming the agent

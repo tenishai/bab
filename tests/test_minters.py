@@ -312,6 +312,7 @@ def test_a_restart_finds_the_kept_datadog_key_and_asks_datadog_before_trusting_i
     # The lease from before the restart ends: its key is the kept one and stands. A key the
     # ledger holds and the store does not is deleted with its lease.
     dd.keys["kid-9"] = {"name": "bab-sherlock-202610301405", "scopes": ["mcp_read", "monitors_read"]}
+    dd.accounts["kid-9"] = "sa-123"
     m.end(first.handle)
     m.end({"key_id": "kid-9"})
     assert set(dd.keys) == {"kid-1"}
@@ -327,11 +328,215 @@ def test_a_restart_finds_the_kept_datadog_key_and_asks_datadog_before_trusting_i
     del dd.keys["kid-1"]
     fresh = DatadogMinter.from_env(DD_ENV, http=dd, keys=keys).mint_standing("sherlock", "datadog", {}, read, 3600)
     assert fresh.handle == {"key_id": "kid-2"} and keys.stored["datadog.sherlock"]["key_id"] == "kid-2"
-    # A key made on another service account is not this connection's to hand out.
+    # A key made on another service account is not this connection's to hand out. It is
+    # deleted where it was made, so the service account that was left keeps nothing.
     keys.deliver()
     moved = DatadogMinter.from_env({**DD_ENV, "DD_SERVICE_ACCOUNT_ID": "sa-999"}, http=dd, keys=keys)
     assert moved.mint_standing("sherlock", "datadog", {}, read, 3600).handle == {"key_id": "kid-3"}
     assert keys.stored["datadog.sherlock"]["service_account_id"] == "sa-999"
+    assert ("DELETE", "https://api.datadoghq.com/api/v2/service_accounts/sa-123/application_keys/kid-2", None) in dd.calls
+    assert dd.accounts["kid-3"] == "sa-999" and set(dd.keys) == {"kid-3"}
+
+
+def test_the_check_against_the_ledger_drops_the_key_it_judged_and_never_its_replacement():
+    """A lease replacing a too-wide kept key and the ledger check judging that same key run at
+    once. The check must drop the key it judged, not the correctly scoped one made meanwhile."""
+    import threading
+
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+    both = read + [cat.action("datadog_metrics_read")]
+    deleting, go = threading.Event(), threading.Event()
+
+    def http(method, url, headers, body):
+        if method == "DELETE" and not go.is_set():
+            deleting.set()
+            go.wait(10)
+        return dd(method, url, headers, body)
+
+    m = DatadogMinter.from_env(DD_ENV, http=http, keys=keys, sleep=lambda s: None,
+                               now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
+    old = m.mint_standing("sherlock", "datadog", {}, both, 3600).handle["key_id"]
+    out = {}
+    lease = threading.Thread(target=lambda: out.update(m=m.mint_standing("sherlock", "datadog", {}, read, 3600)))
+    lease.start()
+    assert deleting.wait(5)
+    check = threading.Thread(target=lambda: m.settle("sherlock", "datadog", read))
+    check.start()
+    go.set()
+    lease.join(10), check.join(10)
+    new = out["m"].handle["key_id"]
+    assert old not in dd.keys and new in dd.keys and keys.stored["datadog.sherlock"]["key_id"] == new
+    assert m.holds(out["m"].handle) and not m.holds({"key_id": old})
+
+
+def test_reading_the_mount_never_waits_on_another_agents_key():
+    """Ending any lease reads the mount for kept keys. A key another lease is making right now
+    (a create and up to six seconds of Datadog's wait) is skipped, not waited on."""
+    import threading
+    import time
+
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+    m = DatadogMinter.from_env(DD_ENV, http=dd, keys=keys, now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
+    keys.stored["datadog.sherlock"] = keys.mounted["datadog.sherlock"] = {"key_id": "kid-9", "key": "k", "scopes": ["monitors_read"]}
+    busy, done = threading.Event(), threading.Event()
+
+    def making():
+        with m._lock_for("datadog.sherlock"):
+            busy.set()
+            done.wait(5)
+
+    t = threading.Thread(target=making)
+    t.start()
+    busy.wait(5)
+    started = time.monotonic()
+    own = m.mint("watson", "datadog", {}, read, 3600)
+    m.end(own.handle)
+    assert time.monotonic() - started < 1 and own.handle["key_id"] not in dd.keys
+    # A kept key's own lease ending while that agent's name is busy is still known as kept.
+    # `end` waits for the name here: it is that agent's own key.
+    ender = threading.Thread(target=lambda: m.end({"key_id": "kid-9"}))
+    ender.start()
+    done.set()
+    t.join(5), ender.join(5)
+    assert m.kept() == [("sherlock", "datadog")]
+    assert ("DELETE", "https://api.datadoghq.com/api/v2/service_accounts/sa-123/application_keys/kid-9", None) not in dd.calls
+
+
+def test_a_kept_key_the_mount_never_shows_is_asked_for_again_and_never_lost():
+    """The store took a key and the delivery to the cluster never came. A process that cannot
+    read a kept key never writes one, and only a write asked for the delivery: so reading the
+    store's names asks again, and a revoke that cannot reach the key says so in the log. The
+    key goes once the mount shows it."""
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+
+    def restart():
+        return DatadogMinter.from_env(DD_ENV, http=dd, keys=keys, now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
+
+    kept = restart().mint_standing("sherlock", "datadog", {}, read, 3600).handle["key_id"]
+    m = restart()
+    m.end(m.mint_standing("sherlock", "datadog", {}, read, 3600).handle)
+    assert keys.redelivered == 1
+    m.drop("sherlock", "datadog")
+    assert keys.redelivered == 2 and kept in dd.keys
+    keys.deliver()
+    assert m.kept() == [("sherlock", "datadog")]
+    m.settle("sherlock", "datadog", None)
+    assert kept not in dd.keys and keys.stored == {}
+
+
+def test_dropping_a_kept_key_never_raises_whatever_datadog_or_the_store_does():
+    """`drop` runs inside revokes, approvals, disconnects and the ledger check. Whatever goes
+    wrong reaching Datadog, the key stays marked, is never handed out, and goes on a later try."""
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+    broken = {"on": False}
+
+    def http(method, url, headers, body):
+        if broken["on"]:
+            raise ValueError("a site that is not a host")
+        return dd(method, url, headers, body)
+
+    m = DatadogMinter.from_env(DD_ENV, http=http, keys=keys, now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp())
+    lease = m.mint_standing("sherlock", "datadog", {}, read, 3600)
+    broken["on"] = True
+    m.drop("sherlock", "datadog")
+    assert lease.handle["key_id"] in dd.keys and not m.holds(lease.handle)
+    broken["on"] = False
+    m.settle("sherlock", "datadog", read)
+    assert dd.keys == {} and keys.stored == {}
+
+
+def test_a_second_kept_datadog_key_is_never_made_while_the_first_may_still_stand():
+    """Only its record knows a kept key's id, so a second key made for the same agent would leave
+    the first in Datadog for good. Whenever the first may still stand where this process cannot
+    see it, the lease gets a key of its own, which ends with the lease."""
+    from bab.service.minters import DD_KEY_NOTE, DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+    both = read + [cat.action("datadog_metrics_read")]
+
+    def restart():
+        return DatadogMinter.from_env(DD_ENV, http=dd, now=lambda: datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp(), keys=keys)
+
+    def own_key(m, permissions=read, refused=0):
+        """One lease that must not be, or replace, a kept key; it is ended, and its key with it.
+        `refused`: how many times Datadog was asked for a key under the kept name."""
+        before, record, asked = set(dd.keys), dict(keys.stored), len(dd.calls)
+        lease = m.mint_standing("sherlock", "datadog", {}, permissions, 3600)
+        made = set(dd.keys) - before
+        assert made == {lease.handle["key_id"]} and lease.note == DD_KEY_NOTE
+        assert [b["data"]["attributes"]["name"] for verb, _, b in dd.calls[asked:] if verb == "POST"].count("bab-sherlock") == refused
+        assert dd.keys[lease.handle["key_id"]]["name"].startswith("bab-sherlock-2026") and keys.stored == record
+        m.end(lease.handle)
+        assert set(dd.keys) == before
+
+    kept = restart().mint_standing("sherlock", "datadog", {}, read, 3600)
+    # A restart before the store's copy is mounted: the store holds a key this process cannot read.
+    m = restart()
+    own_key(m)
+    # The store does not answer, with its own error or any other.
+    keys.broken = True
+    own_key(m)
+    keys.error = OSError("no token file")
+    own_key(m)
+    keys.broken = False
+    # Mounted: the kept key again, and none was made in between.
+    keys.deliver()
+    assert m.mint_standing("sherlock", "datadog", {}, read, 3600).handle == kept.handle
+    # After a restart Datadog will not say whether the key read back is still there: it is not handed out.
+    m, dd.mute = restart(), True
+    own_key(m)
+    dd.mute = False
+    assert m.mint_standing("sherlock", "datadog", {}, read, 3600).handle == kept.handle
+    # More is granted, and bab restarts before the new key is mounted. The mount shows the old
+    # one, which Datadog no longer has; Datadog refuses a second key under the name, and the
+    # store's record is left alone.
+    wide = m.mint_standing("sherlock", "datadog", {}, both, 3600)
+    assert wide.handle != kept.handle and set(dd.keys) == {wide.handle["key_id"]}
+    m = restart()
+    own_key(m, both, refused=1)
+    keys.deliver()
+    assert m.mint_standing("sherlock", "datadog", {}, both, 3600).handle == wide.handle
+    # A key the store would not take is one lease's, whatever the store raised.
+    def refuse(name, record):
+        raise OSError("no token file")
+
+    put, keys.put = keys.put, refuse
+    lone = m.mint_standing("watson", "datadog", {}, read, 3600)
+    assert dd.keys[lone.handle["key_id"]]["name"] == "bab-watson" and "datadog.watson" not in keys.stored
+    m.end(lone.handle)
+    keys.put = put
+    # An agent with a dot in its name has no kept key: `<integration>.<agent>` must split one way.
+    dotted = m.mint_standing("eu.fred", "datadog", {}, read, 3600)
+    assert set(keys.stored) == {"datadog.sherlock"}
+    m.end(dotted.handle)
+    # Two keys of their own for one agent in the same minute: Datadog keeps one key per name.
+    a, b = m.mint("watson", "datadog", {}, read, 3600), m.mint("watson", "datadog", {}, read, 3600)
+    assert a.handle != b.handle and dd.keys[b.handle["key_id"]]["name"].startswith(dd.keys[a.handle["key_id"]]["name"] + "-")
+    m.end(a.handle), m.end(b.handle)
+    assert set(dd.keys) == {wide.handle["key_id"]}
 
 
 def test_the_key_store_is_the_secret_stores_machine_lane_and_a_mounted_secret(tmp_path):
@@ -352,6 +557,8 @@ def test_the_key_store_is_the_secret_stores_machine_lane_and_a_mounted_secret(tm
     keys = SeroKeys("http://secrets:8000/", "secrets-bab", "room", "bab@example.com", str(tmp_path),
                     token=lambda audience: f"id-token-for-{audience}", http=http)
     where = {"acting_email": "bab@example.com", "namespace": "room", "path": "apps/bab/datadog-keys"}
+    assert keys.names() == set() and calls == [("GET", "/api/service/secrets", where)]
+    del calls[:]
     keys.put("datadog.sherlock", {"key_id": "kid-1", "key": "s1"})
     assert calls == [
         ("POST", "/api/service/secrets", {**where, "values": {"datadog.sherlock": '{"key": "s1", "key_id": "kid-1"}'},
@@ -360,9 +567,15 @@ def test_the_key_store_is_the_secret_stores_machine_lane_and_a_mounted_secret(tm
                                        "refresh_interval": "1m", "apply": True})]
     keys.put("datadog.watson", {"key_id": "kid-2", "key": "s2"})
     assert len(calls) == 3  # delivery is asked for once
+    # A mount that does not show the store asks again, at most once a minute.
+    keys.redeliver()
+    keys.redeliver()
+    assert len(calls) == 4 and calls[-1][:2] == ("POST", "/api/service/sync")
     # One of two goes by name; the last goes with its path; one that is not there is nothing to do.
     del calls[:]
     held[:] = ["datadog.sherlock", "datadog.watson"]
+    assert keys.names() == {"datadog.sherlock", "datadog.watson"}
+    del calls[:]
     keys.remove("datadog.sherlock")
     assert calls == [("GET", "/api/service/secrets", where),
                      ("POST", "/api/service/secrets", {**where, "values": {}, "remove_keys": ["datadog.sherlock"], "apply": True})]
@@ -381,6 +594,17 @@ def test_the_key_store_is_the_secret_stores_machine_lane_and_a_mounted_secret(tm
         keys.put("datadog.sherlock", {"key_id": "kid-1", "key": "s1"})
     with pytest.raises(KeyStoreError, match="cannot name a stored key"):
         keys.put("../etc", {})
+    # A token source that fails in its own way (a token file that is not there) is the store not answering.
+    def no_token(audience):
+        raise FileNotFoundError("/var/run/token")
+
+    with pytest.raises(KeyStoreError, match="no identity token for the secret store .FileNotFoundError."):
+        SeroKeys("http://secrets:8000", "secrets-bab", "room", "bab@example.com", str(tmp_path), token=no_token, http=http).names()
+    # bab names the namespace it runs in, so a delivery to anywhere it cannot mount is the store's refusal to log.
+    answer["status"], there = 200, SeroKeys("http://secrets:8000", "secrets-bab", "room", "bab@example.com", str(tmp_path),
+                                            token=lambda audience: f"id-token-for-{audience}", http=http, k8s_namespace="access")
+    there.put("datadog.sherlock", {"key_id": "kid-1", "key": "s1"})
+    assert calls[-1][:2] == ("POST", "/api/service/sync") and calls[-1][2]["k8s_namespace"] == "access"
     # What a restart reads: one file per record, as the cluster mounts a Secret.
     assert keys.all() == {} and keys.get("datadog.sherlock") is None
     (tmp_path / "datadog.sherlock").write_text('{"key_id": "kid-1", "key": "s1"}')

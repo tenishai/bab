@@ -17,10 +17,14 @@ All notable changes to bab are documented here. The format follows
   deleted, and the next one made with the new scopes, when what the agent may do there
   changes: a permission approved, a grant revoked or lapsed, the agent removed, Datadog
   disconnected. A revoke still deletes the key in the agent's hand at once. A key Datadog
-  refuses to delete at that moment is never handed out again, and the delete is tried again
-  with the next lease. A lease that names its permissions (`permissions` on `POST /leases`)
-  still gets a key of its own, deleted with the lease. The wait for Datadog to accept a new
-  key (below) is now paid once per key, not once an hour.
+  refuses to delete at that moment is never handed out again. Every kept key is checked
+  against the ledger after a lease is given (any agent's lease, at most every five minutes,
+  after the answer is sent, so a slow Datadog never slows a lease) and on `POST /sweep`: one whose delete was
+  refused, or that carries a scope its agent no longer holds because a grant ran out while
+  the agent was not asking, is deleted then. A
+  lease that names its permissions (`permissions` on `POST /leases`) still gets a key of its
+  own, deleted with the lease. The wait for Datadog to accept a new key (below) is now paid
+  once per key, not once an hour.
 
   Without a key store nothing changes: a key per lease, as before. bab does not keep a
   secret in its ledger, and a key held only in memory would be remade for every agent at
@@ -39,17 +43,43 @@ All notable changes to bab are documented here. The format follows
   (default `/etc/bab/datadog-keys`; mount it `optional: true`, it does not exist before the
   first key). bab only needs the mount after a restart. A key read from it is checked with
   Datadog once before it is handed out, because the mount lags a delete by about a minute.
-  A key the store would not take is used for its one lease and deleted with it. A restart
-  inside the minute after a key was made makes that agent a second key, and the first is
-  deleted when its lease ends. One limit: a grant that lapses by its own date, on an agent
-  that then never asks for a lease again, leaves its key in Datadog until the agent is
-  removed, the grant is revoked, or Datadog is disconnected. This assumes one bab process,
-  as the lease cache already does.
+  A key the store would not take is used for its one lease and deleted with it. bab tells
+  sero the namespace it runs in when it asks for the delivery, and asks again (at most once
+  a minute) whenever the store holds a key the mount does not show, so a delivery that was
+  refused once does not leave a kept key out of reach.
+
+  An agent never has two kept keys. Only its record knows a kept key's id, so a second one
+  would leave the first in Datadog for good. Datadog itself keeps one application key per
+  name on a service account (a second create answers 409; measured). So whenever bab cannot
+  tell whether a kept key is already standing, the lease gets a key of its own, deleted
+  with the lease, and the log says why once: after a restart until the mount shows the
+  store's record, while the store does not answer, while Datadog will not say whether a key
+  read back is still there, and when Datadog already has a key under that name that bab
+  does not hold. A connection moved to another service account deletes the kept keys on the
+  old one while its management key still can, and names them in the log when it cannot. An
+  agent with a dot in its name gets a key per lease.
+
+  Limits. One bab process, as the lease cache already assumes. A kept key is checked
+  against the ledger only when some lease is asked for, or on a sweep. A key under an
+  agent's kept name that bab does not hold has to be deleted in Datadog by a person; the
+  log names it. Two rooms that mint on one Datadog service account and each have an agent
+  of the same name share that agent's kept name, and the second room's agent gets a key per
+  lease.
+- **A lease is checked against the grants again once it is recorded.** A revoke or an
+  approval that landed while the credential was made found no lease to end, and the one
+  made a moment later carried what had just been taken back (for a kept Datadog key, for as
+  long as the key was kept), or was a key the approval had just deleted. Now the grants, and
+  for Datadog whether the key is still one to hand out, are asked again after the lease is
+  recorded; a change from then on finds the lease and ends it. When the answer changed the
+  lease is ended at once and refused (409, "no lease: access changed while this lease was
+  made; ask again"), and the ledger records `lease.failed`.
+  When the store cannot answer the second check the lease is refused with 503. This holds
+  for every vendor.
 
 ### Fixed
 - **A Datadog lease is not handed out before Datadog accepts its key.** Datadog refuses a new
   application key for a moment after it creates it: measured from the service's own pod, five
-  keys of five answered 403 for 0.7 to 1.8 seconds after the create returned, then 200, and
+  keys of five answered 403 for 0.7 to 1.8 seconds after the create returned (3.1 in a later run), then 200, and
   never 403 again. A lease handed out inside that moment failed the agent's first call, and
   read as a missing permission. The minter now reads with the new key until Datadog answers
   200, then hands it out. The read is one the key's own scopes allow (`monitors_read`,
@@ -59,6 +89,9 @@ All notable changes to bab are documented here. The format follows
   Datadog never costs an agent its lease. A Datadog lease request now takes 1 to 3 seconds
   longer the first time in each hour; a caller that waits less than that on a lease should
   wait longer.
+- **Two Datadog keys made for one agent in the same minute no longer collide.** A key made
+  for one lease is named for its agent and the minute, and Datadog refuses a second key
+  under a name. The second now carries a short suffix.
 
 ## [0.4.24] - 2026-11-16
 

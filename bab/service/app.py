@@ -8,13 +8,14 @@ caller's claim about what it holds.
 
 import inspect
 import logging
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
@@ -245,6 +246,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     # new vendor session each time. Memory only; a restart simply mints afresh.
     live: dict[tuple[str, str, tuple[str, ...]], tuple[int, dict, float, str]] = {}
     LIVE_MARGIN_S = 120
+    checking: set[int] = set()  # leases cached but not yet past their second check: never a cache hit
+    # How often a lease also checks every kept key against the ledger (`settle_kept`).
+    SETTLE_EVERY_S = 300
+    settled = {"at": 0.0}
+    settling = threading.Lock()
 
     def is_member(actor: str, team: str) -> bool:
         try:
@@ -354,15 +360,16 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def disconnect(s, row: Integration, actor: str, now: datetime) -> tuple[int, int]:
         """Take one integration out of the ledger: every active grant on it revoked, every request
         still waiting on it withdrawn, the row deleted. The tuples naming it are the caller's to
-        delete from the store. A key a minter kept for an agent there goes with the agent's
-        grants. Returns how many grants and requests that was."""
+        delete from the store. Every key a minter kept there goes, whether or not its agent
+        still holds a grant: one whose delete was refused earlier would otherwise outlive the
+        connection that could delete it. Returns how many grants and requests that was."""
         revoked, holders = 0, set()
         for g in ledger.active_grants_on(s, row.id):
             g.revoked_at, g.revoked_by = now, actor
             revoked += 1
             holders.add(g.agent)
-        for agent in sorted(holders):
-            drop_standing(agent, row.id)
+        for agent in sorted(holders | {agent for _, agent, integration in kept_keys() if integration == row.id}):
+            drop_standing(agent, row.id, row.vendor)
         withdrawn = withdraw_all(s, row.id, actor, now)
         s.delete(row)
         return revoked, withdrawn
@@ -504,19 +511,59 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def end_expired(s, now: datetime) -> int:
         return end_leases(s, s.scalars(select(Lease).where(Lease.expires_at <= now.replace(tzinfo=None))), now)
 
-    def drop_standing(agent: str, integration: str) -> None:
+    def drop_standing(agent: str, integration: str, vendor: str | None) -> None:
         """A key a minter keeps for `agent` across leases goes when what the agent may do on
-        `integration` changes or ends, live lease or none."""
-        for m in minters.values():
+        `integration` changes or ends, live lease or none. Only the vendor's own minter is
+        told, so a change on one vendor never waits on another's store; with no vendor known
+        (the row is gone), every minter is."""
+        for m in [minters.get(vendor)] if vendor else list(minters.values()):
             drop = getattr(m, "drop", None)
             if drop is not None:
                 drop(agent, integration)
+
+    def kept_keys() -> list[tuple[Minter, str, str]]:
+        """(minter, agent, integration) of every key a minter keeps across leases."""
+        found = []
+        for m in minters.values():
+            kept = getattr(m, "kept", None)
+            if kept is not None:
+                found.extend((m, agent, integration) for agent, integration in kept())
+        return found
+
+    def settle_kept(now: datetime, force: bool = False) -> None:
+        """Check every kept key against what the ledger says its agent holds now, at most every
+        SETTLE_EVERY_S unless forced, one pass at a time, in a session of its own. A lease runs
+        it after its answer is sent, so a slow vendor never slows a lease. `drop_standing` is
+        told of a change once, when it happens; this is what tries again a delete the vendor
+        refused then, and what takes a key whose grant ran out, or whose connection went, while
+        its agent was not asking."""
+        if not settling.acquire(blocking=force):
+            return
+        try:
+            if not force and now.timestamp() - settled["at"] < SETTLE_EVERY_S:
+                return
+            settled["at"] = now.timestamp()
+            cutoff = rfc3339(now)
+            with ledger.session() as s:
+                for m, agent, integration in kept_keys():
+                    holds = None
+                    if s.get(Integration, integration) is not None:
+                        names = [g.permission for g in ledger.active_grants(s, agent, integration)
+                                 if not g.gated and not (g.expires_at and g.expires_at <= cutoff)]
+                        holds = [a for a in map(cat.action, names) if a]
+                    try:
+                        m.settle(agent, integration, holds)
+                    except Exception as exc:  # noqa: BLE001 - one key's trouble is not the next key's
+                        log.warning("could not check the key kept for %s on %s: %s", agent, integration, exc)
+        finally:
+            settling.release()
 
     def end_live(s, agent: str, integration: str, now: datetime) -> int:
         """End what `agent` holds on `integration` right now. A grant or a revoke changes
         what the next credential may carry, so the one in hand is ended where the vendor
         allows it rather than left to run out its hour beside the new one."""
-        drop_standing(agent, integration)
+        row = s.get(Integration, integration)
+        drop_standing(agent, integration, row.vendor if row is not None else None)
         return end_leases(s, s.scalars(select(Lease).where(
             Lease.agent == agent, Lease.integration == integration,
             Lease.expires_at > now.replace(tzinfo=None))), now)
@@ -1131,12 +1178,14 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         forget_live([(g.agent, g.integration)])
         return {"revoked": grant_id, "leases_ended": ended}
 
-    def lease_for(agent: str, body: LeaseBody, via: str | None) -> dict:
+    def lease_for(agent: str, body: LeaseBody, via: str | None, after: BackgroundTasks | None = None) -> dict:
         """One lease, for `agent`: the grant checks, the live-credential cache, the mint and the
         ledger row are the same whether the agent asked with its own token (via None) or the
         tool gateway asked for it (via "gateway"). The caller is settled before this runs."""
         now = settings.now()
         context = {"current_time": rfc3339(now)}
+        if after is not None:
+            after.add_task(settle_kept, now)
         with ledger.session() as s:
             end_expired(s, now)
             if body.on_behalf_of:
@@ -1174,7 +1223,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 cat.action(g.permission) for g in ledger.active_grants(s, agent, iid)
                 if cat.action(g.permission) and not g.gated]
             if not wanted:
-                drop_standing(agent, iid)  # every grant lapsed or was taken back: nothing is left to carry
+                drop_standing(agent, iid, integ.vendor)  # every grant lapsed or was taken back: nothing is left to carry
                 ledger.event(s, now, "lease.refused", agent, agent=agent, integration=iid, permissions=[],
                              reason=NOT_GRANTED, via=via)
                 s.commit()
@@ -1197,7 +1246,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 s.add(pending)
             if not granted:
                 if not body.permissions:
-                    drop_standing(agent, iid)
+                    drop_standing(agent, iid, integ.vendor)
                 if not gated:
                     # Nothing held and nothing waiting: a refusal, recorded like the borrowing one so
                     # the room's Agents audit can show it next to the leases that did mint.
@@ -1211,7 +1260,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             key = (agent, iid, tuple(sorted(a.name for a in granted)))
             resolved = {"resolved_from": body.integration} if iid != body.integration else {}
             held = live.get(key)
-            if held and held[2] - now.timestamp() > LIVE_MARGIN_S:
+            if held and held[0] not in checking and held[2] - now.timestamp() > LIVE_MARGIN_S:
                 lease_id, credential, expires_ts, note = held
                 if pending is not None:
                     s.commit()
@@ -1236,7 +1285,31 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                           via=via)
             s.add(lease)
             s.commit()
+            checking.add(lease.id)
             live[key] = (lease.id, minted.credential, minted.expires_at, minted.note)
+            # Asked again now that the lease is on the books. A revoke or an approval that
+            # landed while the credential was made found no lease to end; one that lands from
+            # here on finds this one. For a kept key the minter is asked too: an approval drops
+            # the key without taking a grant away.
+            try:
+                still = all(store.check(f"agent:{agent}", a.name, obj(iid), context) for a in granted)
+            except StoreError:
+                still = None
+            holds = getattr(minter, "holds", None)
+            given = bool(still) and (holds is None or holds(minted.handle))
+            checking.discard(lease.id)
+            if not given:
+                if still is False:
+                    drop_standing(agent, iid, integ.vendor)
+                lease.expires_at = now.replace(tzinfo=None)  # ended now, whether or not the vendor could
+                end_leases(s, [lease], now)
+                if live.get(key, (None,))[0] == lease.id:
+                    live.pop(key, None)
+                reason = "the store cannot answer" if still is None else "access changed while this lease was made"
+                ledger.event(s, now, "lease.failed", agent, agent=agent, integration=iid, lease=lease.id,
+                             permissions=[a.name for a in granted], reason=reason, error=reason, via=via)
+                s.commit()
+                raise HTTPException(503 if still is None else 409, f"no lease: {reason}; ask again")
             log.info("lease %s -> %s on %s (%d permissions, %ds%s%s)", lease.id, agent, iid,
                      len(granted), seconds, f", via {via}" if via else "",
                      f", asked for {body.integration}" if resolved else "")
@@ -1264,11 +1337,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         return held[0]
 
     @app.post("/leases")
-    def post_lease(body: LeaseBody, caller: Agent):
-        return lease_for(caller.name, body, None)
+    def post_lease(body: LeaseBody, caller: Agent, after: BackgroundTasks):
+        return lease_for(caller.name, body, None, after)
 
     @app.post("/leases/for-agent")
-    def post_lease_for_agent(body: ForAgentLeaseBody, caller: Gateway):
+    def post_lease_for_agent(body: ForAgentLeaseBody, caller: Gateway, after: BackgroundTasks):
         """The tool gateway leases for the agent whose call it is serving. The gateway is its
         own pod identity (Settings.gateway_service_account); the named agent must be one the
         room's topology knows; then the grant checks, cache and ledger are the agent's own,
@@ -1277,7 +1350,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             if s.scalar(select(AgentRow.name).limit(1)) is not None and s.get(AgentRow, body.agent) is None:
                 raise HTTPException(403, f"{body.agent} is not an agent this room knows")
         try:
-            return lease_for(body.agent, LeaseBody(**body.model_dump(exclude={"agent"})), "gateway")
+            return lease_for(body.agent, LeaseBody(**body.model_dump(exclude={"agent"})), "gateway", after)
         except HTTPException as exc:
             # The gateway shows a 403's detail to the model as one sentence; 404 stays "not connected".
             if exc.status_code == 403 and isinstance(exc.detail, dict):
@@ -1338,6 +1411,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             dead = grants.sweep(store, now)
         except StoreError as exc:
             raise HTTPException(503, f"the store cannot answer: {exc}") from exc
+        settle_kept(now, force=True)
         with ledger.session() as s:
             ended = end_expired(s, now)
             ledger.event(s, now, "sweep", caller.actor, tuples=len(dead), leases_ended=ended)
