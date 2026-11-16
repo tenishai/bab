@@ -398,9 +398,7 @@ def test_the_room_registers_agents_itself_but_every_other_vendor_takes_a_reviewe
     assert c.delete("/integrations/sage", headers=room).json()["removed"] == "sage"
 
 
-@pytest.fixture
-def gateway():
-    """A room with a tool gateway: pods for an agent, the gateway and a stranger; AWS and Datadog minters."""
+def gateway_room(keys=None):
     from bab.service.minters import DatadogMinter
     from tests.conftest import FakeDatadog
 
@@ -410,7 +408,7 @@ def gateway():
     aws = StaticMinter(now=lambda: clock["now"].timestamp())
     dd = FakeDatadog()
     datadog = DatadogMinter.from_env({"DD_SERVICE_ACCOUNT_ID": "sa-123", "DD_API_KEY": "api-xyz", "DD_MGMT_APP_KEY": "mgmt-abc"},
-                                     http=dd, now=lambda: clock["now"].timestamp())
+                                     http=dd, now=lambda: clock["now"].timestamp(), keys=keys)
     verifier = PodVerifier({"ledger-pod": ("agent-ledger", "ledger"), "gateway-pod": ("tool-gateway", "gateway"),
                             "stray-pod": ("default", "kube-system")})
     ledger = Ledger()
@@ -423,6 +421,12 @@ def gateway():
                                         {"name": "watson", "team": "sre", "namespace": "watson", "service_account": "agent-watson"}]},
           headers=ADMIN)
     return c, clock, aws, dd
+
+
+@pytest.fixture
+def gateway():
+    """A room with a tool gateway: pods for an agent, the gateway and a stranger; AWS and Datadog minters."""
+    return gateway_room()
 
 
 GATEWAY = {"Authorization": "Bearer gateway-pod"}
@@ -495,6 +499,45 @@ def test_a_datadog_lease_is_a_scoped_key_that_a_revoke_or_expiry_deletes(gateway
     assert set(dd.keys) == {"kid-4"}
     rows = c.get("/leases?agent=ledger", headers=OWNER).json()["leases"]  # newest first; the revoked one ended at 12:00
     assert [(x["via"], x["expires_at"][:16]) for x in rows] == [("gateway", "2026-10-27T15:00"), ("gateway", "2026-10-27T13:00"), ("gateway", "2026-10-27T12:00")]
+
+
+def test_a_kept_datadog_key_is_still_leased_by_the_hour_and_goes_when_access_changes():
+    """Keeping the key must cost nothing the lease gave: every hour is still a ledger row, a
+    revoke still deletes the key the agent holds at once, and disconnecting leaves none behind."""
+    from tests.conftest import FakeKeys
+
+    keys = FakeKeys()
+    c, clock, _, dd = gateway_room(keys)
+    connection = {"vendor": "datadog", "spec": {"service_account_id": "sa-123"},
+                  "ceiling": ["datadog_monitors_read", "datadog_metrics_read"]}
+    c.put("/integrations/datadog", json=connection, headers=ADMIN)
+    grant(c, "ledger", "datadog", ["datadog_monitors_read", "datadog_metrics_read"])
+    ask = {"agent": "ledger", "integration": "datadog"}
+    first = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    held = first["credential"]["dd_app_key"].removeprefix("secret-")
+    assert dd.keys[held]["name"] == "bab-ledger" and first["expires_at"] == "2026-10-27T13:00:00Z"
+    assert keys.stored["datadog.ledger"]["key_id"] == held
+    # Two hours on the lease has run out and the key has not: a new row, the same key.
+    clock["now"] = T0 + timedelta(hours=2)
+    second = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert second["reused"] is False and second["lease_id"] != first["lease_id"]
+    assert second["credential"] == first["credential"] and second["expires_at"] == "2026-10-27T15:00:00Z"
+    assert set(dd.keys) == {held}
+    # A lease that names its permissions is a key of its own: it cannot end the one the gateway holds.
+    own = c.post("/leases", json={"integration": "datadog", "permissions": ["datadog_monitors_read"]},
+                 headers={"Authorization": "Bearer ledger-pod"}).json()
+    apart = own["credential"]["dd_app_key"].removeprefix("secret-")
+    assert apart != held and dd.keys[apart]["name"].startswith("bab-ledger-2026")
+    # Revoking one permission deletes both now. The next lease is narrower, on a new kept key.
+    gid = next(g["id"] for g in c.get("/agents/ledger/grants", headers=OWNER).json()["grants"] if g["permission"] == "datadog_metrics_read")
+    assert c.delete(f"/grants/{gid}", headers=ADMIN).json() == {"revoked": gid, "leases_ended": 2}
+    assert dd.keys == {} and keys.stored == {}
+    third = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    narrow = third["credential"]["dd_app_key"].removeprefix("secret-")
+    assert dd.keys == {narrow: {"name": "bab-ledger", "scopes": ["mcp_read", "monitors_read"]}}
+    # Disconnecting Datadog takes the kept key with the grants.
+    assert c.delete("/integrations/datadog", headers=ADMIN).json()["grants_revoked"] == 1
+    assert dd.keys == {} and keys.stored == {}
 
 
 def test_a_new_grant_ends_the_credential_in_hand_and_the_next_one_carries_both(gateway):
