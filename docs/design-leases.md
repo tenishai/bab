@@ -245,9 +245,10 @@ runs out. What changes is when the key is deleted:
   key does, so the old key is deleted and a new one made; when nothing is
   left, the refusal deletes it. An agent that has stopped asking tells
   nobody, so every kept key is also checked against the ledger
-  (`settle_kept`: as any lease is made, at most every five minutes, and on
-  `/sweep`), and one that carries a scope its agent no longer holds is
-  deleted;
+  (`settle_kept`: after any lease is answered, at most every five minutes,
+  in a session of its own, and on `/sweep`), and one that carries a scope
+  its agent no longer holds is deleted. The check takes the key's lock, so
+  it deletes the key it judged and never one a lease made meanwhile;
 - the agent is removed, or Datadog is disconnected: deleted with the
   grants. A disconnect deletes every kept key on the connection, whether or
   not its agent still holds a grant there.
@@ -262,11 +263,16 @@ handed out again. The same check against the ledger tries the delete again,
 and so does the agent's next lease, which fails if it cannot.
 
 A lease reads the grants and then mints, and a revoke that lands between
-the two finds nothing to end. For a key made per lease that was an hour of
+the two finds no lease to end. For a key made per lease that was an hour of
 a scope just taken back; for a kept key it would be for as long as the key
-is kept. So `lease_for` asks the store again after the mint, for every
-vendor: if the answer changed, what was minted is ended, the kept key is
-dropped, and the lease is refused with 409 and "ask again".
+is kept. An approval in the same moment takes nothing away but deletes the
+kept key, so the lease would hand out a key Datadog no longer has. So
+`lease_for` records the lease first and then asks again, for every vendor:
+the store whether the grants still hold, and the minter (`holds`) whether
+the credential is still one to hand out. A change after that point finds
+the recorded lease and ends it. A change before it is caught by the second
+asking: the lease is ended at once, a kept key dropped on a revoke, and the
+lease refused with 409 and "ask again".
 
 The store is the room's secret store, written through sero's machine lane
 as bab's own identity and read back from a Secret sero delivers to bab's
@@ -283,8 +289,11 @@ otherwise gives the lease a key of its own (`mint`), deleted with the
 lease, saying why in the log once:
 
 - the mount does not show a record the store holds (asked by name; sero
-  answers names, never values): the restart came before the delivery. The
-  kept key is used again once the mount shows it;
+  answers names, never values): the restart came before the delivery, or
+  the delivery was refused. bab asks for the delivery again (at most once a
+  minute), and the kept key is used again once the mount shows it. A revoke
+  that finds only the store's record says so in the log, and the ledger
+  check deletes the key once the mount shows it;
 - the store does not answer;
 - the mount shows a key and Datadog will not say whether it still has it
   (asked by id with the management key: 200 keeps it, 404 replaces it,

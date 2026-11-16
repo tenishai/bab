@@ -577,7 +577,7 @@ class DatadogMinter:
     def _http(method: str, url: str, headers: dict, body: dict | None) -> tuple[int, dict]:
         try:
             resp = httpx.request(method, url, headers=headers, json=body, timeout=10.0)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
             raise MintError(f"Datadog did not answer: {exc.__class__.__name__}") from exc
         try:
             data = resp.json() if resp.content else {}
@@ -679,9 +679,10 @@ class DatadogMinter:
         """Take up every key the store holds and memory does not. A record whose key this
         process saw deleted is the store catching up, and is left."""
         for name, record in self.keys.all().items():
-            read = None if name in self._standing else self._parse(name, record)
-            if read is not None and read.key_id not in self._gone:
-                self._standing[name] = read
+            with self._lock_for(name):
+                read = None if name in self._standing else self._parse(name, record)
+                if read is not None and read.key_id not in self._gone:
+                    self._standing[name] = read
 
     def _exists(self, cfg: DatadogConfig, key_id: str) -> bool | None:
         """Whether Datadog still has this key, asked with the management key so the answer
@@ -760,7 +761,17 @@ class DatadogMinter:
         if stored:
             self._once(f"unseen:{name}", "the store holds a datadog key for %s that this process cannot read yet: "
                                          "its leases get a key of their own until the mounted Secret shows it", name)
+            self._redeliver()
         return not stored
+
+    def _redeliver(self) -> None:
+        """The mount does not show what the store holds. A delivery that was refused is asked
+        for again only with a write, and a process that cannot read a kept key never writes
+        one: so ask here. The store paces it."""
+        try:
+            self.keys.redeliver()
+        except Exception as exc:  # noqa: BLE001 - asked again with the next lease
+            log.warning("%s", exc if isinstance(exc, KeyStoreError) else exc.__class__.__name__)
 
     def _forget(self, name: str, key_id: str) -> None:
         """A kept key Datadog has deleted: out of memory, and out of the store when it answers."""
@@ -804,9 +815,10 @@ class DatadogMinter:
                     key_id, key = self._create_key(cfg, key_name, scopes)
                 except NameTaken:
                     key_id = key = ""
-                    self._once(f"taken:{name}", "datadog already has a key named %s on service account %s that bab does "
-                                                "not hold: the agent's leases get a key of their own until it is gone",
-                               key_name, cfg.service_account_id)
+                    self._once(f"taken:{name}", "datadog already has a key named %s on service account %s that this "
+                                                "process does not hold (a kept key the mounted Secret does not show yet, "
+                                                "or one bab did not make): the agent's leases get a key of their own "
+                                                "until it can read it or it is gone", key_name, cfg.service_account_id)
                 if key_id:
                     return self._keep(cfg, name, agent, integration_id, key_name, key_id, key, scopes, now, expires_at)
         return self.mint(agent, integration_id, spec, permissions, seconds)
@@ -841,7 +853,10 @@ class DatadogMinter:
             held = self._standing.get(name)
             if held is None:
                 held = self._parse(name, self.keys.get(name))
-                if held is None or held.key_id in self._gone:
+                if held is None:
+                    self._unreachable(name)
+                    return
+                if held.key_id in self._gone:
                     return
                 self._standing[name] = held
             held.dropped = True
@@ -851,11 +866,24 @@ class DatadogMinter:
                     self._leave(cfg, name, held)
                 else:
                     self._delete_key(cfg, held.key_id)
-            except MintError as exc:
+            except Exception as exc:  # noqa: BLE001 - never raises; the key stays marked and is tried again
                 self._once(f"kept:{held.key_id}", "datadog key %s of %s is still there, and the delete is tried again: %s",
-                           held.key_id, name, exc)
+                           held.key_id, name, exc if isinstance(exc, MintError) else exc.__class__.__name__)
                 return
             self._forget(name, held.key_id)
+
+    def _unreachable(self, name: str) -> None:
+        """`drop` found no record in the mount. When the store holds one, a key is standing in
+        Datadog that this process cannot read: said, and the delivery asked for again, so the
+        ledger check deletes it once the mount shows it."""
+        try:
+            stored = name in self.keys.names()
+        except Exception:  # noqa: BLE001 - the store did not say; nothing to add
+            return
+        if stored:
+            log.warning("the store holds a datadog key for %s that this process cannot read, so it was not deleted: "
+                        "it goes once the mounted Secret shows it", name)
+            self._redeliver()
 
     def kept(self) -> list[tuple[str, str]]:
         """(agent, integration) of every key kept here, what a restart left in the store included."""
@@ -872,9 +900,10 @@ class DatadogMinter:
         name = self._standing_name(agent, integration_id)
         if self.keys is None or name is None:
             return
-        held = self._standing.get(name)
-        if held is not None and (held.dropped or not set(held.scopes) <= set(dd_scopes(permissions or []))):
-            self.drop(agent, integration_id)
+        with self._lock_for(name):  # the key judged is the key dropped, not one that replaced it
+            held = self._standing.get(name)
+            if held is not None and (held.dropped or not set(held.scopes) <= set(dd_scopes(permissions or []))):
+                self.drop(agent, integration_id)
 
     def _await_key(self, cfg: DatadogConfig, name: str, key: str, scopes: list[str]) -> bool:
         """Hold a new key until Datadog answers a read made with it (see DD_KEY_READS). True
@@ -938,6 +967,18 @@ class DatadogMinter:
 
     def _name_of(self, key_id: str) -> str | None:
         return next((n for n, k in list(self._standing.items()) if k.key_id == key_id), None)
+
+    def holds(self, handle) -> bool:
+        """Whether the key a lease was just given is still one to hand out: not deleted since,
+        and not a kept key marked to go. An approval that lands while a lease is made drops the
+        key without taking anything away, so the grant check alone would pass it."""
+        key_id = str((handle or {}).get("key_id") or "")
+        name = self._name_of(key_id) if key_id else None
+        if name is None:
+            return key_id not in self._gone
+        with self._lock_for(name):
+            held = self._standing.get(name)
+            return key_id not in self._gone and not (held is not None and held.key_id == key_id and held.dropped)
 
     def identity(self, audience: str | None = None) -> dict:
         """Who bab is to Datadog: the service account whose keys it mints."""

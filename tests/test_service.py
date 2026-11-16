@@ -590,16 +590,17 @@ def test_a_kept_datadog_key_never_outlives_what_its_agent_holds():
     assert dd.keys == {} and keys.stored == {}
 
 
-def test_a_revoke_that_lands_while_a_lease_is_being_made_is_not_outrun_by_it():
-    """A lease reads the grants, then mints. A revoke between the two finds no credential to
-    end, and the key made a moment later would carry what was just taken back, for as long as
-    the key is kept. The grants are asked again after the mint, and the lease is refused."""
+def test_a_change_that_lands_while_a_lease_is_being_made_is_not_outrun_by_it():
+    """A lease reads the grants, then mints. A revoke or an approval between the two finds no
+    lease to end, and the key made a moment later would carry what was just taken back, for as
+    long as the key is kept, or be a key the approval just deleted. The grants and the minter
+    are asked again once the lease is recorded, and the lease is refused: ask again."""
     import threading
 
     from tests.conftest import FakeKeys
 
     keys = FakeKeys()
-    c, _, _, dd = gateway_room(keys)
+    c, clock, _, dd = gateway_room(keys)
     c.put("/integrations/datadog", headers=ADMIN, json={
         "vendor": "datadog", "spec": {"service_account_id": "sa-123"}, "ceiling": ["datadog_monitors_read", "datadog_metrics_read"]})
     grant(c, "ledger", "datadog", ["datadog_monitors_read", "datadog_metrics_read"])
@@ -622,6 +623,30 @@ def test_a_revoke_that_lands_while_a_lease_is_being_made_is_not_outrun_by_it():
     again = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
     assert again["granted"] == ["datadog_monitors_read"]
     assert list(dd.keys.values()) == [{"name": "bab-ledger", "scopes": ["mcp_read", "monitors_read"]}]
+    first = next(r for r in c.get("/leases", headers=ADMIN).json()["leases"] if sorted(r["permissions"]) == ["datadog_metrics_read", "datadog_monitors_read"])
+    assert first["expires_at"] <= first["issued_at"]  # recorded, and ended at once
+
+    # An approval in the same moment takes nothing away, and drops the key the lease was just
+    # given, so the agent can have the wider one. The lease is refused rather than handed a
+    # key Datadog no longer has.
+    minter.mint_standing, approved = mint_standing, []
+    clock["now"] = T0 + timedelta(hours=2)  # the lease in hand ran out: the next one is minted
+
+    def approving(*args, **kwargs):
+        out = mint_standing(*args, **kwargs)
+        if not approved:
+            t = threading.Thread(target=lambda: (grant(c, "ledger", "datadog", ["datadog_metrics_read"]), approved.append(1)))
+            t.start()
+            t.join(20)
+        return out
+
+    minter.mint_standing = approving
+    raced = c.post("/leases/for-agent", json=ask, headers=GATEWAY)
+    assert approved == [1] and raced.status_code == 409 and "ask again" in raced.json()["detail"]
+    minter.mint_standing = mint_standing
+    wide = c.post("/leases/for-agent", json=ask, headers=GATEWAY).json()
+    assert sorted(wide["granted"]) == ["datadog_metrics_read", "datadog_monitors_read"]
+    assert wide["credential"]["dd_app_key"].removeprefix("secret-") in dd.keys
 
 
 def test_a_new_grant_ends_the_credential_in_hand_and_the_next_one_carries_both(gateway):

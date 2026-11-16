@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from typing import Protocol
 
@@ -31,6 +32,7 @@ SERO_DEFAULT_APP = "bab"
 # How often the cluster re-reads the stored path: the longest a restart can miss a key
 # bab has just made (it then makes another, and the first is deleted with its lease).
 SERO_REFRESH = "1m"
+SERO_REDELIVER_S = 60  # how often a mount that does not show the store asks for delivery again
 # A record's name is a key in a Kubernetes Secret and a file name in its mount.
 NAME_OK = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,252}\Z")
 
@@ -50,6 +52,8 @@ class KeyStore(Protocol):
     def names(self) -> set[str]: ...
 
     def put(self, name: str, record: dict) -> None: ...
+
+    def redeliver(self) -> None: ...
 
     def remove(self, name: str) -> None: ...
 
@@ -88,6 +92,7 @@ class SeroKeys:
         self.path = path or f"apps/{app}/datadog-keys"
         self.http = http or _http
         self._delivered = False
+        self._asked = float("-inf")
 
     # ---- the mount: what a restart finds --------------------------------------
 
@@ -154,6 +159,15 @@ class SeroKeys:
             log.warning("%s", exc)
             return
         self._delivered = True
+
+    def redeliver(self) -> None:
+        """The store holds a record the mount does not show: a restart before the delivery
+        was asked for, or after it was refused. Asked again, at most once a minute."""
+        if time.monotonic() - self._asked < SERO_REDELIVER_S:
+            return
+        self._asked = time.monotonic()
+        self._delivered = False
+        self._deliver()
 
     def names(self) -> set[str]:
         """What sero holds at the path right now (it gives names, never values)."""

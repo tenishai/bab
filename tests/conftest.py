@@ -142,6 +142,7 @@ class FakeKeys:
         self.mounted: dict[str, dict] = {}
         self.broken = False
         self.error: Exception | None = None
+        self.redelivered = 0  # how often a minter asked for the delivery again
 
     def _guard(self):
         if self.broken:
@@ -165,6 +166,10 @@ class FakeKeys:
     def remove(self, name):
         self._guard()
         self.stored.pop(name, None)
+
+    def redeliver(self):
+        self._guard()
+        self.redelivered += 1
 
     def deliver(self):
         self.mounted = copy.deepcopy(self.stored)
