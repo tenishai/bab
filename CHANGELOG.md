@@ -4,7 +4,7 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.25] - 2026-11-16
 
 ### Changed
 - **An agent keeps one Datadog application key, where bab has somewhere to keep it.** A lease
