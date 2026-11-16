@@ -4,7 +4,7 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.24] - 2026-11-16
 
 ### Added
 - **Okta in the room catalogue.** A new service vendor, `okta`, with two levels:
