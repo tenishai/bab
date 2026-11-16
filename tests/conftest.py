@@ -66,18 +66,30 @@ def cat():
 
 class FakeDatadog:
     """Datadog's service-account application-key API, as the DatadogMinter's `http` function:
-    records every call, hands out key ids, forgets a key on DELETE, 404s one already gone."""
+    records every call, hands out key ids, forgets a key on DELETE, 404s one already gone.
+    A read made with a key it handed out is refused `slow` times before it is answered, the
+    way Datadog refuses a new key for a moment."""
 
-    def __init__(self, refuse: str | None = None):
+    def __init__(self, refuse: str | None = None, slow: int = 0):
         self.calls: list[tuple[str, str, dict | None]] = []
         self.keys: dict[str, dict] = {}
         self.refuse = refuse  # an error sentence Datadog answers every create with
+        self.slow = slow
+        self.refusals: dict[str, int] = {}  # key id -> reads still to refuse
+        self.headers: list[dict] = []
         self.last_headers: dict = {}
         self.n = 0
 
     def __call__(self, method, url, headers, body):
         self.calls.append((method, url, body))
+        self.headers.append(dict(headers))
         self.last_headers = dict(headers)
+        if method == "GET":
+            kid = str(headers.get("DD-APPLICATION-KEY", "")).removeprefix("secret-")
+            if kid not in self.keys or self.refusals.get(kid, 0) > 0:
+                self.refusals[kid] = self.refusals.get(kid, 0) - 1
+                return 403, {"errors": ["Forbidden"]}
+            return 200, {}
         _, _, key_id = url.rpartition("/application_keys/") if "/application_keys/" in url else (None, None, "")
         if method == "POST":
             if self.refuse:
@@ -86,6 +98,7 @@ class FakeDatadog:
             kid = f"kid-{self.n}"
             attrs = body["data"]["attributes"]
             self.keys[kid] = {"name": attrs["name"], "scopes": list(attrs["scopes"])}
+            self.refusals[kid] = self.slow
             return 201, {"data": {"type": "application_keys", "id": kid,
                                   "attributes": {**self.keys[kid], "key": f"secret-{kid}"}}}
         if method == "DELETE":

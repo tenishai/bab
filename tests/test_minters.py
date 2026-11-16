@@ -94,8 +94,11 @@ def test_datadog_minter_mints_a_key_scoped_to_the_union_and_named_for_the_agent(
     out = m.mint("sherlock", "datadog", {}, perms, 7200)
     method, url, body = dd.calls[0]
     assert (method, url) == ("POST", "https://api.datadoghq.eu/api/v2/service_accounts/sa-123/application_keys")
-    assert dd.last_headers["DD-API-KEY"] == "api-xyz" and dd.last_headers["DD-APPLICATION-KEY"] == "mgmt-abc"
+    assert dd.headers[0]["DD-API-KEY"] == "api-xyz" and dd.headers[0]["DD-APPLICATION-KEY"] == "mgmt-abc"
     assert body["data"]["type"] == "application_keys"
+    # The key is read with once before it is handed out, on a scope it carries.
+    assert dd.calls[1][:2] == ("GET", "https://api.datadoghq.eu/api/v1/monitor?page=0&page_size=1")
+    assert dd.headers[1]["DD-APPLICATION-KEY"] == "secret-kid-1" and len(dd.calls) == 2
     assert body["data"]["attributes"] == {"name": "bab-sherlock-202610301405", "scopes": dd_scopes(perms)}
     assert out.credential == {"dd_api_key": "api-xyz", "dd_app_key": "secret-kid-1", "dd_site": "datadoghq.eu"}
     assert out.handle == {"key_id": "kid-1"} and out.note == "application key scoped to the granted permissions"
@@ -106,7 +109,7 @@ def test_datadog_minter_mints_a_key_scoped_to_the_union_and_named_for_the_agent(
     assert dd.keys == {}
     m.end(out.handle)
     m.end({})
-    assert len(dd.calls) == 3
+    assert len(dd.calls) == 4
     # Nothing scoped, nothing minted: an unscoped key would be the whole service account.
     with pytest.raises(MintError, match="names a Datadog scope"):
         m.mint("sherlock", "datadog", {}, [cat.action("aws_logs_read")], 3600)
@@ -119,6 +122,51 @@ def test_datadog_minter_mints_a_key_scoped_to_the_union_and_named_for_the_agent(
     assert m.probe("sa-123")["subject"] == "sa-123"
     with pytest.raises(MintError, match="not sa-999"):
         m.probe("sa-999")
+
+
+def test_a_datadog_key_is_held_until_datadog_answers_a_read_made_with_it():
+    """Datadog refuses a new key for a moment (0.7 to 1.8 seconds, measured 2026-11-16), and a
+    lease handed out inside it failed the agent's first call."""
+    from bab.service.minters import DD_KEY_LATE_NOTE, DD_KEY_NOTE, DatadogMinter
+    from tests.conftest import FakeDatadog
+
+    cat = catalogue.load("catalogues/room.yaml")
+    env = {"DD_SERVICE_ACCOUNT_ID": "sa-123", "DD_API_KEY": "api-xyz", "DD_MGMT_APP_KEY": "mgmt-abc"}
+
+    def minter(dd):
+        clock, slept = {"t": 0.0}, []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            clock["t"] += seconds
+
+        return DatadogMinter.from_env(env, http=dd, sleep=sleep, clock=lambda: clock["t"]), slept
+
+    def reads(dd):
+        return [url.split("datadoghq.com")[1].split("?")[0] for method, url, _ in dd.calls if method == "GET"]
+
+    # Refused three times, answered on the fourth read: handed out then, and not before.
+    dd = FakeDatadog(slow=3)
+    m, slept = minter(dd)
+    out = m.mint("sherlock", "datadog", {}, [cat.action("datadog_monitors_read")], 3600)
+    assert reads(dd) == ["/api/v1/monitor"] * 4 and slept == [0.2] * 3 and out.note == DD_KEY_NOTE
+    assert all(h["DD-APPLICATION-KEY"] == "secret-kid-1" for h in dd.headers[1:])
+    # The read is on a scope the key carries: events when it holds events and no monitors.
+    dd = FakeDatadog()
+    m, slept = minter(dd)
+    m.mint("sherlock", "datadog", {}, [cat.action("datadog_events_read")], 3600)
+    assert reads(dd) == ["/api/v1/events"] and slept == []
+    # No scope there is a proven read for: held for the usual delay, and no read is made.
+    dd = FakeDatadog()
+    m, slept = minter(dd)
+    out = m.mint("sherlock", "datadog", {}, [cat.action("datadog_dashboards_read")], 3600)
+    assert reads(dd) == [] and slept == [2.5] and out.note == DD_KEY_NOTE
+    # Never answered: the wait is bounded, and the key is handed out with a note, not lost.
+    dd = FakeDatadog(slow=10_000)
+    m, slept = minter(dd)
+    out = m.mint("sherlock", "datadog", {}, [cat.action("datadog_monitors_read")], 3600)
+    assert sum(slept) <= 6.0 and len(reads(dd)) == len(slept) + 1 > 20
+    assert out.note == DD_KEY_LATE_NOTE and out.handle == {"key_id": "kid-1"} and "kid-1" in dd.keys
 
 
 def test_datadog_minter_reports_datadogs_sentence_never_the_keys():
