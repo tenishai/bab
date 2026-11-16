@@ -954,15 +954,18 @@ class DatadogMinter:
         if key_id in self._gone:
             return
         name = self._name_of(key_id)
-        if name is None:  # after a restart a kept key is in the store before it is in memory
-            self._adopt()
-            name = self._name_of(key_id)
+        if name is None:  # after a restart a kept key is in the mount before it is in memory
+            name = next((n for n, r in self.keys.all().items() if str(r.get("key_id") or "") == key_id), None)
         if name is None:  # a key of this lease's own
             self._delete_key(self.config(), key_id)
             self._gone.add(key_id)
             return
         with self._lock_for(name):
             held = self._standing.get(name)
+            if held is None:
+                read = self._parse(name, self.keys.get(name))
+                if read is not None and read.key_id not in self._gone:
+                    held = self._standing[name] = read
             if key_id in self._gone or (held is not None and held.key_id == key_id and not held.dropped):
                 return  # deleted while this waited, or the agent's kept key
             self._delete_key(self.config(), key_id)

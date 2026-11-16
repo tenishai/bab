@@ -402,9 +402,14 @@ def test_reading_the_mount_never_waits_on_another_agents_key():
     own = m.mint("watson", "datadog", {}, read, 3600)
     m.end(own.handle)
     assert time.monotonic() - started < 1 and own.handle["key_id"] not in dd.keys
+    # A kept key's own lease ending while that agent's name is busy is still known as kept.
+    # `end` waits for the name here: it is that agent's own key.
+    ender = threading.Thread(target=lambda: m.end({"key_id": "kid-9"}))
+    ender.start()
     done.set()
-    t.join(5)
+    t.join(5), ender.join(5)
     assert m.kept() == [("sherlock", "datadog")]
+    assert ("DELETE", "https://api.datadoghq.com/api/v2/service_accounts/sa-123/application_keys/kid-9", None) not in dd.calls
 
 
 def test_a_kept_key_the_mount_never_shows_is_asked_for_again_and_never_lost():
