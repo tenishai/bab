@@ -354,11 +354,15 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def disconnect(s, row: Integration, actor: str, now: datetime) -> tuple[int, int]:
         """Take one integration out of the ledger: every active grant on it revoked, every request
         still waiting on it withdrawn, the row deleted. The tuples naming it are the caller's to
-        delete from the store. Returns how many grants and requests that was."""
-        revoked = 0
+        delete from the store. A key a minter kept for an agent there goes with the agent's
+        grants. Returns how many grants and requests that was."""
+        revoked, holders = 0, set()
         for g in ledger.active_grants_on(s, row.id):
             g.revoked_at, g.revoked_by = now, actor
             revoked += 1
+            holders.add(g.agent)
+        for agent in sorted(holders):
+            drop_standing(agent, row.id)
         withdrawn = withdraw_all(s, row.id, actor, now)
         s.delete(row)
         return revoked, withdrawn
@@ -500,10 +504,19 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def end_expired(s, now: datetime) -> int:
         return end_leases(s, s.scalars(select(Lease).where(Lease.expires_at <= now.replace(tzinfo=None))), now)
 
+    def drop_standing(agent: str, integration: str) -> None:
+        """A key a minter keeps for `agent` across leases goes when what the agent may do on
+        `integration` changes or ends, live lease or none."""
+        for m in minters.values():
+            drop = getattr(m, "drop", None)
+            if drop is not None:
+                drop(agent, integration)
+
     def end_live(s, agent: str, integration: str, now: datetime) -> int:
         """End what `agent` holds on `integration` right now. A grant or a revoke changes
         what the next credential may carry, so the one in hand is ended where the vendor
         allows it rather than left to run out its hour beside the new one."""
+        drop_standing(agent, integration)
         return end_leases(s, s.scalars(select(Lease).where(
             Lease.agent == agent, Lease.integration == integration,
             Lease.expires_at > now.replace(tzinfo=None))), now)
@@ -845,8 +858,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def delete_integration(integration: str, caller: Console):
         """Disconnect: the row, every active grant on it (revoked), every request still waiting
         on it (withdrawn), and every tuple naming it (room link, ceilings, grants). Leases already
-        minted run out on their own. A row that is not there is 404 whoever asks: that it is
-        absent is no secret from a caller holding the console token."""
+        minted run out on their own; a key kept across leases is deleted. A row that is not
+        there is 404 whoever asks: that it is absent is no secret from a caller holding the
+        console token."""
         with ledger.session() as s0:
             row0 = integration_or_404(s0, integration)
         if row0.vendor != AGENTS_VENDOR:
@@ -1160,6 +1174,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 cat.action(g.permission) for g in ledger.active_grants(s, agent, iid)
                 if cat.action(g.permission) and not g.gated]
             if not wanted:
+                drop_standing(agent, iid)  # every grant lapsed or was taken back: nothing is left to carry
                 ledger.event(s, now, "lease.refused", agent, agent=agent, integration=iid, permissions=[],
                              reason=NOT_GRANTED, via=via)
                 s.commit()
@@ -1181,6 +1196,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                   requested_by=f"agent:{agent}", note=body.task, kind="lease", created_at=now)
                 s.add(pending)
             if not granted:
+                if not body.permissions:
+                    drop_standing(agent, iid)
                 if not gated:
                     # Nothing held and nothing waiting: a refusal, recorded like the borrowing one so
                     # the room's Agents audit can show it next to the leases that did mint.
@@ -1203,8 +1220,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                         "waiting_for_approval": [a.name for a in gated], "request_id": pending.id if pending else None,
                         "credential": credential, "expires_at": rfc3339(datetime.fromtimestamp(expires_ts, tz=UTC)),
                         "note": note, "reused": True}
+            # A lease on everything the agent holds may be the key the minter keeps for it;
+            # one that names its permissions is a credential of its own.
+            mint = minter.mint if body.permissions else getattr(minter, "mint_standing", minter.mint)
             try:
-                minted = minter.mint(agent, iid, mint_spec, granted, seconds)
+                minted = mint(agent, iid, mint_spec, granted, seconds)
             except MintError as exc:
                 ledger.event(s, now, "lease.failed", agent, agent=agent, integration=iid,
                              permissions=[a.name for a in granted], reason=str(exc), error=str(exc), via=via)

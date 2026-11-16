@@ -172,7 +172,7 @@ principal the vendor trusts.
 | Google Cloud (built, 0.4.15) | an access token for bab's own service account from the metadata server (the admin grants it the role pack on the project, folder or organization: no federation step), or `generateAccessToken` on the connection's `service_account` when one is named | bab's check only; the token carries the identity's roles (no session policy on this cloud), and the lease note says so | 1 h, or the metadata token's own expiry when shorter |
 | Azure | workload identity federation client assertion | bab's check only | about 1 h |
 | GitHub | App installation token | `permissions` and `repositories` narrowing on the token request | 1 h |
-| Datadog | create a **scoped application key** per lease, delete it at expiry | the key's own `scopes` | bab deletes it |
+| Datadog | a **scoped application key**: one per agent, kept across leases, where bab has a key store; else one per lease, deleted at expiry | the key's own `scopes` | the lease is an hour; bab deletes the key when the agent's access changes |
 | Fastly | create a token with `scope` and `expires_at` | the token's scope | expires itself |
 | OAuth vendors (Atlassian, Okta, Wiz) | client-credentials access token with scopes | the scopes | vendor default, about 1 h |
 
@@ -225,6 +225,56 @@ that works a second late is better than no lease. A caller's lease request
 therefore takes 1 to 3 seconds longer on a mint, and its timeout has to
 allow for that.
 
+#### The key outlives the lease, where there is somewhere to keep it
+
+A key an hour per agent is a key made and a key deleted in Datadog's audit
+trail every hour for every agent, and a message to the service account's
+owner each time. Nothing about the hour needed that: Datadog's keys do not
+expire, so the hour was always bab's lease, never the key's.
+
+So when bab has a key store (`bab/service/keys.py`), an agent has one key
+per Datadog connection, named `bab-<agent>`, and a lease on everything the
+agent holds hands out that same key (`DatadogMinter.mint_standing`). The
+lease is unchanged: an hour, a row in the ledger, asked for again when it
+runs out. What changes is when the key is deleted:
+
+- a permission is approved, or a grant is revoked: `end_live` calls the
+  minter's `drop`, the key is deleted at once, and the next lease makes one
+  with the new scopes;
+- a grant lapses by its date: the next lease carries fewer scopes than the
+  key does, so the old key is deleted and a new one made; when nothing is
+  left, the refusal deletes it;
+- the agent is removed, or Datadog is disconnected: deleted with the grants.
+
+A lease ending is not on that list. `end` knows a kept key from a key made
+for one lease and leaves the first alone. A lease that names its
+permissions still gets a key of its own (`mint`), so asking for less never
+replaces the key the gateway is using.
+
+A key Datadog refuses to delete when access changes is marked and never
+handed out again; the next lease deletes it before it makes another, and
+fails if it cannot.
+
+The store is the room's secret store, written through sero's machine lane
+as bab's own identity and read back from a Secret sero delivers to bab's
+namespace: sero never returns a value. bab needs the mount only after a
+restart, and it lags a write by about a minute, which gives three cases a
+restart has to get right. A key in the mount that Datadog no longer has
+(deleted just before the restart): bab asks Datadog for it by id, with the
+management key, before handing it out, and replaces it on a 404. A key in
+Datadog that the mount does not have yet (made just before the restart):
+bab makes another, and the first is deleted when the lease that carried it
+ends, because the ledger still holds its id. A key the store refused: it is
+one lease's key and is deleted with it.
+
+Without a key store bab keeps no key past its lease. The ledger does not
+hold secrets, and a key kept only in memory would be remade for every agent
+at every restart with the old ones left in Datadog.
+
+Two limits. A grant that lapses by date on an agent that never asks again
+leaves the key in Datadog until a revoke, a removal or a disconnect. And
+one bab process is assumed, as the lease cache already assumes.
+
 The tool gateway, not the agent, is what reaches Datadog today; it leases
 through `POST /leases/for-agent` with its own pod identity, naming the agent
 whose call it is serving. The checks are the agent's; the row says `via:
@@ -260,7 +310,7 @@ instance):
 
 Per-call activity lives with the vendor and names the agent: CloudTrail
 rows carry the session name `bab-<agent>` in the assumed-role ARN, GitHub audit carries the installation token's
-actor, Datadog audit carries the per-lease key. The console's Activity view
+actor, Datadog audit carries the key's name, which carries the agent's. The console's Activity view
 reads bab's leases and links to the vendor's log for the window. bab does
 not proxy calls and does not try to see them.
 

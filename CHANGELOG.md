@@ -6,6 +6,46 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **An agent keeps one Datadog application key, where bab has somewhere to keep it.** A lease
+  was a new application key, so Datadog recorded a key made and a key deleted every hour for
+  every agent, and told the service account's owner each time. Datadog's keys do not expire,
+  and the hour was always bab's: the lease. So with a key store configured (below), an agent
+  has one key per Datadog connection, named `bab-<agent>`, and each lease on everything it
+  holds there hands out that same key. Nothing else about a lease changes: it is an hour, it
+  is a row in the ledger, and when it runs out the next call asks for another. The key is
+  deleted, and the next one made with the new scopes, when what the agent may do there
+  changes: a permission approved, a grant revoked or lapsed, the agent removed, Datadog
+  disconnected. A revoke still deletes the key in the agent's hand at once. A key Datadog
+  refuses to delete at that moment is never handed out again, and the delete is tried again
+  with the next lease. A lease that names its permissions (`permissions` on `POST /leases`)
+  still gets a key of its own, deleted with the lease. The wait for Datadog to accept a new
+  key (below) is now paid once per key, not once an hour.
+
+  Without a key store nothing changes: a key per lease, as before. bab does not keep a
+  secret in its ledger, and a key held only in memory would be remade for every agent at
+  each restart, with the old ones left behind.
+
+### Added
+- **A key store: bab keeps a vendor key in the room's secret store (sero).** Four settings
+  turn it on, all or none: `BAB_SERO_URL`, `BAB_SERO_AUDIENCE` (the audience sero's machine
+  lane pins to bab's own identity; it needs one of its own, not another caller's),
+  `BAB_SERO_NAMESPACE` (the namespace that caller is pinned to) and `BAB_SERO_ACTING_EMAIL`
+  (the address sero records beside each write; no person is behind these writes, so name the
+  service's own). bab writes each agent's key as one value at `apps/bab/datadog-keys`
+  (`BAB_SERO_APP` renames the application) and asks sero once to deliver that path to its own
+  namespace as the Secret `bab-datadog-keys`, re-read every minute. sero never returns a
+  value, so bab reads its keys back from that Secret, mounted at `BAB_DATADOG_KEYS_DIR`
+  (default `/etc/bab/datadog-keys`; mount it `optional: true`, it does not exist before the
+  first key). bab only needs the mount after a restart. A key read from it is checked with
+  Datadog once before it is handed out, because the mount lags a delete by about a minute.
+  A key the store would not take is used for its one lease and deleted with it. A restart
+  inside the minute after a key was made makes that agent a second key, and the first is
+  deleted when its lease ends. One limit: a grant that lapses by its own date, on an agent
+  that then never asks for a lease again, leaves its key in Datadog until the agent is
+  removed, the grant is revoked, or Datadog is disconnected. This assumes one bab process,
+  as the lease cache already does.
+
 ### Fixed
 - **A Datadog lease is not handed out before Datadog accepts its key.** Datadog refuses a new
   application key for a moment after it creates it: measured from the service's own pod, five

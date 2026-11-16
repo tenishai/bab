@@ -229,6 +229,174 @@ def test_datadog_minter_reads_the_mounted_secret_on_every_call(monkeypatch, tmp_
         DatadogMinter.from_dir(str(secret), env={}, http=fake).identity()
 
 
+DD_ENV = {"DD_SERVICE_ACCOUNT_ID": "sa-123", "DD_API_KEY": "api-xyz", "DD_MGMT_APP_KEY": "mgmt-abc"}
+DD_KEYS_URL = "https://api.datadoghq.com/api/v2/service_accounts/sa-123/application_keys"
+
+
+def test_with_a_key_store_an_agent_keeps_one_datadog_key_until_its_access_changes():
+    """A key an hour per agent made Datadog write to its audit trail, and to the service
+    account's owner, every hour. The lease is still the hour; the key is the agent's until
+    what it may do changes, and a key whose access was taken is never handed out again."""
+    from bab.service.minters import DD_STANDING_NOTE, DatadogMinter, MintError, dd_scopes
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys, clock = FakeDatadog(), FakeKeys(), {"now": datetime(2026, 10, 30, 14, 5, tzinfo=UTC).timestamp()}
+    m = DatadogMinter.from_env(DD_ENV, http=dd, now=lambda: clock["now"], keys=keys)
+    read = [cat.action("datadog_monitors_read")]
+    first = m.mint_standing("sherlock", "datadog", {}, read, 7200)
+    assert dd.keys == {"kid-1": {"name": "bab-sherlock", "scopes": ["mcp_read", "monitors_read"]}}
+    assert first.note == DD_STANDING_NOTE and first.expires_at == clock["now"] + 3600
+    record = keys.stored["datadog.sherlock"]
+    assert (record["key_id"], record["key"], record["scopes"]) == ("kid-1", "secret-kid-1", ["mcp_read", "monitors_read"])
+    assert (record["agent"], record["integration"], record["service_account_id"]) == ("sherlock", "datadog", "sa-123")
+    # The lease ends and the key stands. The next hour's lease is the same key, and Datadog is not called.
+    m.end(first.handle)
+    clock["now"] += 3600
+    calls = len(dd.calls)
+    second = m.mint_standing("sherlock", "datadog", {}, read, 3600)
+    assert (second.credential, second.handle) == (first.credential, first.handle) and len(dd.calls) == calls
+    assert second.expires_at == first.expires_at + 3600
+    # Another agent has its own; a lease made with `mint` is a key of its own and goes with the lease.
+    assert m.mint_standing("watson", "datadog", {}, read, 3600).handle == {"key_id": "kid-2"}
+    own = m.mint("sherlock", "datadog", {}, read, 3600)
+    m.end(own.handle)
+    assert set(dd.keys) == {"kid-1", "kid-2"}
+    # More is granted: the key that carried the old set is deleted and the new one stored.
+    both = read + [cat.action("datadog_metrics_read")]
+    third = m.mint_standing("sherlock", "datadog", {}, both, 3600)
+    assert set(dd.keys) == {"kid-2", "kid-4"} and dd.keys["kid-4"]["scopes"] == dd_scopes(both)
+    assert keys.stored["datadog.sherlock"]["key_id"] == "kid-4"
+    # Access is taken away: the key goes from Datadog and the store, with no lease asked for,
+    # and the lease that carried it ends without another call.
+    m.drop("sherlock", "datadog")
+    assert set(dd.keys) == {"kid-2"} and set(keys.stored) == {"datadog.watson"}
+    calls = len(dd.calls)
+    m.end(third.handle)
+    m.drop("sherlock", "datadog")
+    m.drop("sherlock", "aws-prod")
+    assert len(dd.calls) == calls
+    # Datadog will not delete a key whose access was taken: it is never handed out again. The
+    # next lease fails until the delete goes through, and then carries a new key.
+    dd.keep = True
+    m.drop("watson", "datadog")
+    assert "kid-2" in dd.keys
+    with pytest.raises(MintError, match="refused deleting application key kid-2"):
+        m.mint_standing("watson", "datadog", {}, read, 3600)
+    dd.keep = False
+    assert m.mint_standing("watson", "datadog", {}, read, 3600).handle == {"key_id": "kid-5"}
+    assert set(dd.keys) == {"kid-5"}
+    # A store that will not take a key: the key is one lease's, as it was before there was a store.
+    keys.broken = True
+    lone = m.mint_standing("sherlock", "datadog", {}, read, 3600)
+    assert "datadog.sherlock" not in keys.stored and lone.handle == {"key_id": "kid-6"}
+    m.end(lone.handle)
+    assert set(dd.keys) == {"kid-5"}
+    # No store at all: `mint_standing` is `mint`.
+    plain = DatadogMinter.from_env(DD_ENV, http=dd, now=lambda: clock["now"])
+    assert dd.keys[plain.mint_standing("sherlock", "datadog", {}, read, 3600).handle["key_id"]]["name"].startswith("bab-sherlock-2026")
+
+
+def test_a_restart_finds_the_kept_datadog_key_and_asks_datadog_before_trusting_it():
+    """bab's ledger records leases, not secrets, so a restart would make every agent a new key.
+    The store gives the key back, a minute or so behind what was last written to it."""
+    from bab.service.minters import DatadogMinter
+    from tests.conftest import FakeDatadog, FakeKeys
+
+    cat = catalogue.load("catalogues/room.yaml")
+    dd, keys = FakeDatadog(), FakeKeys()
+    read = [cat.action("datadog_monitors_read")]
+    first = DatadogMinter.from_env(DD_ENV, http=dd, keys=keys).mint_standing("sherlock", "datadog", {}, read, 3600)
+    keys.deliver()
+    m = DatadogMinter.from_env(DD_ENV, http=dd, keys=keys)
+    # The lease from before the restart ends: its key is the kept one and stands. A key the
+    # ledger holds and the store does not is deleted with its lease.
+    dd.keys["kid-9"] = {"name": "bab-sherlock-202610301405", "scopes": ["mcp_read", "monitors_read"]}
+    m.end(first.handle)
+    m.end({"key_id": "kid-9"})
+    assert set(dd.keys) == {"kid-1"}
+    # The first lease after it asks Datadog, with the management key, whether the key is there. Once.
+    calls = len(dd.calls)
+    again = m.mint_standing("sherlock", "datadog", {}, read, 3600)
+    assert (again.credential, again.handle) == (first.credential, first.handle)
+    assert [x[:2] for x in dd.calls[calls:]] == [("GET", f"{DD_KEYS_URL}/kid-1")]
+    assert dd.last_headers["DD-APPLICATION-KEY"] == "mgmt-abc"
+    m.mint_standing("sherlock", "datadog", {}, read, 3600)
+    assert len(dd.calls) == calls + 1
+    # A stored key Datadog no longer has (deleted while the store lagged) is replaced, not handed out.
+    del dd.keys["kid-1"]
+    fresh = DatadogMinter.from_env(DD_ENV, http=dd, keys=keys).mint_standing("sherlock", "datadog", {}, read, 3600)
+    assert fresh.handle == {"key_id": "kid-2"} and keys.stored["datadog.sherlock"]["key_id"] == "kid-2"
+    # A key made on another service account is not this connection's to hand out.
+    keys.deliver()
+    moved = DatadogMinter.from_env({**DD_ENV, "DD_SERVICE_ACCOUNT_ID": "sa-999"}, http=dd, keys=keys)
+    assert moved.mint_standing("sherlock", "datadog", {}, read, 3600).handle == {"key_id": "kid-3"}
+    assert keys.stored["datadog.sherlock"]["service_account_id"] == "sa-999"
+
+
+def test_the_key_store_is_the_secret_stores_machine_lane_and_a_mounted_secret(tmp_path):
+    """bab and the secret store are released apart, and all that joins them is this: who is
+    acting, a namespace, a path under apps/, one value per record, a delivery asked for once,
+    and a last record that goes with its path because the store refuses to leave one empty."""
+    from bab.service.keys import KeyStoreError, SeroKeys, sero_keys_from_env
+
+    calls, held, answer = [], [], {"status": 200}
+
+    def http(method, url, headers, body, params):
+        assert headers["Authorization"] == "Bearer id-token-for-secrets-bab"
+        calls.append((method, url.removeprefix("http://secrets:8000"), body or params))
+        if method == "GET":
+            return (200, {"keys": list(held), "version": 3}) if held else (404, {"detail": "there is no secret"})
+        return answer["status"], {"blocked": []}
+
+    keys = SeroKeys("http://secrets:8000/", "secrets-bab", "room", "bab@example.com", str(tmp_path),
+                    token=lambda audience: f"id-token-for-{audience}", http=http)
+    where = {"acting_email": "bab@example.com", "namespace": "room", "path": "apps/bab/datadog-keys"}
+    keys.put("datadog.sherlock", {"key_id": "kid-1", "key": "s1"})
+    assert calls == [
+        ("POST", "/api/service/secrets", {**where, "values": {"datadog.sherlock": '{"key": "s1", "key_id": "kid-1"}'},
+                                          "remove_keys": [], "apply": True}),
+        ("POST", "/api/service/sync", {**where, "app": "bab", "name": "bab-datadog-keys", "target_name": "bab-datadog-keys",
+                                       "refresh_interval": "1m", "apply": True})]
+    keys.put("datadog.watson", {"key_id": "kid-2", "key": "s2"})
+    assert len(calls) == 3  # delivery is asked for once
+    # One of two goes by name; the last goes with its path; one that is not there is nothing to do.
+    del calls[:]
+    held[:] = ["datadog.sherlock", "datadog.watson"]
+    keys.remove("datadog.sherlock")
+    assert calls == [("GET", "/api/service/secrets", where),
+                     ("POST", "/api/service/secrets", {**where, "values": {}, "remove_keys": ["datadog.sherlock"], "apply": True})]
+    del calls[:]
+    held[:] = ["datadog.watson"]
+    keys.remove("datadog.watson")
+    keys.remove("datadog.nobody")
+    held[:] = []
+    keys.remove("datadog.watson")
+    assert [c[:2] for c in calls] == [("GET", "/api/service/secrets"), ("DELETE", "/api/service/secrets"),
+                                      ("GET", "/api/service/secrets"), ("GET", "/api/service/secrets")]
+    assert calls[1][2] == {**where, "apply": True}
+    # A refusal is an error that names the path and the status, never a value.
+    answer["status"] = 403
+    with pytest.raises(KeyStoreError, match="could not store datadog.sherlock at apps/bab/datadog-keys: the secret store answered HTTP 403"):
+        keys.put("datadog.sherlock", {"key_id": "kid-1", "key": "s1"})
+    with pytest.raises(KeyStoreError, match="cannot name a stored key"):
+        keys.put("../etc", {})
+    # What a restart reads: one file per record, as the cluster mounts a Secret.
+    assert keys.all() == {} and keys.get("datadog.sherlock") is None
+    (tmp_path / "datadog.sherlock").write_text('{"key_id": "kid-1", "key": "s1"}')
+    (tmp_path / "datadog.torn").write_text('{"key_id": ')
+    (tmp_path / "..data").mkdir()
+    assert keys.all() == {"datadog.sherlock": {"key_id": "kid-1", "key": "s1"}} and keys.get("../etc") is None
+    # A deployment names all of the store or none of it.
+    env = {"BAB_SERO_URL": "http://secrets:8000", "BAB_SERO_AUDIENCE": "secrets-bab", "BAB_SERO_NAMESPACE": "room",
+           "BAB_SERO_ACTING_EMAIL": "bab@example.com"}
+    made = sero_keys_from_env(env, str(tmp_path), lambda audience: "t")
+    assert (made.url, made.audience, made.namespace, made.acting_email, made.path) == (
+        "http://secrets:8000", "secrets-bab", "room", "bab@example.com", "apps/bab/datadog-keys")
+    assert sero_keys_from_env({**env, "BAB_SERO_AUDIENCE": " "}, str(tmp_path), lambda audience: "t") is None
+    assert sero_keys_from_env({}, str(tmp_path), lambda audience: "t") is None
+
+
 def test_every_datadog_permission_names_its_scopes():
     cat = catalogue.load("catalogues/room.yaml")
     scopes = {a.name: a.extra.get("scopes") for a in cat.for_vendor("datadog")}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from bab.catalogue import Catalogue
@@ -66,11 +68,13 @@ def cat():
 
 class FakeDatadog:
     """Datadog's service-account application-key API, as the DatadogMinter's `http` function:
-    records every call, hands out key ids, forgets a key on DELETE, 404s one already gone.
-    A read made with a key it handed out is refused `slow` times before it is answered, the
-    way Datadog refuses a new key for a moment."""
+    records every call, hands out key ids, forgets a key on DELETE, 404s one already gone,
+    and says whether it has a key that is asked for by id. A read made with a key it handed
+    out is refused `slow` times before it is answered, the way Datadog refuses a new key for
+    a moment. `keep` makes it refuse every DELETE."""
 
     def __init__(self, refuse: str | None = None, slow: int = 0):
+        self.keep = False
         self.calls: list[tuple[str, str, dict | None]] = []
         self.keys: dict[str, dict] = {}
         self.refuse = refuse  # an error sentence Datadog answers every create with
@@ -84,6 +88,8 @@ class FakeDatadog:
         self.calls.append((method, url, body))
         self.headers.append(dict(headers))
         self.last_headers = dict(headers)
+        if method == "GET" and "/application_keys/" in url:
+            return (200, {"data": {"id": url.rpartition("/")[2]}}) if url.rpartition("/")[2] in self.keys else (404, {"errors": ["Not found"]})
         if method == "GET":
             kid = str(headers.get("DD-APPLICATION-KEY", "")).removeprefix("secret-")
             if kid not in self.keys or self.refusals.get(kid, 0) > 0:
@@ -102,8 +108,42 @@ class FakeDatadog:
             return 201, {"data": {"type": "application_keys", "id": kid,
                                   "attributes": {**self.keys[kid], "key": f"secret-{kid}"}}}
         if method == "DELETE":
+            if self.keep:
+                return 500, {"errors": ["Internal error"]}
             return (204, {}) if self.keys.pop(key_id, None) is not None else (404, {"errors": ["Not found"]})
         return 405, {"errors": ["method"]}
+
+
+class FakeKeys:
+    """A key store as a minter sees it. `stored` is what the store holds; `mounted` is what a
+    restart would read, which is `stored` as of the last `deliver()`. `broken` refuses writes."""
+
+    def __init__(self):
+        self.stored: dict[str, dict] = {}
+        self.mounted: dict[str, dict] = {}
+        self.broken = False
+
+    def _guard(self):
+        if self.broken:
+            from bab.service.keys import KeyStoreError
+            raise KeyStoreError("the secret store answered HTTP 503")
+
+    def get(self, name):
+        return copy.deepcopy(self.mounted.get(name))
+
+    def all(self):
+        return copy.deepcopy(self.mounted)
+
+    def put(self, name, record):
+        self._guard()
+        self.stored[name] = copy.deepcopy(record)
+
+    def remove(self, name):
+        self._guard()
+        self.stored.pop(name, None)
+
+    def deliver(self):
+        self.mounted = copy.deepcopy(self.stored)
 
 
 class FakeGitHub:
