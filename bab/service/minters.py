@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from collections.abc import Mapping
@@ -37,6 +38,10 @@ class MintError(RuntimeError):
 
 class NotConfigured(MintError):
     """bab holds nothing for this vendor yet; connecting it is what is missing, not a retry."""
+
+
+class NameTaken(MintError):
+    """The vendor already has a credential under the name asked for."""
 
 
 class Unreachable(MintError):
@@ -475,6 +480,8 @@ class _Standing:
     scopes: tuple[str, ...]
     service_account_id: str
     site: str
+    agent: str = ""
+    integration: str = ""
     proven: bool = True  # False for one read back from the store: Datadog is asked whether it is still there
     dropped: bool = False  # its access changed and Datadog would not delete it then: never handed out again
 
@@ -497,6 +504,16 @@ class DatadogMinter:
     lets a restart find the key again; a key the store would not take is kept for its one
     lease, like the keys above.
 
+    A kept key is only made when no other can be standing under its name. The store is asked
+    what it has first, and while it holds a key this process cannot read (the mount is
+    behind, or missing), or Datadog will not say whether a key read back is still there, a
+    lease gets a key of its own. Datadog is the last word: it keeps one key per name, so a
+    create it answers 409 means a key named `bab-<agent>` stands that nothing here holds
+    (another room on the same service account, or one whose delete never went through), and
+    the lease gets a key of its own then too. `kept` and `settle` let the service check
+    every kept key against what its agent holds now, which is what retries a delete Datadog
+    refused and takes a key whose access ran out while its agent was not asking.
+
     Its configuration is read on every call, never at boot: the room writes the Secret the
     moment an admin connects Datadog and probes at once, and a disconnect removes it again,
     so a value cached at boot would be absent first and stale afterwards."""
@@ -514,7 +531,11 @@ class DatadogMinter:
         self.keys = keys  # where a kept key lives between restarts; None: every lease has a key of its own
         self._standing: dict[str, _Standing] = {}  # by `<integration>.<agent>`
         self._gone: set[str] = set()  # key ids this process saw deleted: a store record still naming one is stale
-        self._lock = threading.RLock()
+        # One lock per name, held across Datadog and the store: a slow answer holds up that
+        # agent's key and nobody else's lease.
+        self._locks: dict[str, threading.RLock] = {}
+        self._mu = threading.Lock()
+        self._told: set[str] = set()  # what was already said once in the log
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ, **kwargs) -> DatadogMinter:
@@ -577,12 +598,15 @@ class DatadogMinter:
         return f"HTTP {status}" + (f" {'; '.join(parts)}" if parts else "")
 
     @staticmethod
-    def _keys_path(cfg: DatadogConfig, key_id: str = "") -> str:
-        return f"/api/v2/service_accounts/{cfg.service_account_id}/application_keys" + (f"/{key_id}" if key_id else "")
+    def _keys_path(cfg: DatadogConfig, key_id: str = "", service_account_id: str = "") -> str:
+        account = service_account_id or cfg.service_account_id
+        return f"/api/v2/service_accounts/{account}/application_keys" + (f"/{key_id}" if key_id else "")
 
     def _create_key(self, cfg: DatadogConfig, name: str, scopes: list[str]) -> tuple[str, str]:
         body = {"data": {"type": "application_keys", "attributes": {"name": name, "scopes": list(scopes)}}}
         status, data = self._call(cfg, "POST", self._keys_path(cfg), body)
+        if status == 409:  # Datadog keeps one application key per name
+            raise NameTaken(f"Datadog refused creating an application key: {self._error(status, data)}")
         if status not in (200, 201):
             raise MintError(f"Datadog refused creating an application key: {self._error(status, data)}")
         d = data.get("data") or {}
@@ -607,7 +631,11 @@ class DatadogMinter:
             raise MintError("none of the granted permissions names a Datadog scope; nothing to mint")
         now = self.now()
         name = _DD_KEY_NAME_BAD.sub("-", f"bab-{agent}-{time.strftime('%Y%m%d%H%M', time.gmtime(now))}")
-        key_id, key = self._create_key(cfg, name, scopes)
+        try:
+            key_id, key = self._create_key(cfg, name, scopes)
+        except NameTaken:  # a second key for this agent within the minute
+            name = f"{name}-{secrets.token_hex(2)}"
+            key_id, key = self._create_key(cfg, name, scopes)
         accepted = self._await_key(cfg, name, key, scopes)
         return Minted(credential=self._credential(cfg, key),
                       expires_at=now + max(1, min(int(seconds), DD_MAX_SECONDS)), handle={"key_id": key_id},
@@ -617,24 +645,43 @@ class DatadogMinter:
 
     @staticmethod
     def _standing_name(agent: str, integration_id: str) -> str | None:
+        """`<integration>.<agent>`, or None for a pair the store cannot name. An agent with a
+        dot in its name has no kept key: the name must split one way, and `datadog.eu` with
+        `fred` would be `datadog` with `eu.fred`."""
         name = f"{integration_id}.{agent}"
-        return name if NAME_OK.match(name) else None
+        return name if "." not in agent and NAME_OK.match(name) else None
 
-    def _adopt(self, name: str | None = None) -> None:
-        """Take up what the store holds and memory does not: one record, or all of them. A
-        record whose key this process saw deleted is the store catching up, and is left."""
-        if self.keys is None:
-            return
-        records = self.keys.all() if name is None else {name: self.keys.get(name)}
-        for n, record in records.items():
-            if n in self._standing or not record:
-                continue
-            key_id, key, scopes = str(record.get("key_id") or ""), str(record.get("key") or ""), record.get("scopes")
-            if not (key_id and key) or key_id in self._gone or not isinstance(scopes, list):
-                continue
-            self._standing[n] = _Standing(key_id, key, tuple(str(s) for s in scopes),
-                                          str(record.get("service_account_id") or ""), str(record.get("site") or ""),
-                                          proven=False)
+    def _lock_for(self, name: str) -> threading.RLock:
+        with self._mu:
+            return self._locks.setdefault(name, threading.RLock())
+
+    def _once(self, what: str, message: str, *args) -> None:
+        """A warning that would otherwise repeat with every lease or every check."""
+        if what not in self._told:
+            self._told.add(what)
+            log.warning(message, *args)
+
+    @staticmethod
+    def _parse(name: str, record: dict | None) -> _Standing | None:
+        """One of the store's records as a kept key not yet checked with Datadog, or None for
+        one that is not a key."""
+        if not record:
+            return None
+        key_id, key, scopes = str(record.get("key_id") or ""), str(record.get("key") or ""), record.get("scopes")
+        if not (key_id and key) or not isinstance(scopes, list):
+            return None
+        integration, _, agent = name.rpartition(".")
+        return _Standing(key_id, key, tuple(str(s) for s in scopes), str(record.get("service_account_id") or ""),
+                         str(record.get("site") or ""), agent=str(record.get("agent") or agent),
+                         integration=str(record.get("integration") or integration), proven=False)
+
+    def _adopt(self) -> None:
+        """Take up every key the store holds and memory does not. A record whose key this
+        process saw deleted is the store catching up, and is left."""
+        for name, record in self.keys.all().items():
+            read = None if name in self._standing else self._parse(name, record)
+            if read is not None and read.key_id not in self._gone:
+                self._standing[name] = read
 
     def _exists(self, cfg: DatadogConfig, key_id: str) -> bool | None:
         """Whether Datadog still has this key, asked with the management key so the answer
@@ -645,28 +692,75 @@ class DatadogMinter:
             return None
         return True if status == 200 else False if status == 404 else None
 
-    def _held(self, cfg: DatadogConfig, name: str) -> _Standing | None:
-        """The key kept under `name`, from memory or else the store. One made on another
-        service account or site is not this connection's to hand out. One read back from the
-        store is checked with Datadog first: the store lags a delete by a minute or so, and a
-        key Datadog no longer has would fail every call made with it."""
+    def _leave(self, cfg: DatadogConfig, name: str, held: _Standing) -> None:
+        """The connection names another service account or site than the one this key was made
+        on. It is deleted where it was made when this connection's management key can still
+        reach it, and named in the log for a person when it cannot: nothing here will hold its
+        id again."""
+        try:
+            if held.site != cfg.site:
+                raise MintError(f"it is on {held.site or 'another site'}")
+            status, data = self._call(cfg, "DELETE", self._keys_path(cfg, held.key_id, held.service_account_id))
+            if status not in (200, 204):
+                raise MintError(self._error(status, data))
+        except MintError as exc:
+            log.warning("datadog key %s of %s, made on service account %s, could not be deleted from here (%s): "
+                        "delete it in Datadog if it is still there", held.key_id, name, held.service_account_id, exc)
+        self._gone.add(held.key_id)
+        self._standing.pop(name, None)
+
+    def _held(self, cfg: DatadogConfig, name: str) -> tuple[_Standing | None, str]:
+        """The key kept under `name`, from memory or else the store, and when there is none,
+        why: "" the store showed no key, "stale" it showed one that is no longer a key,
+        "unsure" Datadog did not say. One made on another service account or site is not this
+        connection's. One read back from the store is checked with Datadog first: the store
+        lags a delete by a minute or so, and a key Datadog no longer has would fail every call
+        made with it."""
         held = self._standing.get(name)
         if held is None:
-            self._adopt(name)
-            held = self._standing.get(name)
-        if held is None:
-            return None
+            read = self._parse(name, self.keys.get(name))
+            if read is None:
+                return None, ""
+            if read.key_id in self._gone:
+                return None, "stale"
+            held = self._standing[name] = read
         if (held.service_account_id, held.site) != (cfg.service_account_id, cfg.site):
-            self._standing.pop(name, None)
-            return None
+            self._leave(cfg, name, held)
+            return None, "stale"
         if not held.proven:
             there = self._exists(cfg, held.key_id)
+            if there is None:
+                return None, "unsure"
             if there is False:
                 self._gone.add(held.key_id)
                 self._standing.pop(name, None)
-                return None
-            held.proven = there is True
-        return held
+                return None, "stale"
+            held.proven = True
+        return held, ""
+
+    def _free(self, name: str, why: str) -> bool:
+        """Whether to ask Datadog for a kept key under `name` now. Yes when the store's record
+        was read and is no longer a key ("stale"): if the store holds a newer one the mount has
+        not shown yet, Datadog refuses the name and nothing is overwritten. Otherwise only when
+        the store, asked directly, holds nothing under the name: a record there that the mount
+        does not show is a key this process cannot read."""
+        if why == "stale":
+            return True
+        if why == "unsure":
+            self._once(f"unsure:{name}", "datadog did not say whether the kept key of %s is still there: "
+                                         "its leases get a key of their own until it does", name)
+            return False
+        try:
+            stored = name in self.keys.names()
+        except Exception as exc:  # noqa: BLE001 - whatever the store raised, it did not answer
+            self._once(f"names:{name}", "the store did not say whether it holds a datadog key for %s (%s): "
+                                        "its leases get a key of their own until it does", name,
+                       exc if isinstance(exc, KeyStoreError) else exc.__class__.__name__)
+            return False
+        if stored:
+            self._once(f"unseen:{name}", "the store holds a datadog key for %s that this process cannot read yet: "
+                                         "its leases get a key of their own until the mounted Secret shows it", name)
+        return not stored
 
     def _forget(self, name: str, key_id: str) -> None:
         """A kept key Datadog has deleted: out of memory, and out of the store when it answers."""
@@ -674,13 +768,14 @@ class DatadogMinter:
         self._standing.pop(name, None)
         try:
             self.keys.remove(name)
-        except KeyStoreError as exc:  # the record names a key that is gone; `_held` settles that
-            log.warning("%s", exc)
+        except Exception as exc:  # noqa: BLE001 - the record names a key that is gone; `_held` settles that
+            log.warning("%s", exc if isinstance(exc, KeyStoreError) else exc.__class__.__name__)
 
     def mint_standing(self, agent, integration_id, spec, permissions, seconds):
         """A lease on everything the agent holds on this connection: its kept key when the
         scopes are the ones that key carries, else a new key after the old one is deleted.
-        With no store, or a name the store cannot hold, this is `mint`."""
+        With no store, a name the store cannot hold, or a kept key that may be standing
+        unseen (`_free`, or Datadog refusing the name), this is `mint`."""
         name = self._standing_name(agent, integration_id)
         if self.keys is None or name is None:
             return self.mint(agent, integration_id, spec, permissions, seconds)
@@ -690,56 +785,96 @@ class DatadogMinter:
             raise MintError("none of the granted permissions names a Datadog scope; nothing to mint")
         now = self.now()
         expires_at = now + max(1, min(int(seconds), DD_MAX_SECONDS))
-        with self._lock:
-            held = self._held(cfg, name)
+        with self._lock_for(name):
+            held, why = self._held(cfg, name)
             if held is not None and not held.dropped and held.scopes == tuple(scopes):
                 return Minted(credential=self._credential(cfg, held.key), expires_at=expires_at,
                               handle={"key_id": held.key_id}, note=DD_STANDING_NOTE)
-            if held is not None:
-                # What the agent may do changed. The key that carried the old set goes before
-                # the new one is made, so a refused delete fails this lease and is tried again
-                # with the next, never left behind a key that replaced it.
-                held.dropped = True
-                self._delete_key(cfg, held.key_id)
-                self._gone.add(held.key_id)
-                self._standing.pop(name, None)
-            key_name = _DD_KEY_NAME_BAD.sub("-", f"bab-{agent}")
-            key_id, key = self._create_key(cfg, key_name, scopes)
-            try:
-                self.keys.put(name, {"agent": agent, "integration": integration_id, "key_id": key_id, "key": key,
-                                     "scopes": list(scopes), "service_account_id": cfg.service_account_id,
-                                     "site": cfg.site, "created_at": int(now)})
-            except KeyStoreError as exc:
-                # Not kept: this lease's `end` deletes it, and the next lease tries the store again.
-                log.warning("datadog key %s is for one lease only, the store would not take it: %s", key_name, exc)
-            else:
-                self._standing[name] = _Standing(key_id, key, tuple(scopes), cfg.service_account_id, cfg.site)
-            # Inside the lock: a second lease for the same agent must not take the key up
-            # before Datadog accepts it.
-            accepted = self._await_key(cfg, key_name, key, scopes)
+            if held is not None or self._free(name, why):
+                if held is not None:
+                    # What the agent may do changed. The key that carried the old set goes before
+                    # the new one is made, so a refused delete fails this lease and is tried again
+                    # with the next, never left behind a key that replaced it.
+                    held.dropped = True
+                    self._delete_key(cfg, held.key_id)
+                    self._gone.add(held.key_id)
+                    self._standing.pop(name, None)
+                key_name = _DD_KEY_NAME_BAD.sub("-", f"bab-{agent}")
+                try:
+                    key_id, key = self._create_key(cfg, key_name, scopes)
+                except NameTaken:
+                    key_id = key = ""
+                    self._once(f"taken:{name}", "datadog already has a key named %s on service account %s that bab does "
+                                                "not hold: the agent's leases get a key of their own until it is gone",
+                               key_name, cfg.service_account_id)
+                if key_id:
+                    return self._keep(cfg, name, agent, integration_id, key_name, key_id, key, scopes, now, expires_at)
+        return self.mint(agent, integration_id, spec, permissions, seconds)
+
+    def _keep(self, cfg, name, agent, integration_id, key_name, key_id, key, scopes, now, expires_at) -> Minted:
+        """Store a key just made and hold it until Datadog accepts it. Under the name's lock: a
+        second lease for the same agent must not take the key up before then."""
+        try:
+            self.keys.put(name, {"agent": agent, "integration": integration_id, "key_id": key_id, "key": key,
+                                 "scopes": list(scopes), "service_account_id": cfg.service_account_id,
+                                 "site": cfg.site, "created_at": int(now)})
+        except Exception as exc:  # noqa: BLE001 - whatever the store raised, the key exists and has to end
+            # Not kept: this lease's `end` deletes it, and the next lease tries the store again.
+            log.warning("datadog key %s is for one lease only, the store would not take it: %s", key_name,
+                        exc if isinstance(exc, KeyStoreError) else exc.__class__.__name__)
+        else:
+            self._standing[name] = _Standing(key_id, key, tuple(scopes), cfg.service_account_id, cfg.site,
+                                             agent=agent, integration=integration_id)
+        accepted = self._await_key(cfg, key_name, key, scopes)
         return Minted(credential=self._credential(cfg, key), expires_at=expires_at, handle={"key_id": key_id},
                       note=DD_STANDING_NOTE if accepted else DD_KEY_LATE_NOTE)
 
     def drop(self, agent: str, integration_id: str) -> None:
         """What `agent` may do on this connection changed or ended: its kept key goes, whether
         or not a lease is live. Never raises. A delete Datadog refuses leaves the key marked,
-        so it is not handed out again and the next `end` or lease deletes it."""
+        so it is not handed out again, and `settle`, the next `end` or the next lease tries
+        the delete again."""
         name = self._standing_name(agent, integration_id)
         if self.keys is None or name is None:
             return
-        with self._lock:
-            if name not in self._standing:
-                self._adopt(name)
+        with self._lock_for(name):
             held = self._standing.get(name)
             if held is None:
-                return
+                held = self._parse(name, self.keys.get(name))
+                if held is None or held.key_id in self._gone:
+                    return
+                self._standing[name] = held
             held.dropped = True
             try:
-                self._delete_key(self.config(), held.key_id)
+                cfg = self.config()
+                if (held.service_account_id, held.site) != (cfg.service_account_id, cfg.site):
+                    self._leave(cfg, name, held)
+                else:
+                    self._delete_key(cfg, held.key_id)
             except MintError as exc:
-                log.warning("datadog key %s of %s is still there: %s", held.key_id, name, exc)
+                self._once(f"kept:{held.key_id}", "datadog key %s of %s is still there, and the delete is tried again: %s",
+                           held.key_id, name, exc)
                 return
             self._forget(name, held.key_id)
+
+    def kept(self) -> list[tuple[str, str]]:
+        """(agent, integration) of every key kept here, what a restart left in the store included."""
+        if self.keys is None:
+            return []
+        self._adopt()
+        return sorted({(k.agent, k.integration) for k in list(self._standing.values())})
+
+    def settle(self, agent: str, integration_id: str, permissions: list[Action] | None) -> None:
+        """Check one kept key against what its agent holds on the connection now (`permissions`;
+        None or empty when it holds nothing there, or the connection is gone). A key whose
+        delete was refused, or that carries a scope the agent no longer holds, goes (`drop`).
+        One that carries less is left for the agent's next lease to replace. Never raises."""
+        name = self._standing_name(agent, integration_id)
+        if self.keys is None or name is None:
+            return
+        held = self._standing.get(name)
+        if held is not None and (held.dropped or not set(held.scopes) <= set(dd_scopes(permissions or []))):
+            self.drop(agent, integration_id)
 
     def _await_key(self, cfg: DatadogConfig, name: str, key: str, scopes: list[str]) -> bool:
         """Hold a new key until Datadog answers a read made with it (see DD_KEY_READS). True
@@ -781,23 +916,28 @@ class DatadogMinter:
         if self.keys is None:
             self._delete_key(self.config(), key_id)
             return
-        with self._lock:
-            if key_id in self._gone:
-                return
+        if key_id in self._gone:
+            return
+        name = self._name_of(key_id)
+        if name is None:  # after a restart a kept key is in the store before it is in memory
+            self._adopt()
             name = self._name_of(key_id)
-            if name is None:  # after a restart a kept key is in the store before it is in memory
-                self._adopt()
-                name = self._name_of(key_id)
-            if name is not None and not self._standing[name].dropped:
-                return
+        if name is None:  # a key of this lease's own
             self._delete_key(self.config(), key_id)
-            if name is None:
-                self._gone.add(key_id)
-            else:
+            self._gone.add(key_id)
+            return
+        with self._lock_for(name):
+            held = self._standing.get(name)
+            if key_id in self._gone or (held is not None and held.key_id == key_id and not held.dropped):
+                return  # deleted while this waited, or the agent's kept key
+            self._delete_key(self.config(), key_id)
+            if held is not None and held.key_id == key_id:
                 self._forget(name, key_id)
+            else:
+                self._gone.add(key_id)
 
     def _name_of(self, key_id: str) -> str | None:
-        return next((n for n, k in self._standing.items() if k.key_id == key_id), None)
+        return next((n for n, k in list(self._standing.items()) if k.key_id == key_id), None)
 
     def identity(self, audience: str | None = None) -> dict:
         """Who bab is to Datadog: the service account whose keys it mints."""

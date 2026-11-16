@@ -32,7 +32,7 @@ SERO_DEFAULT_APP = "bab"
 # bab has just made (it then makes another, and the first is deleted with its lease).
 SERO_REFRESH = "1m"
 # A record's name is a key in a Kubernetes Secret and a file name in its mount.
-NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+NAME_OK = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,252}\Z")
 
 
 class KeyStoreError(RuntimeError):
@@ -40,11 +40,14 @@ class KeyStoreError(RuntimeError):
 
 
 class KeyStore(Protocol):
-    """Records by name. `get` is what a restart would find, which lags `put` and `remove`."""
+    """Records by name. `get` and `all` are what a restart would find, which lags `put` and
+    `remove`; `names` asks the store itself, so it shows a record before a restart could."""
 
     def get(self, name: str) -> dict | None: ...
 
     def all(self) -> dict[str, dict]: ...
+
+    def names(self) -> set[str]: ...
 
     def put(self, name: str, record: dict) -> None: ...
 
@@ -54,7 +57,7 @@ class KeyStore(Protocol):
 def _http(method: str, url: str, headers: dict, body: dict | None, params: dict | None) -> tuple[int, dict]:
     try:
         resp = httpx.request(method, url, headers=headers, json=body, params=params, timeout=10.0)
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
         raise KeyStoreError(f"the secret store did not answer: {exc.__class__.__name__}") from exc
     try:
         data = resp.json() if resp.content else {}
@@ -74,10 +77,14 @@ class SeroKeys:
 
     def __init__(self, url: str, audience: str, namespace: str, acting_email: str, directory: str, *,
                  token: Callable[[str], str], app: str = SERO_DEFAULT_APP, secret: str = "bab-datadog-keys",
-                 path: str | None = None, http=None):
+                 path: str | None = None, http=None, k8s_namespace: str | None = None):
         self.url, self.audience, self.namespace = url.rstrip("/"), audience, namespace
         self.acting_email, self.directory, self.token = acting_email, directory, token
         self.app, self.secret = app, secret
+        # Where bab runs, when it knows. sero delivers to the namespace named after the
+        # application unless told; naming it turns a Secret delivered somewhere bab cannot
+        # mount it into a refusal bab can log.
+        self.k8s_namespace = k8s_namespace
         self.path = path or f"apps/{app}/datadog-keys"
         self.http = http or _http
         self._delivered = False
@@ -108,8 +115,9 @@ class SeroKeys:
               absent_ok: bool = False) -> dict | None:
         try:
             bearer = self.token(self.audience)
-        except RuntimeError as exc:
-            raise KeyStoreError(f"{what}: no identity token for the secret store ({exc})") from exc
+        except Exception as exc:  # a token file that is not there is an OSError, not a refusal
+            said = exc if isinstance(exc, RuntimeError) else exc.__class__.__name__
+            raise KeyStoreError(f"{what}: no identity token for the secret store ({said})") from exc
         status, data = self.http(method, f"{self.url}{route}",
                                  {"Authorization": f"Bearer {bearer}", "Accept": "application/json"}, body, params)
         if absent_ok and status == 404:
@@ -130,13 +138,14 @@ class SeroKeys:
 
     def _deliver(self) -> None:
         """Ask sero to deliver the path to bab's namespace, once per process. A refusal is
-        logged and asked again with the next write: the key is stored either way, and what
-        is lost without delivery is only that a restart makes a new one."""
+        logged and asked again with the next write. The key is stored either way; until it
+        is delivered a restart cannot read it, and the agent's leases get a key of their own."""
         if self._delivered:
             return
         try:
             report = self._send("POST", "/api/service/sync", f"could not deliver {self.path} to the cluster",
                                 {**self._where(), "app": self.app, "name": self.secret, "target_name": self.secret,
+                                 **({"k8s_namespace": self.k8s_namespace} if self.k8s_namespace else {}),
                                  "refresh_interval": SERO_REFRESH, "apply": True}) or {}
             blocked = [b for b in report.get("blocked") or [] if isinstance(b, str)]
             if blocked:
@@ -146,20 +155,33 @@ class SeroKeys:
             return
         self._delivered = True
 
+    def names(self) -> set[str]:
+        """What sero holds at the path right now (it gives names, never values)."""
+        held = self._send("GET", "/api/service/secrets", f"could not read which keys are stored at {self.path}",
+                          params=self._where(), absent_ok=True)
+        return {k for k in (held or {}).get("keys") or [] if isinstance(k, str)}
+
     def remove(self, name: str) -> None:
         """Take one record out. sero refuses a merge that would leave a path empty, so the
         last record goes with its path."""
-        held = self._send("GET", "/api/service/secrets", f"could not read which keys are stored at {self.path}",
-                          params=self._where(), absent_ok=True)
-        names = [k for k in (held or {}).get("keys") or [] if isinstance(k, str)]
+        names = self.names()
         if name not in names:
             return
         what = f"could not remove {name} from {self.path}"
-        if names == [name]:
+        if names == {name}:
             self._send("DELETE", "/api/service/secrets", what, {**self._where(), "apply": True})
         else:
             self._send("POST", "/api/service/secrets", what,
                        {**self._where(), "values": {}, "remove_keys": [name], "apply": True})
+
+
+def _own_namespace(path: str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace") -> str | None:
+    """The Kubernetes namespace this process runs in, or None outside a cluster."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 
 def sero_keys_from_env(env, directory: str, token: Callable[[str], str]) -> SeroKeys | None:
@@ -174,4 +196,4 @@ def sero_keys_from_env(env, directory: str, token: Callable[[str], str]) -> Sero
                         SERO_URL_ENV, SERO_AUDIENCE_ENV, SERO_NAMESPACE_ENV, SERO_ACTING_EMAIL_ENV)
         return None
     return SeroKeys(url, audience, namespace, email, directory, token=token,
-                    app=env.get(SERO_APP_ENV, "").strip() or SERO_DEFAULT_APP)
+                    app=env.get(SERO_APP_ENV, "").strip() or SERO_DEFAULT_APP, k8s_namespace=_own_namespace())

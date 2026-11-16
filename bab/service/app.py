@@ -245,6 +245,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     # new vendor session each time. Memory only; a restart simply mints afresh.
     live: dict[tuple[str, str, tuple[str, ...]], tuple[int, dict, float, str]] = {}
     LIVE_MARGIN_S = 120
+    # How often a lease also checks every kept key against the ledger (`settle_kept`).
+    SETTLE_EVERY_S = 300
+    settled = {"at": 0.0}
 
     def is_member(actor: str, team: str) -> bool:
         try:
@@ -354,14 +357,15 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def disconnect(s, row: Integration, actor: str, now: datetime) -> tuple[int, int]:
         """Take one integration out of the ledger: every active grant on it revoked, every request
         still waiting on it withdrawn, the row deleted. The tuples naming it are the caller's to
-        delete from the store. A key a minter kept for an agent there goes with the agent's
-        grants. Returns how many grants and requests that was."""
+        delete from the store. Every key a minter kept there goes, whether or not its agent
+        still holds a grant: one whose delete was refused earlier would otherwise outlive the
+        connection that could delete it. Returns how many grants and requests that was."""
         revoked, holders = 0, set()
         for g in ledger.active_grants_on(s, row.id):
             g.revoked_at, g.revoked_by = now, actor
             revoked += 1
             holders.add(g.agent)
-        for agent in sorted(holders):
+        for agent in sorted(holders | {agent for _, agent, integration in kept_keys() if integration == row.id}):
             drop_standing(agent, row.id)
         withdrawn = withdraw_all(s, row.id, actor, now)
         s.delete(row)
@@ -511,6 +515,32 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             drop = getattr(m, "drop", None)
             if drop is not None:
                 drop(agent, integration)
+
+    def kept_keys() -> list[tuple[Minter, str, str]]:
+        """(minter, agent, integration) of every key a minter keeps across leases."""
+        found = []
+        for m in minters.values():
+            kept = getattr(m, "kept", None)
+            if kept is not None:
+                found.extend((m, agent, integration) for agent, integration in kept())
+        return found
+
+    def settle_kept(s, now: datetime, force: bool = False) -> None:
+        """Check every kept key against what the ledger says its agent holds now, at most every
+        SETTLE_EVERY_S unless forced. `drop_standing` is told of a change once, when it
+        happens; this is what tries again a delete the vendor refused then, and what takes a
+        key whose grant ran out, or whose connection went, while its agent was not asking."""
+        if not force and now.timestamp() - settled["at"] < SETTLE_EVERY_S:
+            return
+        settled["at"] = now.timestamp()
+        cutoff = rfc3339(now)
+        for m, agent, integration in kept_keys():
+            holds = None
+            if s.get(Integration, integration) is not None:
+                names = [g.permission for g in ledger.active_grants(s, agent, integration)
+                         if not g.gated and not (g.expires_at and g.expires_at <= cutoff)]
+                holds = [a for a in map(cat.action, names) if a]
+            m.settle(agent, integration, holds)
 
     def end_live(s, agent: str, integration: str, now: datetime) -> int:
         """End what `agent` holds on `integration` right now. A grant or a revoke changes
@@ -1139,6 +1169,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         context = {"current_time": rfc3339(now)}
         with ledger.session() as s:
             end_expired(s, now)
+            settle_kept(s, now)
             if body.on_behalf_of:
                 # The second wall (the runtime is the first): whatever either side holds, a
                 # task that arrived from another agent gets no credential. Recorded, refused.
@@ -1230,6 +1261,25 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                              permissions=[a.name for a in granted], reason=str(exc), error=str(exc), via=via)
                 s.commit()
                 raise HTTPException(502, f"no lease: {exc}") from exc
+            # Asked again now that the credential exists. A revoke that landed between the
+            # check above and the mint found nothing to end, and what was just made would
+            # carry what it took back: for a kept key, until the agent's next change.
+            try:
+                still = all(store.check(f"agent:{agent}", a.name, obj(iid), context) for a in granted)
+            except StoreError:
+                still = None
+            if not still:
+                if still is False:
+                    drop_standing(agent, iid)
+                try:
+                    minter.end(minted.handle)
+                except MintError as exc:
+                    log.warning("the credential of a lease that was not given could not be ended: %s", exc)
+                reason = "the store cannot answer" if still is None else "access changed while this lease was made"
+                ledger.event(s, now, "lease.failed", agent, agent=agent, integration=iid,
+                             permissions=[a.name for a in granted], reason=reason, error=reason, via=via)
+                s.commit()
+                raise HTTPException(503 if still is None else 409, f"no lease: {reason}; ask again")
             expires = datetime.fromtimestamp(minted.expires_at, tz=UTC)
             lease = Lease(agent=agent, integration=iid, permissions=[a.name for a in granted],
                           task=body.task, minter=integ.vendor, issued_at=now, expires_at=expires, handle=minted.handle,
@@ -1340,6 +1390,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             raise HTTPException(503, f"the store cannot answer: {exc}") from exc
         with ledger.session() as s:
             ended = end_expired(s, now)
+            settle_kept(s, now, force=True)
             ledger.event(s, now, "sweep", caller.actor, tuples=len(dead), leases_ended=ended)
             s.commit()
         return {"expired_tuples_deleted": len(dead), "leases_ended": ended}

@@ -71,12 +71,17 @@ class FakeDatadog:
     records every call, hands out key ids, forgets a key on DELETE, 404s one already gone,
     and says whether it has a key that is asked for by id. A read made with a key it handed
     out is refused `slow` times before it is answered, the way Datadog refuses a new key for
-    a moment. `keep` makes it refuse every DELETE."""
+    a moment. A key belongs to the service account it was made on and is not found under
+    another, and a service account has one key per name (a second create answers 409, as
+    Datadog does). `keep` makes it refuse every DELETE; `mute` makes it answer 500 when
+    asked whether it has a key."""
 
     def __init__(self, refuse: str | None = None, slow: int = 0):
         self.keep = False
+        self.mute = False
         self.calls: list[tuple[str, str, dict | None]] = []
         self.keys: dict[str, dict] = {}
+        self.accounts: dict[str, str] = {}  # key id -> the service account it was made on
         self.refuse = refuse  # an error sentence Datadog answers every create with
         self.slow = slow
         self.refusals: dict[str, int] = {}  # key id -> reads still to refuse
@@ -88,8 +93,12 @@ class FakeDatadog:
         self.calls.append((method, url, body))
         self.headers.append(dict(headers))
         self.last_headers = dict(headers)
+        account = url.partition("/service_accounts/")[2].partition("/")[0]
         if method == "GET" and "/application_keys/" in url:
-            return (200, {"data": {"id": url.rpartition("/")[2]}}) if url.rpartition("/")[2] in self.keys else (404, {"errors": ["Not found"]})
+            if self.mute:
+                return 500, {"errors": ["Internal error"]}
+            kid = url.rpartition("/")[2]
+            return (200, {"data": {"id": kid}}) if self._has(kid, account) else (404, {"errors": ["Not found"]})
         if method == "GET":
             kid = str(headers.get("DD-APPLICATION-KEY", "")).removeprefix("secret-")
             if kid not in self.keys or self.refusals.get(kid, 0) > 0:
@@ -100,39 +109,54 @@ class FakeDatadog:
         if method == "POST":
             if self.refuse:
                 return 403, {"errors": [{"title": "Forbidden", "detail": self.refuse}]}
+            attrs = body["data"]["attributes"]
+            if any(k["name"] == attrs["name"] and self.accounts.get(i) == account for i, k in self.keys.items()):
+                return 409, {"errors": [f"An application key with the name {attrs['name']} already exists"]}
             self.n += 1
             kid = f"kid-{self.n}"
-            attrs = body["data"]["attributes"]
             self.keys[kid] = {"name": attrs["name"], "scopes": list(attrs["scopes"])}
+            self.accounts[kid] = account
             self.refusals[kid] = self.slow
             return 201, {"data": {"type": "application_keys", "id": kid,
                                   "attributes": {**self.keys[kid], "key": f"secret-{kid}"}}}
         if method == "DELETE":
             if self.keep:
                 return 500, {"errors": ["Internal error"]}
-            return (204, {}) if self.keys.pop(key_id, None) is not None else (404, {"errors": ["Not found"]})
+            if not self._has(key_id, account):
+                return 404, {"errors": ["Not found"]}
+            del self.keys[key_id]
+            return 204, {}
         return 405, {"errors": ["method"]}
+
+    def _has(self, kid: str, account: str) -> bool:
+        return kid in self.keys and self.accounts.get(kid) == account
 
 
 class FakeKeys:
     """A key store as a minter sees it. `stored` is what the store holds; `mounted` is what a
-    restart would read, which is `stored` as of the last `deliver()`. `broken` refuses writes."""
+    restart would read, which is `stored` as of the last `deliver()`. `broken` refuses every
+    call to the store itself, with `error` when one is given."""
 
     def __init__(self):
         self.stored: dict[str, dict] = {}
         self.mounted: dict[str, dict] = {}
         self.broken = False
+        self.error: Exception | None = None
 
     def _guard(self):
         if self.broken:
             from bab.service.keys import KeyStoreError
-            raise KeyStoreError("the secret store answered HTTP 503")
+            raise self.error or KeyStoreError("the secret store answered HTTP 503")
 
     def get(self, name):
         return copy.deepcopy(self.mounted.get(name))
 
     def all(self):
         return copy.deepcopy(self.mounted)
+
+    def names(self):
+        self._guard()
+        return set(self.stored)
 
     def put(self, name, record):
         self._guard()
