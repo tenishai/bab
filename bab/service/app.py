@@ -40,6 +40,11 @@ AGENTS_VENDOR = "agents"
 # Vendors whose credential is narrowed to an integration's `repositories`: the only ones where
 # a child under the connection is a smaller thing than the connection, and so an owner's to pick.
 REPOSITORY_SET_VENDORS = frozenset({"github"})
+# A repository set may instead be every repository the connection can see (`spec.all_repositories`),
+# for Read alone: an agent that reads code across the organization needs no list kept up to date,
+# and nothing it holds there can change a repository.
+ALL_REPOSITORIES = "all_repositories"
+EVERY = "every repository"
 A2A_ASK = "a2a_ask"
 NO_BORROWING = "a credential is never borrowed for another agent's task"
 NOT_GRANTED = "not granted"
@@ -279,52 +284,82 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         return sorted({g.permission for g in ledger.active_grants_on(s, integration)}
                       | {p for r in asked_levels(s, integration) for p in r.permissions})
 
-    def repository_set_or_403(s, integration: str, body: IntegrationBody, caller: Caller) -> tuple[list[str], list[str]]:
+    def every_repository(spec: dict | None) -> bool:
+        return (spec or {}).get(ALL_REPOSITORIES) is True
+
+    def with_set(spec: dict | None, pick: dict) -> dict:
+        """`spec` with its repository set replaced by `pick`: a list, or every repository."""
+        return {**{k: v for k, v in (spec or {}).items() if k not in ("repositories", ALL_REPOSITORIES)}, **pick}
+
+    def beyond_read(names) -> list[str]:
+        """Of these permissions, the ones that are more than Read: none may reach every repository."""
+        return sorted({p for p in names if cat.action(p) is None or cat.action(p).tier != "read"})
+
+    def read_alone_or_409(s, integration: str) -> None:
+        """Every repository is for Read alone: a set that holds or is asked for more stays named."""
+        over = beyond_read(levels_on(s, integration))
+        if over:
+            raise HTTPException(409, f"{EVERY} is for Read alone, and this set holds or is asked for "
+                                     f"{', '.join(over)}: take that back first, or keep a picked set")
+
+    def repository_set_or_403(s, integration: str, body: IntegrationBody, caller: Caller) -> tuple[dict, bool]:
         """The one integration a caller who is no reviewer may write: an agent's repository set
-        under a service connection (github-<agent> under github), and of it the repositories
-        alone. Picking repositories grants nothing: a level on the set is still a reviewer's
-        decision, made looking at the set. So the set must name repositories (an empty one would
-        be the whole connection), and once it carries a grant, or a level request a reviewer has
-        yet to decide, a repository added to it is one no reviewer looked at: those wait for one
-        (`ask_for_repositories`) instead of landing. Returns the set as named (trimmed, each
-        name once) and what must wait. A new set's ceiling is not held to the connection's: that
-        one bounds a grant on the whole connection, and a level on a set is asked for and
-        decided like any other."""
+        under a service connection (github-<agent> under github), and of it the set alone:
+        named repositories, or every repository the connection can see (`all_repositories`),
+        which is for Read alone. Picking grants nothing: a level on the set is still a
+        reviewer's decision, made looking at the set. So the set must name repositories or say
+        every one (an empty list is the whole connection by accident, not by choice), and once
+        it carries a grant, or a level request a reviewer has yet to decide, what widens it (a
+        repository added, or every repository) is what no reviewer looked at: that waits for
+        one (`ask_for_repositories`) instead of landing. Narrowing needs nobody, so every
+        repository back to a named set lands. Returns the set asked for, as a spec fragment
+        (names trimmed, each once), and whether it waits. A new set's ceiling is not held to
+        the connection's: that one bounds a grant on the whole connection, and a level on a set
+        is asked for and decided like any other."""
         no = f"{caller.actor} is not on the admin or security team"
         parent = s.get(Integration, body.parent) if body.parent else None
+        every = every_repository(body.spec)
         repos = body.spec.get("repositories")
         # A name is what is left after the owner (the minter drops it): "acme/" names nothing.
         named = isinstance(repos, list) and bool(repos) and all(
             isinstance(r, str) and r.strip().rsplit("/", 1)[-1] for r in repos)
         if (body.vendor not in REPOSITORY_SET_VENDORS or parent is None or parent.vendor != body.vendor
-                or parent.kind != "connection" or not named):
+                or parent.kind != "connection" or not (named or every)):
             raise HTTPException(403, no)
-        wanted = list(dict.fromkeys(r.strip() for r in repos))
         # Locked: two picks, or a pick and an approval, decide one after the other.
         row = s.get(Integration, integration, with_for_update=True)
-        if row is None:
-            return wanted, []
-        if row.parent != body.parent or row.vendor != body.vendor:
+        if row is not None and (row.parent != body.parent or row.vendor != body.vendor):
             raise HTTPException(403, no)
+        watched = row is not None and bool(ledger.active_grants_on(s, integration) or asked_levels(s, integration))
+        if every:
+            if row is not None:
+                read_alone_or_409(s, integration)
+            return {ALL_REPOSITORIES: True}, watched and not every_repository(row.spec)
+        wanted = list(dict.fromkeys(r.strip() for r in repos))
+        if row is None or every_repository(row.spec):
+            return {"repositories": wanted}, False
         before = set((row.spec or {}).get("repositories") or [])
-        added = sorted(set(wanted) - before)
-        watched = ledger.active_grants_on(s, integration) or asked_levels(s, integration)
-        return wanted, (added if before and watched else [])
+        return {"repositories": wanted}, bool(before and watched and set(wanted) - before)
 
-    def ask_for_repositories(s, row: Integration, wanted: list[str], added: list[str], caller: Caller,
-                             now: datetime) -> tuple[Request, bool]:
-        """An owner's pick that adds to a set already carrying grants. What the pick drops leaves
-        the set now (narrowing needs nobody); what it adds waits as one request of kind
-        `repositories` that a reviewer decides, a later pick replacing it. A pick that keeps
-        nothing of the set is not applied in part (it would empty the set, which means the whole
-        connection): the request then carries what to remove as well. Returns the request and
-        whether the set narrowed."""
+    def ask_for_repositories(s, row: Integration, pick: dict, caller: Caller, now: datetime) -> tuple[Request, bool]:
+        """An owner's pick that widens a set already carrying grants. What the pick drops leaves
+        the set now (narrowing needs nobody); what it adds, or every repository, waits as one
+        request of kind `repositories` that a reviewer decides, a later pick replacing it. A
+        pick that keeps nothing of the set is not applied in part (it would empty the set,
+        which means the whole connection): the request then carries what to remove as well.
+        Returns the request and whether the set narrowed."""
         before = list((row.spec or {}).get("repositories") or [])
-        kept = [r for r in before if r in wanted]
-        narrowed = bool(kept) and len(kept) != len(before)
-        if narrowed:
-            row.spec, row.updated_at = {**row.spec, "repositories": kept}, now
-        proposal = {"added": added, "removed": [] if kept else sorted(before)}
+        if every_repository(pick):
+            added, narrowed = [], False
+            proposal: dict = {"all": True, "added": [], "removed": []}
+        else:
+            wanted = pick["repositories"]
+            added = sorted(set(wanted) - set(before))
+            kept = [r for r in before if r in wanted]
+            narrowed = bool(kept) and len(kept) != len(before)
+            if narrowed:
+                row.spec, row.updated_at = {**row.spec, "repositories": kept}, now
+            proposal = {"added": added, "removed": [] if kept else sorted(before)}
         # The levels the new repositories would be reached with: what a reviewer is saying yes to.
         # Read again whenever the request is shown (`request_summary`), frozen when it is decided.
         holders = [g.agent for g in ledger.active_grants_on(s, row.id)] + [r.agent for r in asked_levels(s, row.id)]
@@ -337,7 +372,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         req.agent, req.permissions = min(holders), levels
         req.requested_by, req.proposal = caller.actor, proposal
         ledger.event(s, now, "request.created", caller.actor, agent=req.agent, integration=row.id,
-                     repositories=len(added))
+                     repositories=EVERY if proposal.get("all") else len(added))
         return req, narrowed
 
     def withdraw_repositories(s, integration: str, actor: str, now: datetime) -> None:
@@ -406,10 +441,12 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def apply_repositories(s, req: Request, who: dict[str, bool], actor: str, now: datetime) -> set[str]:
         """Approve a `repositories` request: the set takes what was asked. The reviewer is saying
         yes to every level held on the set reaching the new repositories, so the destroy tier
-        takes the security team here as it does on a grant. Returns the agents holding grants on
-        the set, whose credential in hand no longer matches it."""
+        takes the security team here as it does on a grant, and every repository is refused
+        while the set holds or is asked for more than Read. Returns the agents holding grants
+        on the set, whose credential in hand no longer matches it."""
         row = s.get(Integration, req.integration, with_for_update=True)
         change = req.proposal or {}
+        every = change.get("all") is True
         added, removed = list(change.get("added") or []), list(change.get("removed") or [])
         held = ledger.active_grants_on(s, req.integration) if row is not None else []
         why = None
@@ -417,10 +454,16 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             why = "the repository set is gone"
         elif not who["security"] and any(cat.action(g.permission) and cat.action(g.permission).tier == "destroy" for g in held):
             why = "the destroy tier needs the security team"
+        elif every and beyond_read(levels_on(s, req.integration)):
+            why = f"{EVERY} is for Read alone, and the set holds or is asked for more"
         if why:
-            req.status, req.outcome = "refused", {r: f"refused: {why}" for r in added}
+            req.status, req.outcome = "refused", {r: f"refused: {why}" for r in ([EVERY] if every else added)}
             return set()
         req.permissions = sorted({g.permission for g in held})  # what the yes was said to
+        if every:
+            row.spec, row.updated_at = with_set(row.spec, {ALL_REPOSITORIES: True}), now
+            req.status, req.outcome = "approved", {EVERY: "added"}
+            return {g.agent for g in held}
         before = set((row.spec or {}).get("repositories") or [])
         row.spec, row.updated_at = {**(row.spec or {}), "repositories": sorted((before - set(removed)) | set(added))}, now
         req.status, req.outcome = "approved", {**{r: "removed" for r in removed}, **{r: "added" for r in added}}
@@ -633,13 +676,15 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         with ledger.session() as s:
             there = s.get(Integration, integration)
             room_fact = body.vendor == AGENTS_VENDOR and (there is None or there.vendor == AGENTS_VENDOR)
-            picked: list[str] | None = None  # an owner's pick: the repositories, and nothing else of the body
-            waiting: list[str] = []
+            picked: dict | None = None  # an owner's pick: the repository set, and nothing else of the body
+            waits = False
             if not (room_fact or is_reviewer(caller)):
-                picked, waiting = repository_set_or_403(s, integration, body, caller)
-            if waiting:
+                picked, waits = repository_set_or_403(s, integration, body, caller)
+            elif every_repository(body.spec) and s.get(Integration, integration) is not None:
+                read_alone_or_409(s, integration)  # a reviewer's write is held to the same rule
+            if waits:
                 row = s.get(Integration, integration)
-                req, narrowed = ask_for_repositories(s, row, picked, waiting, caller, now)
+                req, narrowed = ask_for_repositories(s, row, picked, caller, now)
                 if narrowed:
                     stale = {(g.agent, integration) for g in ledger.active_grants_on(s, integration)}
                     for agent, _ in sorted(stale):
@@ -650,8 +695,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 forget_live(stale)
                 return JSONResponse(status_code=202, content={
                     "integration": integration, "vendor": row.vendor, "ceiling": list(row.ceiling),
-                    "parent": row.parent, "kind": row.kind, "repositories": list(row.spec["repositories"]),
-                    "pending": request_summary(req)})
+                    "parent": row.parent, "kind": row.kind, "repositories": list((row.spec or {}).get("repositories") or []),
+                    "all_repositories": every_repository(row.spec), "pending": request_summary(req)})
             if body.parent:
                 if body.parent == integration:
                     raise HTTPException(422, "an integration cannot be its own parent")
@@ -661,16 +706,17 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 if parent is None or parent.vendor != body.vendor or parent.kind not in ("org", "connection"):
                     raise HTTPException(422, f"{body.parent!r} is not a connected {body.vendor} organization or service connection")
             row = s.get(Integration, integration)
-            spec = body.spec if picked is None else {"repositories": picked}
+            spec = body.spec if picked is None else picked
             if row is None:
                 row = Integration(id=integration, vendor=body.vendor, created_at=now)
                 s.add(row)
             else:
                 if picked is not None:
-                    spec, names = {**(row.spec or {}), "repositories": picked}, list(row.ceiling)
+                    spec, names = with_set(row.spec, picked), list(row.ceiling)
                 # The set stated whole, changed or not: a pick still waiting on it is taken back.
                 withdraw_repositories(s, integration, caller.actor, now)
-                if (row.spec or {}).get("repositories") != spec.get("repositories"):
+                if ((row.spec or {}).get("repositories"), every_repository(row.spec)) != (
+                        spec.get("repositories"), every_repository(spec)):
                     # The set an agent's credential is narrowed to changed: the one in hand is for the old set.
                     stale = {(g.agent, integration) for g in ledger.active_grants_on(s, integration)}
                     for agent, _ in sorted(stale):
@@ -947,6 +993,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                                   "parent_resource": (r.spec or {}).get("parent_resource") if r.kind == "org" else None,
                                   # A service child's repository set, so a console can show what it narrows to.
                                   "repositories": list((r.spec or {}).get("repositories") or []) or None,
+                                  # Or every repository the connection can see, for Read alone.
+                                  "all_repositories": every_repository(r.spec),
                                   # An organization's hub ARN is not a secret; a console needs it to
                                   # render the trust a member account's role must carry.
                                   "hub_role_arn": (r.spec or {}).get("hub_role_arn") if r.kind == "org" else None,
@@ -1053,6 +1101,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         with ledger.session() as s:
             integ = integration_or_404(s, body.integration)
             acts = permissions_or_422(body.permissions, integ.vendor)
+            over = beyond_read(a.name for a in acts) if every_repository(integ.spec) else []
+            if over:
+                raise HTTPException(409, f"{EVERY} is for Read alone: {', '.join(over)} needs a picked set of repositories")
             req = Request(agent=body.agent, integration=body.integration, permissions=[a.name for a in acts],
                           requested_by=caller.actor, note=body.note, created_at=now)
             s.add(req)
@@ -1107,9 +1158,14 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                         changed |= fresh
                     results.append(result)
                     continue
+                on = s.get(Integration, req.integration)
+                over = beyond_read(req.permissions) if on is not None and every_repository(on.spec) else []
+                if over:  # asked before the set became every repository
+                    req.outcome = {p: f"refused: {EVERY} is for Read alone" for p in over}
+                    req.permissions = [p for p in req.permissions if p not in over]
                 destroy = [p for p in req.permissions if (cat.action(p) and cat.action(p).tier == "destroy")]
                 if destroy and not who["security"]:
-                    req.outcome = {p: "refused: the destroy tier needs the security team" for p in destroy}
+                    req.outcome = {**(req.outcome or {}), **{p: "refused: the destroy tier needs the security team" for p in destroy}}
                     req.permissions = [p for p in req.permissions if p not in destroy]
                 expires = (now + timedelta(hours=LEASE_REQUEST_HOURS)) if req.kind == "lease" else "tier"
                 outcome = write_grants(s, req, caller.actor, now, expires)

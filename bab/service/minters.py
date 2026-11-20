@@ -1141,6 +1141,12 @@ class GitHubMinter:
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
         cfg = self.config()
+        # Every repository the installation can see is for Read alone. The service refuses more on
+        # such a set; minting from the read-tier permissions alone keeps the token read-only even
+        # if a row ever said otherwise.
+        every = (spec or {}).get("all_repositories") is True
+        if every:
+            permissions = [p for p in permissions if p.tier == "read"]
         perms = gh_permissions(permissions)
         if not perms:  # a token with no permissions named would be the app's whole set
             raise MintError("none of the granted permissions names a GitHub App permission; nothing to mint")
@@ -1148,14 +1154,17 @@ class GitHubMinter:
         # `owner/name`: the owner is the installation's. A console that stores
         # the full name (the room's picker does) would get a 422 "repository
         # does not exist" for every lease, so the owner is dropped here.
-        repos = [str(r).strip().rsplit("/", 1)[-1] for r in ((spec or {}).get("repositories") or []) if str(r).strip()]
+        repos = [] if every else [
+            str(r).strip().rsplit("/", 1)[-1] for r in ((spec or {}).get("repositories") or []) if str(r).strip()]
         now = self.now()
         token, github_ends = self._token(cfg, perms, repos)
         ends = now + max(1, min(int(seconds), GH_MAX_SECONDS))
         if github_ends:
             ends = min(ends, github_ends)
         note = "installation token narrowed to the granted permissions"
-        if repos:
+        if every:
+            note = "read-only installation token for every repository the installation can see"
+        elif repos:
             note += f" and {len(repos)} repositor{'y' if len(repos) == 1 else 'ies'}"
         return Minted(credential={"github_token": token, "github_api_url": cfg.api_url},
                       expires_at=ends, handle={}, note=note)

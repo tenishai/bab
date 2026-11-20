@@ -4,6 +4,23 @@ All notable changes to bab are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **A repository set can be every repository, for Read alone.** An agent that reads code across
+  an organization had to have every repository picked by name, and a new repository waited for
+  someone to add it. A child of a service connection may now say `all_repositories: true`: the
+  token is an installation token with no repository list and only the read tier's permissions.
+  Nothing on such a set can change a repository:
+  - a level beyond Read is refused when it is asked for, and again when it is decided;
+  - a set that holds or awaits more than Read cannot become every repository, whoever writes it;
+  - the minter mints from the read-tier permissions alone, whatever the row says.
+
+  An owner picks it as they pick repositories. Once the set carries a grant, every repository
+  widens it, so it waits for a reviewer as a `repositories` request with the proposal
+  `{"all": true}`. Back to named repositories is a narrowing and lands. `GET /integrations`
+  says `all_repositories` on each row.
+
 ## [0.4.25] - 2026-11-16
 
 ### Changed
