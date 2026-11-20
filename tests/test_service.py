@@ -917,7 +917,8 @@ def test_every_repository_is_for_read_alone_and_widening_a_watched_set_to_it_wai
         rows = {i["integration"]: i for i in c.get("/integrations", headers=OWNER).json()["integrations"]}
         return rows["github-watson"]["repositories"], rows["github-watson"]["all_repositories"]
 
-    assert put("github-watson", {"all_repositories": True}).status_code == 200
+    first = put("github-watson", {"all_repositories": True})
+    assert first.status_code == 200 and first.json()["all_repositories"] is True
     assert held() == (None, True)
     ask = {"agent": "watson", "integration": "github-watson", "permissions": ["github_pulls_review"]}
     r = c.post("/requests", json=ask, headers=OWNER)

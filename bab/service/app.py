@@ -745,7 +745,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             s.commit()
         forget_live(stale)
         return {"integration": integration, "vendor": body.vendor, "ceiling": names, "teams": teams,
-                "parent": body.parent, "kind": row.kind}
+                "parent": body.parent, "kind": row.kind, "all_repositories": every_repository(row.spec)}
 
     @app.put("/topology")
     def put_topology(body: TopologyBody, caller: Console):
