@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.26] - 2026-11-20
+
 ### Added
 - **A repository set can be every repository, for Read alone.** An agent that reads code across
   an organization had to have every repository picked by name, and a new repository waited for
@@ -23,7 +25,7 @@ All notable changes to bab are documented here. The format follows
   An owner picks it as they pick repositories. Once the set carries a grant, every repository
   widens it, so it waits for a reviewer as a `repositories` request with the proposal
   `{"all": true}`. Back to named repositories is a narrowing and lands. `GET /integrations`
-  says `all_repositories` on each row.
+  says `all_repositories` on each row, and the answer to a write says it back.
 
 ## [0.4.25] - 2026-11-16
 
