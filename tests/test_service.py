@@ -941,6 +941,12 @@ def test_every_repository_is_for_read_alone_and_widening_a_watched_set_to_it_wai
     for headers in (OWNER, ADMIN):
         r = put("github-ledger", {"all_repositories": True}, headers=headers)
         assert r.status_code == 409 and "github_pulls_review" in r.json()["detail"], r.text
+    # Only an agent's set says it, and never beside a list: on the connection every child would inherit it.
+    r = c.put("/integrations/github", headers=ADMIN, json={"vendor": "github", "spec": {"name": "github", "all_repositories": True},
+                                                          "ceiling": ["github_repos_read"]})
+    assert r.status_code == 422 and "under a service connection" in r.json()["detail"]
+    r = put("github-watson", {"all_repositories": True, "repositories": ["acme-web"]}, headers=ADMIN)
+    assert r.status_code == 422 and "not both" in r.json()["detail"]
 
 
 def test_a_database_born_before_repository_requests_gains_the_column(tmp_path):

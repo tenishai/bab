@@ -295,9 +295,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         """Of these permissions, the ones that are more than Read: none may reach every repository."""
         return sorted({p for p in names if cat.action(p) is None or cat.action(p).tier != "read"})
 
-    def read_alone_or_409(s, integration: str) -> None:
+    def read_alone_or_409(s, integration: str, levels: list[str] | None = None) -> None:
         """Every repository is for Read alone: a set that holds or is asked for more stays named."""
-        over = beyond_read(levels_on(s, integration))
+        over = beyond_read(levels_on(s, integration) if levels is None else levels)
         if over:
             raise HTTPException(409, f"{EVERY} is for Read alone, and this set holds or is asked for "
                                      f"{', '.join(over)}: take that back first, or keep a picked set")
@@ -330,10 +330,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         row = s.get(Integration, integration, with_for_update=True)
         if row is not None and (row.parent != body.parent or row.vendor != body.vendor):
             raise HTTPException(403, no)
-        watched = row is not None and bool(ledger.active_grants_on(s, integration) or asked_levels(s, integration))
+        # A set is watched when a level is held on it or asked for: what widens it waits for a reviewer.
+        levels = levels_on(s, integration) if row is not None else []
+        watched = bool(levels)
         if every:
-            if row is not None:
-                read_alone_or_409(s, integration)
+            read_alone_or_409(s, integration, levels)
             return {ALL_REPOSITORIES: True}, watched and not every_repository(row.spec)
         wanted = list(dict.fromkeys(r.strip() for r in repos))
         if row is None or every_repository(row.spec):
@@ -358,7 +359,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             kept = [r for r in before if r in wanted]
             narrowed = bool(kept) and len(kept) != len(before)
             if narrowed:
-                row.spec, row.updated_at = {**row.spec, "repositories": kept}, now
+                row.spec, row.updated_at = with_set(row.spec, {"repositories": kept}), now
             proposal = {"added": added, "removed": [] if kept else sorted(before)}
         # The levels the new repositories would be reached with: what a reviewer is saying yes to.
         # Read again whenever the request is shown (`request_summary`), frozen when it is decided.
@@ -372,7 +373,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         req.agent, req.permissions = min(holders), levels
         req.requested_by, req.proposal = caller.actor, proposal
         ledger.event(s, now, "request.created", caller.actor, agent=req.agent, integration=row.id,
-                     repositories=EVERY if proposal.get("all") else len(added))
+                     repositories=len(added), every=bool(proposal.get("all")))
         return req, narrowed
 
     def withdraw_repositories(s, integration: str, actor: str, now: datetime) -> None:
@@ -465,7 +466,7 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
             req.status, req.outcome = "approved", {EVERY: "added"}
             return {g.agent for g in held}
         before = set((row.spec or {}).get("repositories") or [])
-        row.spec, row.updated_at = {**(row.spec or {}), "repositories": sorted((before - set(removed)) | set(added))}, now
+        row.spec, row.updated_at = with_set(row.spec, {"repositories": sorted((before - set(removed)) | set(added))}), now
         req.status, req.outcome = "approved", {**{r: "removed" for r in removed}, **{r: "added" for r in added}}
         return {g.agent for g in held}
 
@@ -676,6 +677,15 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
         with ledger.session() as s:
             there = s.get(Integration, integration)
             room_fact = body.vendor == AGENTS_VENDOR and (there is None or there.vendor == AGENTS_VENDOR)
+            if every_repository(body.spec):
+                # Only an agent's set under a service connection: on the connection itself every child's
+                # credential would inherit it, and a list beside it would say two things at once.
+                home = s.get(Integration, body.parent) if body.parent else None
+                if (body.vendor not in REPOSITORY_SET_VENDORS or home is None or home.vendor != body.vendor
+                        or home.kind != "connection"):
+                    raise HTTPException(422, f"{EVERY} is for an agent's repository set under a service connection")
+                if body.spec.get("repositories"):
+                    raise HTTPException(422, f"name repositories or ask for {EVERY}, not both")
             picked: dict | None = None  # an owner's pick: the repository set, and nothing else of the body
             waits = False
             if not (room_fact or is_reviewer(caller)):
@@ -1099,7 +1109,10 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
     def post_request(body: RequestBody, caller: Console):
         now = settings.now()
         with ledger.session() as s:
-            integ = integration_or_404(s, body.integration)
+            # Locked, as a pick is: the set cannot become every repository between this read and the commit.
+            integ = s.get(Integration, body.integration, with_for_update=True)
+            if integ is None:
+                raise HTTPException(404, f"no integration {body.integration!r}")
             acts = permissions_or_422(body.permissions, integ.vendor)
             over = beyond_read(a.name for a in acts) if every_repository(integ.spec) else []
             if over:
@@ -1151,8 +1164,9 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                     req.decided_at, req.decided_by, req.reason = now, caller.actor, body.reason
                     result = {"id": rid, "status": req.status, "outcome": req.outcome}
                     if req.status == "approved":
+                        every = bool((req.proposal or {}).get("all"))
                         ledger.event(s, now, "integration.put", caller.actor, integration=req.integration,
-                                     request=req.id, repositories=len(req.outcome))
+                                     request=req.id, repositories=0 if every else len(req.outcome), every=every)
                         fresh = {(a, req.integration) for a in holders} - changed
                         result["leases_ended"] = sum(end_live(s, a, i, now) for a, i in sorted(fresh))
                         changed |= fresh
@@ -1274,7 +1288,8 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                 elif parent is not None:
                     # A child of a service connection: the connection's spec, narrowed by the child's own
                     # (its `repositories`); the minter's credentials come from bab's mounted Secret either way.
-                    mint_spec = {**dict(parent.spec or {}), **{k: v for k, v in mint_spec.items() if v is not None}}
+                    mint_spec = {**{k: v for k, v in (parent.spec or {}).items() if k != ALL_REPOSITORIES},
+                                 **{k: v for k, v in mint_spec.items() if v is not None}}
             wanted = permissions_or_422(body.permissions, integ.vendor) if body.permissions else [
                 cat.action(g.permission) for g in ledger.active_grants(s, agent, iid)
                 if cat.action(g.permission) and not g.gated]
@@ -1295,6 +1310,11 @@ def create_app(store: Store, cat: Catalogue, ledger: Ledger, agent_verifier, con
                         refused.append(a.name)
             except StoreError as exc:
                 raise HTTPException(503, f"no lease: the store cannot answer ({exc})") from exc
+            if every_repository(integ.spec):
+                # Every repository is for Read alone: what else the agent holds there is not leased,
+                # so the lease's ledger row and answer name only what the credential can do.
+                refused += [a.name for a in granted if a.tier != "read"]
+                granted = [a for a in granted if a.tier == "read"]
             pending = None
             if gated:
                 pending = Request(agent=agent, integration=iid, permissions=[a.name for a in gated],

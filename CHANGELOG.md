@@ -16,6 +16,10 @@ All notable changes to bab are documented here. The format follows
   - a set that holds or awaits more than Read cannot become every repository, whoever writes it;
   - the minter mints from the read-tier permissions alone, whatever the row says.
 
+  It is only ever an agent's set under a service connection, never the connection itself (every
+  child would inherit it) and never beside a list (422 either way). A lease on such a set carries
+  Read alone and names only that as granted.
+
   An owner picks it as they pick repositories. Once the set carries a grant, every repository
   widens it, so it waits for a reviewer as a `repositories` request with the proposal
   `{"all": true}`. Back to named repositories is a narrowing and lands. `GET /integrations`
