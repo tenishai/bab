@@ -687,6 +687,27 @@ def test_github_minter_narrows_an_installation_token_to_the_union(monkeypatch):
     assert m_.default_minters()["github"].name == "github"
 
 
+def test_github_minter_mints_every_repository_read_only_whatever_the_grant_names(monkeypatch):
+    """Gate: a set of every repository is for Read alone. The service refuses more on it; the
+    minter keeps the token read-only even if a row ever said otherwise, and narrows to no list."""
+    from bab.service.minters import GitHubMinter, MintError, gh_permissions
+    from tests.conftest import FakeGitHub
+
+    monkeypatch.setattr(GitHubMinter, "_jwt", lambda self, cfg: "app-jwt")
+    cat = catalogue.load("catalogues/room.yaml")
+    gh = FakeGitHub()
+    m = GitHubMinter.from_env({"GITHUB_APP_ID": "4242", "GITHUB_APP_INSTALLATION_ID": "777",
+                               "GITHUB_APP_PRIVATE_KEY": "k"}, http=gh)
+    held = [cat.action("github_repos_read"), cat.action("github_pulls_write")]
+    out = m.mint("sherlock", "github-sherlock", {"all_repositories": True, "repositories": ["infra"]}, held, 600)
+    body = gh.calls[-1][2]
+    assert body == {"permissions": gh_permissions([cat.action("github_repos_read")])}
+    assert set(body["permissions"].values()) == {"read"}
+    assert out.note == "read-only installation token for every repository the installation can see"
+    with pytest.raises(MintError, match="names a GitHub App permission"):
+        m.mint("sherlock", "github-sherlock", {"all_repositories": True}, [cat.action("github_pulls_write")], 600)
+
+
 def test_github_minter_reports_githubs_sentence_never_the_key_or_token(monkeypatch):
     from bab.service.minters import GitHubMinter, MintError, NotConfigured
     from tests.conftest import FakeGitHub

@@ -900,6 +900,56 @@ def test_an_owner_picks_an_agents_repositories_and_a_reviewer_still_decides_what
     assert held() == ["acme-infra", "acme-web"] and c.get("/requests", headers=OWNER).json()["requests"] == []
 
 
+def test_every_repository_is_for_read_alone_and_widening_a_watched_set_to_it_waits_for_a_reviewer(repos):
+    """Gate: an agent's repository set may be every repository the connection can see, for Read
+    alone. An owner picks it like a named set. A level beyond Read is refused on it; a set that
+    holds or is asked for more cannot become it, whoever writes it. Once the set carries a
+    grant, every repository is a widening no reviewer looked at, so it waits for one; back to
+    named repositories is a narrowing and lands."""
+    c, gh = repos
+
+    def put(name, spec, headers=OWNER):
+        return c.put(f"/integrations/{name}", headers=headers,
+                     json={"vendor": "github", "parent": "github", "spec": {"name": name, **spec},
+                           "ceiling": ["github_repos_read", "github_pulls_review", "github_pulls_write"]})
+
+    def held():
+        rows = {i["integration"]: i for i in c.get("/integrations", headers=OWNER).json()["integrations"]}
+        return rows["github-watson"]["repositories"], rows["github-watson"]["all_repositories"]
+
+    first = put("github-watson", {"all_repositories": True})
+    assert first.status_code == 200 and first.json()["all_repositories"] is True
+    assert held() == (None, True)
+    ask = {"agent": "watson", "integration": "github-watson", "permissions": ["github_pulls_review"]}
+    r = c.post("/requests", json=ask, headers=OWNER)
+    assert r.status_code == 409 and "Read alone" in r.json()["detail"]
+    grant(c, "watson", "github-watson", ["github_repos_read"])
+    lease = c.post("/leases/for-agent", json={"agent": "watson", "integration": "github"}, headers=GATEWAY)
+    assert lease.status_code == 200, lease.text
+    assert gh.minted[-1]["spec"]["all_repositories"] is True and "repositories" not in gh.minted[-1]["spec"]
+    # Back to a named set narrows, so it lands; widening the watched set again waits.
+    assert put("github-watson", {"repositories": ["acme-web"]}).status_code == 200 and held() == (["acme-web"], False)
+    r = put("github-watson", {"all_repositories": True})
+    assert r.status_code == 202 and r.json()["pending"]["proposal"] == {"all": True, "added": [], "removed": []}
+    assert held() == (["acme-web"], False)
+    assert c.post("/requests/decide", json={"ids": [r.json()["pending"]["id"]], "verdict": "approve"},
+                  headers=OWNER).status_code == 403
+    out = c.post("/requests/decide", json={"ids": [r.json()["pending"]["id"]], "verdict": "approve"},
+                 headers=ADMIN).json()["results"][0]
+    assert (out["status"], out["outcome"]) == ("approved", {"every repository": "added"}) and held() == (None, True)
+    # A set holding more than Read stays named, for an owner and for a reviewer.
+    grant(c, "ledger", "github-ledger", ["github_pulls_review"])
+    for headers in (OWNER, ADMIN):
+        r = put("github-ledger", {"all_repositories": True}, headers=headers)
+        assert r.status_code == 409 and "github_pulls_review" in r.json()["detail"], r.text
+    # Only an agent's set says it, and never beside a list: on the connection every child would inherit it.
+    r = c.put("/integrations/github", headers=ADMIN, json={"vendor": "github", "spec": {"name": "github", "all_repositories": True},
+                                                          "ceiling": ["github_repos_read"]})
+    assert r.status_code == 422 and "under a service connection" in r.json()["detail"]
+    r = put("github-watson", {"all_repositories": True, "repositories": ["acme-web"]}, headers=ADMIN)
+    assert r.status_code == 422 and "not both" in r.json()["detail"]
+
+
 def test_a_database_born_before_repository_requests_gains_the_column(tmp_path):
     """`create_all` never alters a table: a requests table from an older bab gets `proposal` at boot."""
     from sqlalchemy import create_engine, inspect, text
