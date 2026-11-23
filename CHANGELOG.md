@@ -10,6 +10,10 @@ All notable changes to bab are documented here. The format follows
 
 - **Licence: MIT.** The project moves from AGPL-3.0-or-later to MIT, with the agreement of every contributor (tenishai/agora discussion 69). Releases already published keep the licence they shipped under.
 
+### Fixed
+
+- `bab serve` ignores the `BAB_PORT=tcp://<ip>:<port>` Kubernetes injects for a Service named bab, and listens on 8080. It used to take that Service's port, so a Service on 80 in front of the container moved bab to 80 and every probe on 8080 was refused.
+
 ## [0.4.26] - 2026-11-20
 
 ### Added
