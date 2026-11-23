@@ -27,5 +27,5 @@ def test_port_from_env_ignores_kubernetes_service_links(monkeypatch):
     monkeypatch.setenv("BAB_PORT", "9000")
     assert _port_from_env() == 9000
     # A Service named bab on port 80 injects this; bab still listens on 8080.
-    monkeypatch.setenv("BAB_PORT", "tcp://10.140.5.222:80")
+    monkeypatch.setenv("BAB_PORT", "tcp://192.0.2.10:80")
     assert _port_from_env() == 8080
