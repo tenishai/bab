@@ -32,7 +32,7 @@ GOTCHAS:
 - Its grants exceed its ceilings (e.g. atlas configmap_update on a dev project with no ceiling_configmap_update). Legal: ceilings are checked at write time by bab/grants.py `grant`; the fixture is imported, not granted, and Door never checks them.
 - Syncs own WHOLE relations: okta owns `member`; topology owns `team`, `owner` and parent-link relations. A topology sync from a partial file deletes every link it didn't produce.
 - OpenFgaStore wraps check/list_users/list_objects errors in StoreError (door fails closed), but write/delete/read_all do not: a sync failure surfaces as a raw SDK exception.
-- The write gate with pinned assertions (README "every policy change is tested before it lands") is design, not code: nothing here runs assertions on a grant write.
+- The write gate with pinned assertions (README Status says so) is design, not code: nothing here runs assertions on a grant write.
 - docs/design.md is a design record: the console, deploy and SDK hook it describes are plans, not code.
 - bab is authorization, NOT the approval UX: it returns approvers; posting the plan and waiting for ✅ is the caller's job.
 RELATED DOCS: docs/design.md (increment one: data model, API sketch), docs/design-leases.md (proposal: bab as permission authority, conditional grants, leases, minters), README.md.
