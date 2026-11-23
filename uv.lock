@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 
 [[package]]
@@ -1424,7 +1424,7 @@ wheels = [
 
 [[package]]
 name = "tenish-bab"
-version = "0.4.26"
+version = "0.4.27"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
