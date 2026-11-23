@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.27] - 2026-11-23
+
 ### Changed
 
 - **Licence: MIT.** The project moves from AGPL-3.0-or-later to MIT, with the agreement of every contributor (tenishai/agora discussion 69). Releases already published keep the licence they shipped under.
