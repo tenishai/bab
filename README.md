@@ -1,47 +1,49 @@
-# bab — the door
+# bab
 
-*bab* (باب, "door") decides who may pass: **actor → action → object**, with three
-verdicts — **allow**, **approve** (a human on the owning team says yes), **deny**
-(default). Built for fleets of AI agents; the same shape serves a parent setting
-what a child's companion may do.
+bab (باب, "door") decides whether an AI agent may take an action on a resource: allow, ask a person, or deny.
 
-- A small **catalogue** (resource tree + actions) generates an
-  [OpenFGA](https://openfga.dev) model. Nobody hand-edits the model.
-- Three **tuple sources** and nothing else writes to the store: an identity sync
-  (people → teams), a topology sync (the resource tree and who owns it), and the
-  console (grants, ceiling-checked at write time).
-- The runtime path is one `check` at tool dispatch, fail-closed. The console is
-  never in the runtime path; the emergency lever stays in IAM.
-- **Grants expire.** A grant carries OpenFGA's `grant_window` condition and every
-  check passes the current time, so it stops answering yes on the dot; `grants.sweep`
-  only tidies. Read-tier grants stand; mutate and destroy tiers expire by default.
-- Every policy change is **tested** before it lands: pinned assertions run
-  against the candidate tuples and a failure names the assertion.
+[![CI](https://github.com/tenishai/bab/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tenishai/bab/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tenishai/bab)](https://github.com/tenishai/bab/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-Design: [docs/design.md](docs/design.md) (increment one, built) and
-[docs/design-leases.md](docs/design-leases.md) (next: requests, grants with expiry, one-hour leases). First profile: [catalogues/example.yaml](catalogues/example.yaml).
+![The verdicts make demo prints, shortened](docs/img/demo.svg)
 
-## Try it
+## Overview
 
-```
-make fga         # fetch the OpenFGA CLI for this platform
-make model       # catalogue -> model/example.fga (generated; CI fails if it drifts)
-make test-model  # run model/example.fga.yaml: checks, list-objects, list-users
-make demo        # real OpenFGA in Docker, example profile loaded, six live verdicts (needs: pip install -e .)
-make demo-down
-```
+An agent that can delete a pod or change a topic needs an answer to one question before
+it does: may this agent do this, here? bab answers it with one of three verdicts.
 
-`make demo` prints, for example:
+- **allow**: go ahead.
+- **approve**: a person on the team that owns the resource has to say yes; bab names them.
+- **deny**: the default.
+
+The rules live in [OpenFGA](https://openfga.dev). You describe your resources and actions
+in a small YAML catalogue, bab generates the OpenFGA model from it, and nobody edits the
+model by hand. If the store cannot be reached, the answer is never allow.
+
+## Quickstart
+
+You need Python 3.11 or newer, Docker and `make`.
 
 ```
-atlas     pod_delete   namespace:platform-dev/ingest   -> {"verdict": "allow", ...}
-atlas     pod_delete   namespace:platform-prod/ingest  -> {"verdict": "approve", "approvers": ["user:carol", "user:bob", "user:alice"], ...}
-beacon   pod_delete   namespace:data-kafka/streams   -> {"verdict": "deny", "reason": "agent:beacon holds neither pod_delete nor pod_delete_gated on ...
+git clone https://github.com/tenishai/bab && cd bab
+python3 -m venv venv && venv/bin/pip install -e .
+make demo PY=venv/bin/python
+```
+
+`make demo` fetches the OpenFGA CLI, starts OpenFGA in Docker, loads the example
+catalogue and asks six questions, then one more with the store unreachable:
+
+```
+atlas  pod_delete  namespace:platform-dev/ingest   -> {"verdict": "allow", ...}
+atlas  pod_delete  namespace:platform-prod/ingest  -> {"verdict": "approve", "approvers": ["user:alice", "user:bob", "user:carol"], ...}
+beacon pod_delete  namespace:data-kafka/streams    -> {"verdict": "deny", "reason": "agent:beacon holds neither pod_delete nor pod_delete_gated on ...
 --- store unreachable (fail-closed):
 {"verdict": "approve", "reason": "store unreachable; fallback approvers", "degraded": true}
 ```
 
-## In an agent
+`make demo-down` stops it. To ask from your own code:
 
 ```python
 from bab import Door, catalogue
@@ -53,16 +55,53 @@ d = door.decide("atlas", "pod_delete", "namespace:platform-prod/ingest")
 # d.verdict in {ALLOW, APPROVE, DENY}; d.approvers; d.reason; d.degraded
 ```
 
-## Layout
+## How it works
+
+- **A catalogue generates the model.** `catalogues/*.yaml` lists the resource levels and
+  the actions; `bab model` turns it into OpenFGA's language. CI fails if the generated
+  model drifts from the catalogue.
+- **Three sources write to the store, and nothing else does.** An identity sync (people
+  to teams), a topology sync (the resource tree and who owns it), and grants. A grant is
+  checked against the team's ceiling when it is written.
+- **One check at the moment of the action.** `Door.decide` runs where the agent
+  dispatches a tool. No console sits in that path.
+- **Grants expire.** A grant carries a time window and every check passes the current
+  time, so it stops answering yes on the dot. Read grants stand; grants that change or
+  destroy things expire by default.
+- **A service for fleets.** `bab serve` puts the same decisions behind HTTP, keeps a
+  ledger of requests and grants, and hands out one-hour credentials for a granted
+  permission.
 
 | Path | What |
 |---|---|
-| `catalogues/*.yaml` | resource levels + actions; one profile per deployment (the example ships) |
-| `bab/model.py` | catalogue -> OpenFGA DSL (allow / approve / either / two ceilings, per level) |
-| `bab/door.py` | the decision at tool dispatch, fail-closed |
+| `catalogues/*.yaml` | resource levels and actions; one profile per deployment (the example ships) |
+| `bab/model.py` | catalogue to OpenFGA model |
+| `bab/door.py` | the decision, fail-closed |
 | `bab/ceiling.py` | write-time check: may this team hold this grant? |
-| `bab/sync/` | identity (Okta groups -> members), topology (agents -> teams, root owners; pushed by the room or read from a file); reconcile owns whole relations |
-| `model/example.fga.yaml` | the fixture + assertions; `fga model test` and `fga store import` both read it |
+| `bab/sync/` | identity and topology syncs |
+| `bab/service/` | the HTTP service (`bab serve`) |
+| `model/example.fga.yaml` | the example's fixture and assertions |
+
+## Status
+
+Alpha. The decision, the generated model, the syncs, expiring grants and the HTTP service
+are built and run in our own deployment. Interfaces can still change between minor
+versions; [CHANGELOG.md](CHANGELOG.md) says what changed. Running pinned assertions
+against a policy change before it lands is designed, not built.
+
+## Documentation
+
+- [docs/design.md](docs/design.md): the data model and the decision
+- [docs/design-leases.md](docs/design-leases.md): expiring grants, requests and short-lived credentials
+- [ARCHITECTURE.md](ARCHITECTURE.md): a map of the code, for people and coding agents
+- [RELEASING.md](RELEASING.md): how a release is cut and what it contains
+- [SECURITY.md](SECURITY.md): how to report a vulnerability
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has the setup,
+the checks CI runs and the sign-off every commit needs; the
+[Code of Conduct](CODE_OF_CONDUCT.md) applies to everyone taking part.
 
 ## How this was built
 

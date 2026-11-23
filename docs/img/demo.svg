@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1026" height="262" viewBox="0 0 1026 262" role="img" aria-label="make demo">
+<rect width="1026" height="262" rx="10" fill="#1c1917"/>
+<circle cx="20" cy="18" r="5.5" fill="#57534e"/><circle cx="38" cy="18" r="5.5" fill="#57534e"/><circle cx="56" cy="18" r="5.5" fill="#57534e"/>
+<text x="513.0" y="22" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#a8a29e">make demo</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" xml:space="preserve">
+<text x="18" y="54" fill="#fafaf9" font-weight="600">$ make demo</text>
+<text x="18" y="74" fill="#e7e5e4">openfga up at http://localhost:18080, store 01M8539P1PKA2XC44E5V38Z62G</text>
+<text x="18" y="94" fill="#e7e5e4">atlas    pod_delete                 namespace:platform-dev/ingest    -&gt; allow</text>
+<text x="18" y="114" fill="#e7e5e4">atlas    pod_delete                 namespace:platform-prod/ingest   -&gt; approve   approvers: alice, bob, carol</text>
+<text x="18" y="134" fill="#e7e5e4">beacon   pod_delete                 namespace:data-kafka/streams     -&gt; deny      holds neither pod_delete nor pod_delete_gated</text>
+<text x="18" y="154" fill="#e7e5e4">beacon   kafka_topic_config_update  project:acme-data-prod           -&gt; approve   approvers: alice, dave</text>
+<text x="18" y="174" fill="#e7e5e4">beacon   log_read                   cluster:platform-dev-legacy      -&gt; allow</text>
+<text x="18" y="194" fill="#e7e5e4">atlas    reboot_world               cluster:platform-prod            -&gt; deny      action is not in the catalogue</text>
+<text x="18" y="214" fill="#a8a29e">--- store unreachable (fail-closed):</text>
+<text x="18" y="234" fill="#e7e5e4">atlas    pod_delete                 namespace:platform-prod/ingest   -&gt; approve   fallback approvers, degraded</text>
+</g>
+</svg>
