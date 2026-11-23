@@ -32,6 +32,10 @@ If you change a catalogue in `catalogues/`, regenerate the model and commit the 
 3. Sign off every commit with `git commit -s`; see [Developer Certificate of Origin](#developer-certificate-of-origin).
 4. Open a PR describing what changed and why.
 
+## Releases
+
+Maintainers cut releases; [RELEASING.md](RELEASING.md) says how, and what stops one.
+
 ## Using AI tools
 
 AI-assisted contributions are welcome; we build this way ourselves. You are
