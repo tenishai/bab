@@ -79,6 +79,6 @@ with. Its commits name the Claude model in the trailer, not Ember.
 
 ## License
 
-AGPL-3.0-or-later, the GNU Affero General Public License version 3 or (at your option) any later version (see [LICENSE](LICENSE)).
+MIT (see [LICENSE](LICENSE)).
 
 Copyright (C) 2026 tenish and the bab contributors
