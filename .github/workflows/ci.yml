@@ -1,20 +1,27 @@
+# bab CI: the gates every change must pass. Every job runs on a GitHub-hosted
+# runner, so a pull request from a fork gets the same checks as one from a branch
+# (tests/test_ci_workflow.py holds that). The last job, `ci`, is the one check the
+# branch rules require. Actions are pinned by commit; Dependabot moves the pins.
 name: ci
 on:
   pull_request:
   push:
     branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
-    # spark (arm64, self-hosted) when CI_RUNNER is set. A pull request from a fork
-    # always runs on GitHub-hosted ubuntu-latest: a self-hosted runner must never
-    # run a fork's code. Defence in depth, not the boundary (a fork's pull_request
-    # runs the fork's copy of this file); the real control is fork-PR approval.
-    # tests/test_ci_workflow.py keeps every job on this expression.
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with: {python-version: "3.12"}
+      - name: architecture cards match the files they describe
+        run: python3 scripts/check_arch_cards.py
       - run: rm -rf .venv && python -m venv .venv && .venv/bin/pip install -q -e ".[dev,service,aws]"
       - run: .venv/bin/ruff check bab tests
       - run: make fga
@@ -22,3 +29,19 @@ jobs:
         run: make model PY=.venv/bin/python && git diff --exit-code model/example.fga
       - run: make test-model PY=.venv/bin/python
       - run: .venv/bin/pytest -q
+
+  # The one check the branch rules require: it passes only when every job above passed.
+  # A skipped or cancelled job fails it, so nothing merges on a job that did not run.
+  ci:
+    name: ci
+    if: ${{ always() }}
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for r in $RESULTS; do
+            [ "$r" = "success" ] || { echo "a job did not pass: $RESULTS"; exit 1; }
+          done

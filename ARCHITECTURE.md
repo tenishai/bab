@@ -1,8 +1,10 @@
 ---
 card: repo-card:bab
-updated: 2026-11-16
-anchor: pyproject.toml sha=23b26e864fa74da34c4e47888e67ff540f9cec58
+updated: 2026-11-23
+anchor: bab/cli.py sha=69e96d24471fbe14779678ea767d68f39af71f28
 ---
+<!-- pyproject.toml and the workflow files are deliberately not anchored: Dependabot moves their
+     pins weekly and the card check would fail every one of those PRs. -->
 # bab — repo card
 
 WHAT: "the door": actor → action → object authorization for agent fleets on OpenFGA, with three verdicts: allow, approve (a human on the owning team says yes), deny (default). A YAML catalogue generates the OpenFGA model; `Door.decide` is the one runtime check, meant to run at tool dispatch.
@@ -23,7 +25,7 @@ SEAMS → card:
 - (uncarded) bab/sync/: `reconcile(store, desired, relations)`; okta.py → `user:<email> member team:<t>` from engineering_* groups; topology.py → agent team, root owner, parent links (YAML file or Gojira, the service that connects GitHub repos to GKE, GET /api/v1/topology)
 
 DEPS: none imported. Calls out over HTTP: an Okta groups JSON API (behind IAP) (okta sync, bearer BAB_OKTA_TOKEN), gojira /api/v1/topology (BAB_GOJIRA_TOKEN; design.md says the endpoint does not exist yet; unverified here), OpenFGA server. Planned callers (design.md increments 3-4, not built): the agent SDK calling Door.decide at tool dispatch; a kobo (the web console) module for grants/assertions.
-HEALTH: 12 test files, 74 passed + 2 skipped locally (test_suite_passes_under_fga_cli skips without `fga`). tests/conftest.py FakeStore answers tuples literally, NO inheritance: model semantics are covered only by `fga model test`. CI .github/workflows/ci.yml (3.12, ubuntu-latest): ruff check, make fga, `make model && git diff --exit-code model/example.fga` (generated-model drift), make test-model, pytest. No branch protection: CI reports, never blocks.
+HEALTH: 12 test files, 74 passed + 2 skipped locally (test_suite_passes_under_fga_cli skips without `fga`). tests/conftest.py FakeStore answers tuples literally, NO inheritance: model semantics are covered only by `fga model test`. CI .github/workflows/ci.yml (3.12, GitHub-hosted ubuntu-latest, actions pinned by commit): the architecture-card check, ruff check, make fga, `make model && git diff --exit-code model/example.fga` (generated-model drift), make test-model, pytest. The last job, `ci`, needs every other job: it is the one check the branch rules require, with `dco` (tests/test_ci_workflow.py).
 GOTCHAS:
 - model/example.fga is GENERATED from catalogues/example.yaml by bab/model.py. Never hand-edit; CI and tests/test_model.py both diff it.
 - model/example.fga.yaml is the fixture + assertions for `fga model test` AND the demo's `fga store import`. Its users are bare ids (user:alice) while the Okta sync keys users by lowercased email; the fixture is illustrative, not sync output.

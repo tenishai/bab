@@ -1,0 +1,21 @@
+# Dependabot version updates, grouped so a week's bumps land as one PR per ecosystem.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python:
+        patterns: ["*"]
+    ignore:
+      # Majors by hand, with a changelog entry; the weekly group stays mergeable.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
