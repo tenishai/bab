@@ -22,6 +22,13 @@ The rules live in [OpenFGA](https://openfga.dev). You describe your resources an
 in a small YAML catalogue, bab generates the OpenFGA model from it, and nobody edits the
 model by hand. If the store cannot be reached, the answer is never allow.
 
+bab is the permissions member of the tenish family of open-source platform and agent
+projects, each usable on its own: [gojira](https://github.com/tenishai/gojira) deploys,
+[kobo](https://github.com/tenishai/kobo) is where people build agents,
+[sero](https://github.com/tenishai/sero) keeps secrets, [noto](https://github.com/tenishai/noto)
+observes, and [liminal](https://github.com/tenishai/liminal) is the gateway agents reach
+tools through.
+
 ## Quickstart
 
 You need Python 3.11 or newer, Docker and `make`.
