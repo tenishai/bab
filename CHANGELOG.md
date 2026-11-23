@@ -10,6 +10,7 @@ All notable changes to bab are documented here. The format follows
 
 - **Licence: MIT.** The project moves from AGPL-3.0-or-later to MIT, with the agreement of every contributor (tenishai/agora discussion 69). Releases already published keep the licence they shipped under.
 - **CI runs on GitHub-hosted runners, behind one `ci` check.** The `CI_RUNNER` variable is gone: every job names a hosted image. A last job, `ci`, needs every other job and is the one check the branch rules require, with `dco` (tenishai/agora discussion 71). CI also pins its actions by commit, reads the repository with a read-only token, and checks the architecture cards. New: `CODEOWNERS` and weekly Dependabot updates for actions and Python dependencies.
+- **Community files.** A code of conduct, issue templates (bug, feature, question) and a pull request template, the same as the sibling projects.
 
 ### Fixed
 
