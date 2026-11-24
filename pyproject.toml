@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tenish-bab"
-version = "0.4.27"
+version = "0.4.28"
 description = "bab (باب, door): actor → action → object guardrails for agent fleets, on OpenFGA"
 readme = "README.md"
 license = "MIT"
