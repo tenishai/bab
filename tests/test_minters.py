@@ -843,10 +843,16 @@ def test_gcp_minter_asks_through_the_agents_own_account_and_directly_where_that_
     assert "delegates" in g.calls[-2][2] and "delegates" not in g.calls[-1][2]
     assert other.credential["gcp_access_token"].endswith(sa)
     assert "Cloud Audit Logs do not name the agent: agent-watson@room-project.iam.gserviceaccount.com is not a link" in other.note
-    # No service account on the connection: bab's own token, one call.
-    before = len(g.calls)
+    # No service account on the connection: bab's own identity, through the agent and back to bab.
+    from tests.conftest import BAB_EMAIL
     own = m.mint("sherlock", "example-project", {"project": "example-project"}, [], 600)
-    assert len(g.calls) == before + 1 and "bab's own identity" in own.note
+    assert g.calls[-1][1].endswith(f"/serviceAccounts/{BAB_EMAIL}:generateAccessToken")
+    assert g.calls[-1][2]["delegates"] == [f"projects/-/serviceAccounts/{link}"]
+    assert own.note.startswith(f"access token for bab's own identity through {link}, which Cloud Audit Logs name; ")
+    # Not a link: the token the metadata server handed bab, and the note says what the log lacks.
+    plain = m.mint("watson", "example-project", {"project": "example-project"}, [], 600)
+    assert plain.credential["gcp_access_token"].startswith("own-")
+    assert "bab's own identity (Cloud Audit Logs do not name the agent: agent-watson@" in plain.note
     # A probe names no agent, so it never goes through one.
     m._token_for(sa, 600)
     assert "delegates" not in g.calls[-1][2]
