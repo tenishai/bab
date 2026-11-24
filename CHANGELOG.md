@@ -6,6 +6,8 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.29] - 2026-11-24
+
 ### Fixed
 
 - **Google Cloud's log names the agent on a connection with no service account of its own.** 0.4.28 asked through the agent's account only where the connection named a `service_account`; a project connected under an organization names none, so its leases were bab's own token and the log named no agent. Such a lease is now asked for through the agent's account and back to bab's own (bab, the agent, bab): the same roles, and `serviceAccountDelegationInfo` carries the agent. It needs the agents' accounts, or a group they are in, to hold Service Account Token Creator on bab's own account. Where that grant is missing, the lease is bab's own token as before and its note says the log does not name the agent.
