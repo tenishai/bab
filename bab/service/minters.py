@@ -1216,6 +1216,10 @@ GCP_MAX_SECONDS = 3600  # generateAccessToken's ceiling without an org policy ch
 GCP_PROBE_SECONDS = 600
 GCP_IDENTITY_AUDIENCE = "bab"  # the identity token is read for its claims, never presented anywhere
 GCP_OWN = "bab's own identity"
+# Each agent's own service account, `{agent}` standing for its name
+# (agent-{agent}@<project>.iam.gserviceaccount.com). Unset, no lease goes through one.
+GCP_AGENT_ACCOUNT_ENV = "BAB_GCP_AGENT_ACCOUNT"
+GCP_NARROWING_NOTE = "narrowing is bab's check only, the token carries the role pack"
 # The tree walk under a folder or organization: how deep, how many folders in all, and the page size.
 # A folder tree is read with two searches (every project and every folder bab may see), not a
 # walk of two calls per folder: a 2026-11-09 walk of a 100-folder tree hit Resource Manager's
@@ -1251,14 +1255,24 @@ class GcpMinter:
     a `service_account`, bab impersonates it instead (`generateAccessToken`, which needs
     roles/iam.serviceAccountTokenCreator on that account) and the lease carries that narrower
     identity's roles. bab's own token comes from the metadata server (workload identity), the
-    same source as its AWS web identity token; nothing is stored. Cloud Audit Logs record the
-    identity, not the agent: the ledger is the attribution."""
+    same source as its AWS web identity token; nothing is stored.
+
+    Cloud Audit Logs record the identity. They also name the agent when `agent_account` is set
+    (`BAB_GCP_AGENT_ACCOUNT`) and the connection names a `service_account`: the token is then
+    asked for through the agent's own account (`delegates`), and every call made with it is
+    logged with that account in `serviceAccountDelegationInfo`. The chain needs bab to hold
+    Token Creator on the agent's account and the agent's account to hold it on the
+    connection's; nothing may run as the agent's account, or it could ask for the token
+    itself. Where Google refuses the chain (an agent that is not a link yet) bab asks
+    directly, as before, and the note says the log does not name the agent. A connection with
+    no `service_account` is bab's own token, and the ledger is the only attribution."""
 
     name = "gcp"
 
-    def __init__(self, http=None, now=time.time):
+    def __init__(self, http=None, now=time.time, agent_account: str = ""):
         self.http = http or self._http
         self.now = now
+        self.agent_account = agent_account.strip()
         self.sleep = time.sleep
         self._tree_cache: dict[str, tuple[float, list[dict]]] = {}
         self._tree_locks: dict[str, threading.Lock] = {}
@@ -1305,12 +1319,21 @@ class GcpMinter:
             raise MintError("the metadata server did not name bab's service account")
         return str(data["email"])
 
-    def _impersonate(self, bearer: str, service_account: str, seconds: int) -> tuple[str, float]:
-        """`generateAccessToken` on the connection's service account, with bab's own token."""
+    def _impersonate(self, bearer: str, service_account: str, seconds: int,
+                     through: str | None = None) -> tuple[str, float] | None:
+        """`generateAccessToken` on the connection's service account, with bab's own token.
+        With `through`, the token is asked for by way of that account (`delegates`), and None is
+        the answer when Google refuses the chain (403, or 404 for a link that is not there): the
+        caller asks directly instead. Any other refusal raises."""
         if not _GCP_SA.match(service_account):
             raise MintError(f"{service_account!r} is not a service account email")
         url = f"{GCP_CREDENTIALS_URL}/projects/-/serviceAccounts/{service_account}:generateAccessToken"
-        status, data = self.http("POST", url, self._bearer(bearer), {"scope": [GCP_SCOPE], "lifetime": f"{seconds}s"})
+        body: dict = {"scope": [GCP_SCOPE], "lifetime": f"{seconds}s"}
+        if through:
+            body["delegates"] = [f"projects/-/serviceAccounts/{through}"]
+        status, data = self.http("POST", url, self._bearer(bearer), body)
+        if through and status in (403, 404):
+            return None
         if status != 200:
             raise MintError(f"Google refused a token for {service_account}: {self._error(status, data)}")
         token = str(data.get("accessToken") or "")
@@ -1318,24 +1341,41 @@ class GcpMinter:
             raise MintError("Google answered without the token")
         return token, _iso_epoch(str(data.get("expireTime") or "")) or self.now() + seconds
 
-    def _token_for(self, service_account: str | None, seconds: int) -> tuple[str, float, str]:
-        """A token for the connection's identity: the service account it names, impersonated with
-        bab's own token, or bab's own token itself, which ends when the metadata server says."""
+    def _agent_account(self, agent: str | None) -> str | None:
+        """The agent's own service account, from the configured pattern, or None when there is
+        no pattern, no agent (a probe) or the result is not a service account email."""
+        if not (self.agent_account and agent):
+            return None
+        email = self.agent_account.replace("{agent}", agent)
+        return email if _GCP_SA.match(email) else None
+
+    def _token_for(self, service_account: str | None, seconds: int,
+                   agent: str | None = None) -> tuple[str, float, str]:
+        """A token for the connection's identity, and who it is for: the service account it
+        names, impersonated with bab's own token (through the agent's own account where that
+        chain is set up, so the cloud's log names the agent), or bab's own token itself, which
+        ends when the metadata server says."""
         seconds = max(1, min(int(seconds), GCP_MAX_SECONDS))
         own, own_ends = self._own_token()
-        if service_account:
-            token, ends = self._impersonate(own, service_account, seconds)
-            return token, min(ends, self.now() + seconds), service_account
-        return own, min(own_ends, self.now() + seconds), GCP_OWN
+        if not service_account:
+            return own, min(own_ends, self.now() + seconds), GCP_OWN
+        link = self._agent_account(agent)
+        chained = self._impersonate(own, service_account, seconds, through=link) if link else None
+        if chained:
+            token, ends = chained
+            return token, min(ends, self.now() + seconds), f"{service_account} through {link}, which Cloud Audit Logs name"
+        token, ends = self._impersonate(own, service_account, seconds)
+        who = f"{service_account} (Cloud Audit Logs do not name the agent: {link} is not a link to it)" if link else service_account
+        return token, min(ends, self.now() + seconds), who
 
     def mint(self, agent, integration_id, spec, permissions, seconds):
         project = str((spec or {}).get("project") or "").strip()
         if not project:
             raise MintError(f"integration {integration_id!r} names no Google Cloud project")
         sa = str((spec or {}).get("service_account") or "").strip() or None
-        token, ends, who = self._token_for(sa, seconds)
+        token, ends, who = self._token_for(sa, seconds, agent)
         return Minted(credential={"gcp_access_token": token, "gcp_project": project}, expires_at=ends, handle={},
-                      note=f"access token for {who}; narrowing is bab's check only, the token carries the role pack")
+                      note=f"access token for {who}; {GCP_NARROWING_NOTE}")
 
     def end(self, handle):
         """Nothing to end: Google cannot recall an access token before it expires, and bab keeps
@@ -1518,12 +1558,13 @@ def default_minters() -> dict[str, Minter]:
     """Datadog and GitHub are always registered; whether each can mint is decided per call
     from its mounted Secret (`BAB_DATADOG_DIR` /etc/bab/datadog, `BAB_GITHUB_DIR`
     /etc/bab/github) or, failing that, the environment. AWS and Google Cloud mint with bab's
-    own identity from the metadata server and need nothing mounted. Datadog keeps one key
+    own identity from the metadata server and need nothing mounted; `BAB_GCP_AGENT_ACCOUNT`
+    names each agent's own service account for the Google Cloud chain. Datadog keeps one key
     per agent when the secret store is named (`BAB_SERO_*`, see bab/service/keys.py), read
     back from `BAB_DATADOG_KEYS_DIR` /etc/bab/datadog-keys after a restart."""
     dd_keys = sero_keys_from_env(os.environ, os.environ.get(DD_KEYS_DIR_ENV, "").strip() or DD_DEFAULT_KEYS_DIR,
                                  web_identity_token)
     return {"aws": AwsMinter(),
-            "gcp": GcpMinter(),
+            "gcp": GcpMinter(agent_account=os.environ.get(GCP_AGENT_ACCOUNT_ENV, "")),
             "datadog": DatadogMinter.from_dir(os.environ.get(DD_DIR_ENV, "").strip() or DD_DEFAULT_DIR, keys=dd_keys),
             "github": GitHubMinter.from_dir(os.environ.get(GH_DIR_ENV, "").strip() or GH_DEFAULT_DIR)}

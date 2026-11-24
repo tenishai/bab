@@ -169,7 +169,7 @@ principal the vendor trusts.
 | family | how bab mints | scoped to the granted set by | max life |
 |---|---|---|---|
 | AWS | `AssumeRoleWithWebIdentity` into the account's `KoboAccess-Role`, trust = bab's own cloud identity, `RoleSessionName=bab-<agent>` (that API takes no SourceIdentity) | a session policy built from the granted permissions | 1 h (role max) |
-| Google Cloud (built, 0.4.15) | an access token for bab's own service account from the metadata server (the admin grants it the role pack on the project, folder or organization: no federation step), or `generateAccessToken` on the connection's `service_account` when one is named | bab's check only; the token carries the identity's roles (no session policy on this cloud), and the lease note says so | 1 h, or the metadata token's own expiry when shorter |
+| Google Cloud (built, 0.4.15) | an access token for bab's own service account from the metadata server (the admin grants it the role pack on the project, folder or organization: no federation step), or `generateAccessToken` on the connection's `service_account` when one is named. With `BAB_GCP_AGENT_ACCOUNT` set, that request goes through the agent's own service account (`delegates`), so Cloud Audit Logs name the agent on every call; see below | bab's check only; the token carries the identity's roles (no session policy on this cloud), and the lease note says so | 1 h, or the metadata token's own expiry when shorter |
 | Azure | workload identity federation client assertion | bab's check only | about 1 h |
 | GitHub | App installation token | `permissions` and `repositories` narrowing on the token request | 1 h |
 | Datadog | a **scoped application key**: one per agent, kept across leases, where bab has a key store; else one per lease, deleted at expiry | the key's own `scopes` | the lease is an hour; bab deletes the key when the agent's access changes |
@@ -325,6 +325,30 @@ The tool gateway, not the agent, is what reaches Datadog today; it leases
 through `POST /leases/for-agent` with its own pod identity, naming the agent
 whose call it is serving. The checks are the agent's; the row says `via:
 gateway`.
+
+
+### Google Cloud: the agent in the cloud's own log
+
+A token bab asks for directly is logged by Google as the connection's service
+account, with bab as the one who asked. Which agent it was for is in bab's
+ledger only. `BAB_GCP_AGENT_ACCOUNT` closes that: it is a pattern for each
+agent's own service account, with `{agent}` standing for the name
+(`agent-{agent}@<project>.iam.gserviceaccount.com`). With it set, a lease on a
+connection that names a `service_account` is asked for as a chain, bab to the
+agent's account to the connection's account, and Google records the agent's
+account in `serviceAccountDelegationInfo` on every call the token makes.
+
+The chain needs two grants of Service Account Token Creator: bab's identity on
+the agent's account, and the agent's account (or a group it is in) on the
+connection's account. Nothing may run as the agent's account. It is a name in a
+chain, and a workload that ran as it could ask for the connection's token
+itself, with no grant and no lease. The room keeps that true: an agent's pod is
+granted what it needs on its Kubernetes identity directly.
+
+Where Google refuses the chain (the agent's account is not a link yet, or the
+grant is minutes old) bab asks directly, as before, and the lease note says the
+cloud's log does not name the agent. A connection with no `service_account` is
+bab's own token: the ledger is the only attribution there.
 
 ## Runtime
 
