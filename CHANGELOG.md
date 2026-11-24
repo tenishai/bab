@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`.gitignore` opens with a block shared by every tenish repo** (keys, env files, local databases, Terraform state, editor folders), with this repo's own lines under it.
+
 ## [0.4.27] - 2026-11-23
 
 ### Changed
