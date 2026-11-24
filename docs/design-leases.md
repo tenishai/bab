@@ -333,22 +333,24 @@ A token bab asks for directly is logged by Google as the connection's service
 account, with bab as the one who asked. Which agent it was for is in bab's
 ledger only. `BAB_GCP_AGENT_ACCOUNT` closes that: it is a pattern for each
 agent's own service account, with `{agent}` standing for the name
-(`agent-{agent}@<project>.iam.gserviceaccount.com`). With it set, a lease on a
-connection that names a `service_account` is asked for as a chain, bab to the
-agent's account to the connection's account, and Google records the agent's
-account in `serviceAccountDelegationInfo` on every call the token makes.
+(`agent-{agent}@<project>.iam.gserviceaccount.com`). With it set, a lease is
+asked for as a chain, bab to the agent's account to the account the token is
+for, and Google records the agent's account in `serviceAccountDelegationInfo`
+on every call the token makes. The account the token is for is the connection's
+`service_account`, or bab's own where the connection names none: bab, through
+the agent, back to bab, which carries the same roles as bab's own token.
 
 The chain needs two grants of Service Account Token Creator: bab's identity on
 the agent's account, and the agent's account (or a group it is in) on the
-connection's account. Nothing may run as the agent's account. It is a name in a
+account the token is for: the connection's, or bab's own. Nothing may run as the agent's account. It is a name in a
 chain, and a workload that ran as it could ask for the connection's token
 itself, with no grant and no lease. The room keeps that true: an agent's pod is
 granted what it needs on its Kubernetes identity directly.
 
 Where Google refuses the chain (the agent's account is not a link yet, or the
 grant is minutes old) bab asks directly, as before, and the lease note says the
-cloud's log does not name the agent. A connection with no `service_account` is
-bab's own token: the ledger is the only attribution there.
+cloud's log does not name the agent. A new grant took about a minute and a half
+to count when this was first run against Google (2026-11-24).
 
 ## Runtime
 

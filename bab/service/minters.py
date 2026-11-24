@@ -1258,14 +1258,14 @@ class GcpMinter:
     same source as its AWS web identity token; nothing is stored.
 
     Cloud Audit Logs record the identity. They also name the agent when `agent_account` is set
-    (`BAB_GCP_AGENT_ACCOUNT`) and the connection names a `service_account`: the token is then
-    asked for through the agent's own account (`delegates`), and every call made with it is
-    logged with that account in `serviceAccountDelegationInfo`. The chain needs bab to hold
-    Token Creator on the agent's account and the agent's account to hold it on the
-    connection's; nothing may run as the agent's account, or it could ask for the token
-    itself. Where Google refuses the chain (an agent that is not a link yet) bab asks
-    directly, as before, and the note says the log does not name the agent. A connection with
-    no `service_account` is bab's own token, and the ledger is the only attribution."""
+    (`BAB_GCP_AGENT_ACCOUNT`): the token is then asked for through the agent's own account
+    (`delegates`), and every call made with it is logged with that account in
+    `serviceAccountDelegationInfo`. The chain needs bab to hold Token Creator on the agent's
+    account and the agent's account to hold it on the account the token is for: the
+    connection's `service_account`, or bab's own where the connection names none (bab, through
+    the agent, back to bab). Nothing may run as the agent's account, or it could ask for the
+    token itself. Where Google refuses the chain (an agent that is not a link yet) bab asks
+    directly, as before, and the note says the log does not name the agent."""
 
     name = "gcp"
 
@@ -1273,6 +1273,7 @@ class GcpMinter:
         self.http = http or self._http
         self.now = now
         self.agent_account = agent_account.strip()
+        self._own_email_seen = ""
         self.sleep = time.sleep
         self._tree_cache: dict[str, tuple[float, list[dict]]] = {}
         self._tree_locks: dict[str, threading.Lock] = {}
@@ -1319,6 +1320,12 @@ class GcpMinter:
             raise MintError("the metadata server did not name bab's service account")
         return str(data["email"])
 
+    def _own_email(self) -> str:
+        """bab's own email, asked of the metadata server once: it does not change while bab runs."""
+        if not self._own_email_seen:
+            self._own_email_seen = self._email()
+        return self._own_email_seen
+
     def _impersonate(self, bearer: str, service_account: str, seconds: int,
                      through: str | None = None) -> tuple[str, float] | None:
         """`generateAccessToken` on the connection's service account, with bab's own token.
@@ -1357,9 +1364,16 @@ class GcpMinter:
         ends when the metadata server says."""
         seconds = max(1, min(int(seconds), GCP_MAX_SECONDS))
         own, own_ends = self._own_token()
-        if not service_account:
-            return own, min(own_ends, self.now() + seconds), GCP_OWN
         link = self._agent_account(agent)
+        if not service_account:
+            # bab's own identity, asked for through the agent's account and back to bab: the
+            # same roles, and the cloud's log gains the agent (proven live 2026-11-24).
+            chained = self._impersonate(own, self._own_email(), seconds, through=link) if link else None
+            if chained:
+                token, ends = chained
+                return token, min(ends, self.now() + seconds), f"{GCP_OWN} through {link}, which Cloud Audit Logs name"
+            who = f"{GCP_OWN} (Cloud Audit Logs do not name the agent: {link} is not a link to it)" if link else GCP_OWN
+            return own, min(own_ends, self.now() + seconds), who
         chained = self._impersonate(own, service_account, seconds, through=link) if link else None
         if chained:
             token, ends = chained
