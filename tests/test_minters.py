@@ -819,6 +819,39 @@ def test_gcp_minter_impersonates_the_connections_service_account():
         m.mint("sherlock", "example-project", {"project": "example-project", "service_account": "not-an-email"}, [], 3600)
 
 
+def test_gcp_minter_asks_through_the_agents_own_account_and_directly_where_that_is_refused():
+    """With the agents' account pattern set, a lease on a connection that names a service account
+    is asked for through the agent's own account, so the cloud's log names the agent. An agent
+    whose account is not a link gets the direct token and a note that says so. bab's own token
+    and a probe go through no one."""
+    from bab.service.minters import GcpMinter
+    from tests.conftest import FakeGoogle
+
+    sa = "reader@example-project.iam.gserviceaccount.com"
+    pattern = "agent-{agent}@room-project.iam.gserviceaccount.com"
+    link = "agent-sherlock@room-project.iam.gserviceaccount.com"
+    spec = {"project": "example-project", "service_account": sa}
+    g = FakeGoogle(links=(link,))
+    m = GcpMinter(http=g, now=lambda: 1_800_000_000.0, agent_account=pattern)
+    out = m.mint("sherlock", "example-project", spec, [], 3600)
+    assert g.calls[1][2] == {"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "3600s",
+                             "delegates": [f"projects/-/serviceAccounts/{link}"]}
+    assert len(g.calls) == 2
+    assert out.note.startswith(f"access token for {sa} through {link}, which Cloud Audit Logs name; ")
+    # Not a link: Google refuses the chain, bab asks directly, and the note says what the log lacks.
+    other = m.mint("watson", "example-project", spec, [], 3600)
+    assert "delegates" in g.calls[-2][2] and "delegates" not in g.calls[-1][2]
+    assert other.credential["gcp_access_token"].endswith(sa)
+    assert "Cloud Audit Logs do not name the agent: agent-watson@room-project.iam.gserviceaccount.com is not a link" in other.note
+    # No service account on the connection: bab's own token, one call.
+    before = len(g.calls)
+    own = m.mint("sherlock", "example-project", {"project": "example-project"}, [], 600)
+    assert len(g.calls) == before + 1 and "bab's own identity" in own.note
+    # A probe names no agent, so it never goes through one.
+    m._token_for(sa, 600)
+    assert "delegates" not in g.calls[-1][2]
+
+
 def test_gcp_minter_mints_babs_own_token_when_no_service_account_is_named():
     from bab.service.minters import GcpMinter, MintError
     from tests.conftest import FakeGoogle

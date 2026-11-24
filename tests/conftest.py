@@ -228,12 +228,13 @@ class FakeGoogle:
     was asked for, projects bab may or may not read, a folder's projects over two pages."""
 
     def __init__(self, forbidden: tuple[str, ...] = ("locked-project",), refuse_impersonation: str | None = None,
-                 vertex_forbidden: tuple[str, ...] = ("europe-west9",)):
+                 vertex_forbidden: tuple[str, ...] = ("europe-west9",), links: tuple[str, ...] | None = None):
         self.calls: list[tuple[str, str, dict | None]] = []
         self.headers: list[dict] = []
         self.forbidden = set(forbidden)
         self.vertex_forbidden = set(vertex_forbidden)
         self.refuse_impersonation = refuse_impersonation
+        self.links = links  # the accounts a token may be asked through; None means any
         self.n = 0
 
     def __call__(self, method, url, headers, body):
@@ -256,6 +257,9 @@ class FakeGoogle:
             if self.refuse_impersonation:
                 return 403, {"error": {"code": 403, "message": self.refuse_impersonation, "status": "PERMISSION_DENIED"}}
             sa = url.rsplit("/serviceAccounts/", 1)[1].split(":")[0]
+            through = [d.rsplit("/", 1)[1] for d in (body or {}).get("delegates", [])]
+            if self.links is not None and any(t not in self.links for t in through):
+                return 403, {"error": {"code": 403, "message": "Permission 'iam.serviceAccounts.getAccessToken' denied", "status": "PERMISSION_DENIED"}}
             self.n += 1
             return 200, {"accessToken": f"imp-{self.n}-{sa}", "expireTime": "2026-11-01T13:00:00.123456Z"}
         if url.startswith("https://aiplatform.googleapis.com/v1beta1/publishers/"):

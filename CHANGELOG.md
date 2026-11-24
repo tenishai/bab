@@ -6,6 +6,10 @@ All notable changes to bab are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Google Cloud's own log names the agent.** With `BAB_GCP_AGENT_ACCOUNT` set to the pattern of each agent's service account (`agent-{agent}@<project>.iam.gserviceaccount.com`), a lease on a connection that names a `service_account` is asked for through the agent's account, and Cloud Audit Logs record that account on every call made with the token (`serviceAccountDelegationInfo`). bab needs Token Creator on the agent's account, and the agent's account needs it on the connection's. Where Google refuses the chain bab asks directly, as before, and the lease note says the cloud's log does not name the agent. Unset, nothing changes (#93).
+
 ### Changed
 
 - **`.gitignore` opens with a block shared by every tenish repo** (keys, env files, local databases, Terraform state, editor folders), with this repo's own lines under it.
