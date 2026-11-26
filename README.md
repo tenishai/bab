@@ -9,6 +9,17 @@ bab (باب, "door") decides whether an AI agent may take an action on a resourc
 
 ![The verdicts make demo prints, shortened](docs/img/demo.svg)
 
+## Two ways to run it
+
+- **Try it on a laptop.** The [Quickstart](#quickstart) starts OpenFGA in Docker and
+  prints real verdicts, with no cluster. bab also works alone, as a library or an HTTP
+  service in front of your own agents.
+- **Run it with the platform.** In the tenish suite the gateway asks bab before each tool
+  call. Install [gojira](https://github.com/tenishai/gojira) on a GKE cluster and bring the
+  suite up with [stack](https://github.com/tenishai/stack). Stack's example file does not list
+  bab yet; it deploys through gojira like any other app, from the `gojira.yaml` and `k8s/`
+  in this repo.
+
 ## Overview
 
 An agent that can delete a pod or change a topic needs an answer to one question before
@@ -21,16 +32,6 @@ it does: may this agent do this, here? bab answers it with one of three verdicts
 The rules live in [OpenFGA](https://openfga.dev). You describe your resources and actions
 in a small YAML catalogue, bab generates the OpenFGA model from it, and nobody edits the
 model by hand. If the store cannot be reached, the answer is never allow.
-
-bab is the permissions member of the tenish family of open-source platform and agent
-projects, each usable on its own: [gojira](https://github.com/tenishai/gojira) deploys,
-[kobo](https://github.com/tenishai/kobo) is where people build agents,
-[sero](https://github.com/tenishai/sero) keeps secrets, [noto](https://github.com/tenishai/noto)
-observes, and [liminal](https://github.com/tenishai/liminal) is the gateway agents reach
-tools through.
-
-To run the whole suite on a cluster, start at [stack](https://github.com/tenishai/stack): one file and one command bring the
-parts up in dependency order.
 
 ## Quickstart
 
@@ -64,6 +65,19 @@ door = Door(OpenFgaStore(url, store_id), catalogue.load("catalogues/example.yaml
 d = door.decide("atlas", "pod_delete", "namespace:platform-prod/ingest")
 # d.verdict in {ALLOW, APPROVE, DENY}; d.approvers; d.reason; d.degraded
 ```
+
+## Where it fits
+
+bab is the permissions member of the tenish family of open-source platform and agent
+projects, each usable on its own.
+
+| Part | What it does |
+|---|---|
+| [liminal](https://github.com/tenishai/liminal) | the gateway agents reach tools through; it asks bab |
+| [kobo](https://github.com/tenishai/kobo) | where people build agents and grant them access |
+| [gojira](https://github.com/tenishai/gojira) | deploys |
+| [sero](https://github.com/tenishai/sero) | keeps secrets |
+| [noto](https://github.com/tenishai/noto) | observes |
 
 ## How it works
 
