@@ -29,6 +29,9 @@ projects, each usable on its own: [gojira](https://github.com/tenishai/gojira) d
 observes, and [liminal](https://github.com/tenishai/liminal) is the gateway agents reach
 tools through.
 
+To run the whole suite on a cluster, start at [stack](https://github.com/tenishai/stack): one file and one command bring the
+parts up in dependency order.
+
 ## Quickstart
 
 You need Python 3.11 or newer, Docker and `make`.
